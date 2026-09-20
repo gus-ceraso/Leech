@@ -23,6 +23,8 @@ The design favors a small, explicit state machine over broad protocol coverage:
 
 The cost is reduced reachability and download performance. Leech does not listen, participate in decentralized discovery, advertise acquired pieces, or reciprocate. It depends on seeds, optimistic unchokes, and BEP 6 Allowed Fast behavior.
 
+Fast is the principal recovery path for a client that advertises no availability, not a compatibility guarantee. A peer that lacks BEP 6, rejects `Have None`, requires peer-wire encryption or a nonempty bitfield, or refuses nonreciprocating peers may be unusable. Leech treats that as a peer-local compatibility failure: it closes or rotates the peer without a corruption strike and never weakens the no-upload boundary to retain it.
+
 ## 2. Goals
 
 1. Download selected content correctly from BitTorrent v1 swarms.
@@ -268,13 +270,15 @@ UDP trackers implement BEP 15 connection IDs and lifetimes, transaction matching
 For each phase and tracker:
 
 1. The first announce uses `event=started`.
-2. A valid response makes the tracker active and supplies a positive interval.
-3. HTTP trackers may rerequest early when the candidate pool is depleted, as permitted by BEP 3.
-4. UDP trackers never rerequest before their interval unless sending a defined event, as required by BEP 15.
-5. Transient failures retry indefinitely with capped exponential backoff and jitter.
-6. BEP 31 `retry in` is a not-before duration in minutes; Leech accepts the specified integer form and the deployed decimal-string form, with checked conversion. `never` and definitive HTTP client errors disable only that tracker for the run.
+2. The worker records a `started` request as transmitted only after the protocol transport accepts the complete request for transmission and before waiting for or parsing its response; transmission and response success are separate states.
+3. A valid response makes the tracker active and supplies a positive interval.
+4. An HTTP success response containing `failure reason`, an invalid interval, a malformed compact peer list, or a UDP response with the wrong transaction ID is a tracker-local failure and does not activate the tracker.
+5. HTTP trackers may rerequest early when the candidate pool is depleted, as permitted by BEP 3.
+6. UDP trackers never rerequest before their interval unless sending a defined event, as required by BEP 15.
+7. Transient failures retry indefinitely with capped exponential backoff and jitter.
+8. BEP 31 `retry in` is a not-before duration in minutes; Leech accepts the specified integer form and the deployed decimal-string form, with checked conversion. `never` and definitive HTTP client errors disable only that tracker for the run.
 
-On a phase transition or final shutdown, the session first cancels and joins every regular announce loop. It then uses a separate bounded context to send at most one announce for each applicable final event per tracker: full completion sends `completed` and then `stopped`; every other exit sends only `stopped`. `stopped` is attempted for every nonpermanently-disabled tracker to which a `started` request was transmitted, whether or not a response arrived. Final announce failure is secondary and never changes an existing primary result.
+On a phase transition or final shutdown, the session first cancels and joins every regular announce loop. It then uses a separate bounded context to send at most one announce for each applicable final event per tracker: full completion sends `completed` and then `stopped`; every other exit sends only `stopped`. `stopped` is attempted for every nonpermanently-disabled tracker to which a `started` request was transmitted, whether or not a response arrived. No regular announce may begin after the final-event sequence starts. Final announce failure is secondary and never changes an existing primary result.
 
 Tracker and magnet endpoints may be public, private, or loopback. Invalid ports, unspecified addresses, and multicast addresses are rejected. This intentionally permits untrusted inputs to induce connections to local unicast services.
 
@@ -315,6 +319,8 @@ The outbound peer-message API contains no file `piece` encoder and no metadata `
 ### 11.2 Fast Extension
 
 Allowed Fast and availability are independent. Leech may request a choked piece only when the remote has both advertised that piece as available and included it in Leech's Allowed Fast set. Allowed Fast alone never implies availability. Suggest Piece is parsed and may be ignored.
+
+When Fast is negotiated, receiving `Have None` immediately replaces the remote peer's ordinary availability set with the empty set. The separate bounded Allowed Fast set remains intact. Future choked request selection still requires membership in both sets.
 
 With Fast negotiated, every request remains outstanding across a choke until exactly one matching piece or reject arrives or the connection closes. Sending cancel or reaching the local request timeout does not erase the expected terminal response; it moves the request to a bounded tombstone so a late matching piece or reject is consumed safely. If adding a required tombstone would exceed the cap, Leech closes the connection without a strike before forgetting any request. Without Fast, choke implicitly releases pending requests, while the same bounded tombstone rule permits race-delayed matching pieces described by BEP 3.
 
@@ -501,15 +507,21 @@ Required evidence includes:
 - golden vectors for bencoding, exact info hashes, compact endpoints, peer frames, Fast messages, BEP 10 directionality, metadata messages, UDP trackers, and uTP packets;
 - fuzzing of parsers and state-machine transitions for bencoding, metainfo, magnets, trackers, peer wire, BEP 6, BEP 10, metadata transfer, uTP, transport racing, peer-ID deduplication, strike accounting, and session shutdown;
 - properties for checked ranges, file normalization, BEP 53 indexing, selection, block coverage, rarity, tracker accounting, and sequence wraparound;
-- deterministic tracker models covering premetadata `left=1`, actual `left`, started/regular/completed/stopped sequences, HTTP early rerequests, UDP interval enforcement, BEP 31, phase quiescence, and stopped ordering;
-- deterministic peer models covering Fast choke/reject/cancel, independent Allowed Fast and availability, repeated extension handshakes, local/remote extension IDs, request tombstones, and metadata rejection;
+- deterministic tracker models covering premetadata `left=1`, actual `left`, started/regular/completed/stopped sequences, HTTP early rerequests, UDP interval enforcement, BEP 31, phase quiescence, stopped ordering, first-value-wins and last-value-wins duplicate query parsing, HTTP success responses with failure bodies, malformed compact IPv4 and IPv6 lists, a transmitted `started` with no response followed by `stopped`, and unequal IPv4/IPv6 support;
+- deterministic peer models covering a Fast seed using `Have None`, a reciprocal leecher, an Allowed Fast peer, a peer without Fast, a peer that requires ordinary availability before honoring Allowed Fast, and a peer that would retain stale availability unless `Have None` clears it;
+- peer-state tests covering Fast choke/reject/cancel, repeated extension handshakes, local/remote extension IDs, request tombstones, metadata rejection, and independent bounded availability and Allowed Fast sets;
 - deterministic dial tests proving exact-endpoint use, first-handshake wins, loser cancellation/close/join, duplicate peer-ID handling, and reconnect eligibility;
 - strike tests across transports and reconnects, including mixed-source corrupt pieces and sole-source invalid metadata;
 - uTP simulation with loss, delay, duplication, reordering, selective ACKs, window pressure, timeout, wraparound, teardown, and cancellation;
 - race-detector tests for tracker transitions, peer replacement, event queues, cache finalization, and both signal paths;
 - filesystem tests for traversal, collisions, omitted padding paths, omitted symlink lengths, descendant symlinks, padding, selected boundaries, sparse growth, overlong files, interruption, and resume;
 - local fake HTTP/UDP trackers and TCP/uTP peers for complete `.torrent`, magnet, and bare-hash sessions;
-- wire assertions that Leech never emits `Unchoke`, `Have`, `Bitfield`, `Have All`, file `piece`, or metadata `data`, never requests an unavailable Allowed Fast piece, and always reports tracker `uploaded=0`.
+- wire and storage assertions that an incoming payload or metadata request causes no payload, cache, or output disk read and never emits file `piece` or metadata `data`;
+- terminal-response assertions that each admissible Fast payload request and each rejectable metadata request produces exactly one rejection, while ignored cases produce none;
+- tombstone assertions that an exact late `Piece` or `Reject Request` consumes its tombstone once, or the connection closes before the bounded tombstone is forgotten;
+- wire assertions that Leech never emits `Unchoke`, `Have`, `Bitfield`, or `Have All`, never requests an unavailable Allowed Fast piece, and reports tracker `uploaded=0` on every announce.
+
+Tests observe bounded, read-only per-session debug events or counters for ordinary choke duration, empty availability, Allowed Fast receipt and usefulness, first useful block, tombstone consumption, peer-ID collision, transport-race outcome, metadata refusal, compact peer family, tracker final-event attempts, and staging or hash failure. These observations do not enable upload, additional discovery, or persistent session state.
 
 Production builds are pure Go. Race tooling may enable cgo or require a C toolchain where the current Go release requires it.
 
