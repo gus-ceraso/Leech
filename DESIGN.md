@@ -53,9 +53,226 @@ Leech does not support:
 - multiple torrents in one process;
 - automated or manual interoperability tests against existing clients or live trackers.
 
-CLI spelling and argument parsing are outside this document. The design assumes that the CLI produces one validated session configuration containing a source, destination directory, selection, mode, resume choice, and optional no-progress timeout.
+## 4. Command-line interface
 
-## 4. Protocol profile
+Leech exposes one command with download and file-listing modes:
+
+```text
+leech [options] SOURCE
+```
+
+One invocation handles one torrent. Download is the default; `--list-files` stops
+after reading and validating metadata. There are no subcommands, configuration
+files, environment-variable settings, prompts, or stdin input. Options precede
+`SOURCE`. This keeps the command aligned with the single-session design and makes
+every run self-contained.
+
+### 4.1 Source and argument parsing
+
+`SOURCE` is exactly one of:
+
+- a path to a v1 metainfo file, conventionally ending in `.torrent`;
+- a magnet URI; or
+- a 40-character hexadecimal or 32-character Base32 v1 info hash.
+
+The parser recognizes a case-insensitive `magnet:` scheme first, an exact-length
+info hash second, and otherwise treats the value as a file path. Prefix a
+hash-shaped filename with `./` or another directory component to force path
+interpretation. The literal `-` is unsupported. `--` ends option parsing, which
+permits a path beginning with `-`.
+
+Long options accept either `--name value` or `--name=value`. Short options are not
+combined. Unknown options, missing values, and more or fewer than one source are
+usage errors.
+
+```text
+Usage:
+  leech [options] SOURCE
+
+Options:
+  -o, --output DIR
+        Use DIR as the destination directory (default: current directory).
+  -f, --file PATTERN
+        Download matching content. May be repeated.
+  -l, --list-files
+        List selectable files without downloading them.
+  -L, --loglevel LEVEL
+        Set logging to debug, info, warning, or error (default: warning).
+  -r, --resume
+        Verify and reuse existing selected output (default: overwrite).
+  -s, --stream
+        Prioritize earlier pieces for playback.
+  -t, --timeout DURATION
+        Fail after DURATION with no newly verified file piece; not a total timeout.
+  -h, --help
+        Show help and exit.
+```
+
+### 4.2 Destination
+
+`--output` names a directory, never an output filename. A relative directory is
+interpreted from the process's initial working directory. The directory must
+already exist. Leech resolves it once if it is a symlink and applies the storage
+rules in §8 below that resolved root.
+
+Leech retains the torrent's name:
+
+- a single-file torrent writes `<output>/<torrent name>`;
+- a multi-file torrent writes `<output>/<torrent name>/<file path>`.
+
+It does not offer output renaming.
+
+### 4.3 File selection
+
+Each `--file` adds a pattern to one union. Matching is case-sensitive and uses
+`/` regardless of the host operating system. `*`, `?`, and `[]` are supported;
+`*` does not cross `/`, and `**` is rejected. A directory match includes all of
+its descendants. Shell metacharacters should be quoted.
+
+For a multi-file torrent, patterns are relative to the torrent root and omit the
+root name. For a single-file torrent, the selectable path is its torrent name.
+The combined selection must match at least one regular file. A selection that
+resolves only to padding, or any selection of a symlink entry, is an error.
+Repeated or overlapping matches do not duplicate work.
+
+If no `--file` is present, Leech uses a magnet's BEP 53 `so` selection when one
+exists; otherwise, it selects all regular files. One or more explicit selectors
+replace, rather than extend, magnet `so`.
+
+### 4.4 File listing
+
+`--list-files` validates metadata and writes every selectable regular-file path
+to standard output, one JSON-quoted path per line in torrent order, with no
+header. Each string contains the path accepted by `--file`: a multi-file path is
+relative to the torrent root, while a single-file path is the torrent name.
+Padding and symlink entries are omitted because Leech cannot select them.
+
+For a local metainfo file, listing performs no network activity. For a magnet or
+bare hash, Leech runs the metadata-only discovery phase, stops and joins its
+workers, sends applicable `stopped` announces, prints the validated file list,
+and exits. Listing never validates, creates, truncates, or writes output or piece
+cache paths.
+
+`--list-files` may be combined only with `--loglevel`. Explicit `--output`,
+`--file`, `--resume`, `--stream`, or `--timeout` options in listing mode are usage
+errors.
+
+### 4.5 Logging
+
+`--loglevel` accepts exactly `debug`, `info`, `warning`, or `error`, ordered from
+most to least detail. The default is `warning`. The selected level includes
+messages at that level and every less detailed level:
+
+- `debug` adds bounded tracker, peer, scheduling, and lifecycle diagnostics;
+- `info` adds phase changes, transfer progress, and successful completion;
+- `warning` reports recoverable or important behavior, including ignored
+  `private=1`;
+- `error` reports only the primary failure and secondary shutdown failures.
+
+Help, usage errors, and `--list-files` output are not filtered by the log level.
+All log messages follow the redaction and escaping rules in §4.9.
+
+### 4.6 Transfer order
+
+`--stream` selects the sequential-priority scheduler described in §13. Leech
+still writes verified ranges to their final files and may request later available
+pieces to keep connections productive. The option does not expose a byte stream,
+choose a media file, or promise uninterrupted playback.
+
+Without `--stream`, Leech uses bulk rarest-first scheduling.
+
+### 4.7 Existing output
+
+Overwrite is the default. After metadata and selection validation, Leech
+truncates existing selected regular files and downloads their wanted pieces from
+scratch. It never truncates unselected or unrelated files, and it cannot bypass
+path, collision, or symlink validation.
+
+`--resume` verifies and reuses existing selected output before transfer discovery,
+as defined in §9. Missing, short, or mismatching data remains eligible for
+download.
+
+### 4.8 No-progress timeout
+
+`--timeout` is only a file-transfer no-progress timeout. It accepts a positive Go
+duration such as `30m`, `2h`, or `1h30m`. A missing option means no timeout; zero
+and negative durations are usage errors.
+
+The timer begins only when file transfer begins and resets only when a new file
+piece passes hash verification. It does not limit metadata discovery, selection,
+or resume hashing. Expiry initiates the ordinary graceful failure path, including
+best-effort `stopped` announces and cache cleanup.
+
+### 4.9 Output and terminal behavior
+
+Standard output contains only `--list-files` results. Logs and interactive status
+go to standard error.
+
+At `info` or `debug` level on an interactive terminal, Leech shows one replaceable
+status line for metadata discovery, optional resume checking, and transfer
+progress. It refreshes no more than once per second. Transfer status includes
+verified selected bytes, selected bytes, active peers, and recent payload rate.
+Phase changes, warnings, and the final result receive permanent lines when their
+levels are enabled.
+
+When standard error is not an interactive terminal, Leech emits enabled log lines
+but no periodic progress. It never uses color or requires terminal capabilities.
+
+Names and other untrusted text are quoted and escaped before display. Tracker
+diagnostics identify a tracker by scheme and host only; they do not print URL
+userinfo, path, or query data that may contain credentials. Leech never echoes a
+complete magnet URI.
+
+Notable results are explicit:
+
+- resumed output that is already valid reports that no transfer was needed;
+- a partial selection reports completion of the selection, not the torrent;
+- failure reports that verified partial output remains resumable when applicable;
+- `private=1` produces a warning that Leech treats the torrent as public.
+
+### 4.10 Exit status and signals
+
+| Status | Meaning |
+| ---: | --- |
+| 0 | The selected output is complete and verified, or the validated file list was written. |
+| 1 | Source, metadata, selection, network, verification, storage, timeout, or cleanup failure. |
+| 2 | Invalid command-line usage. |
+| 130 | Graceful exit after `SIGINT`, where supported. |
+| 143 | Graceful exit after `SIGTERM`, where supported. |
+
+`--help` writes help to standard output and exits 0. Usage errors write a concise
+error and usage synopsis to standard error. Runtime errors write one primary
+error; secondary shutdown failures are diagnostics and do not replace it.
+
+The first termination signal starts the graceful shutdown defined in §15. A
+second may terminate immediately, so cleanup is no longer guaranteed.
+
+### 4.11 Examples
+
+```sh
+leech release.torrent
+
+leech --output /srv/media 'magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567'
+
+leech -l series.torrent
+
+leech -L info -l 'magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567'
+
+leech --file 'Season 1' --file 'extras/*.srt' series.torrent
+
+leech -r -s -f 'movie.mkv' -t 20m \
+  0123456789abcdef0123456789abcdef01234567
+
+leech -- -release.torrent
+```
+
+The CLI deliberately uses one action flag instead of subcommands because listing
+and downloading share source parsing and metadata acquisition. A destination is
+an option rather than a second positional value. Repeated file options preserve
+commas in names, and one log-level option replaces overlapping verbose and quiet
+switches. JSON status and user-tunable protocol settings remain out of scope.
+
+## 5. Protocol profile
 
 Leech implements only the required parts of the local specifications:
 
@@ -78,7 +295,7 @@ Leech implements only the required parts of the local specifications:
 | [52](beps/bep_0052.rst) | Detection and rejection of v2/hybrid metadata |
 | [53](beps/bep_0053.rst) | Magnet file selection |
 
-### 4.1 Explicit profile overrides
+### 5.1 Explicit profile overrides
 
 These are product decisions, not claims of full BEP compliance:
 
@@ -91,7 +308,7 @@ These are product decisions, not claims of full BEP compliance:
 
 Unknown metainfo keys remain part of the exact info-hash bytes but are otherwise ignored. Out-of-scope protocols are not represented as dormant extension points.
 
-## 5. Session phases and ownership
+## 6. Session phases and ownership
 
 One process owns one `Session`. It is the lifetime boundary for metadata, trackers, peer candidates, connections, scheduling, cache staging, output, counters, strikes, and shutdown.
 
@@ -105,6 +322,11 @@ A session moves through explicit phases:
 6. **Shutdown:** Quiesce workers, send final tracker events, clean the current workspace, and return.
 
 At the end of metadata-only discovery, Leech cancels and joins regular tracker loops, dials, and metadata peer connections, then sends bounded `stopped` announcements. Resume scanning therefore runs without concurrent tracker or peer activity. A later transfer phase starts fresh `started` announces with the correct `left`. Bounded endpoint values may remain in memory, but no network worker crosses the phase boundary.
+
+CLI file-listing mode exits after metadata validation and normalization. A local
+`.torrent` listing performs no network activity. A magnet or bare-hash listing
+uses the ordinary metadata-only phase and its `stopped` sequence, then exits
+without selection, resume, output access, or piece-cache creation.
 
 ```text
  source
@@ -135,9 +357,9 @@ The session coordinator solely owns mutable torrent state. Tracker workers, dial
 
 A root context requests cancellation. Every goroutine has an owner, bounded work, an unblock mechanism, and a completion path joined before ordinary exit.
 
-## 6. Input and metadata
+## 7. Input and metadata
 
-### 6.1 Accepted sources
+### 7.1 Accepted sources
 
 - A `.torrent` supplies the encoded info dictionary and tracker metadata.
 - A magnet must contain exactly one effective v1 `btih` topic. Hexadecimal and Base32 forms are accepted. `tr`, `x.pe`, `dn`, and `so` are honored.
@@ -147,7 +369,7 @@ Any magnet containing `btmh` is rejected, even if it also contains `btih`, becau
 
 The default tracker `http://tracker.opentrackr.org:1337/announce` is always added. Duplicate URLs are removed. For `.torrent` input, `announce-list` URLs are used when present; otherwise `announce` is used. Tier grouping is discarded.
 
-### 6.2 Strict bencoding and info hashes
+### 7.2 Strict bencoding and info hashes
 
 The bounded decoder rejects:
 
@@ -160,7 +382,7 @@ The bounded decoder rejects:
 
 For `.torrent` input, Leech records and hashes the exact encoded byte span of `info`; it never computes an info hash by re-encoding a decoded object. BEP 9 metadata is the exact encoded info dictionary and must hash to the requested SHA-1.
 
-### 6.3 v1 validation and normalization
+### 7.3 v1 validation and normalization
 
 Leech validates:
 
@@ -184,7 +406,7 @@ File entries normalize as follows:
 
 After validation, `info.name` is one safe path component used as the conventional output name. A single-file torrent maps to `<destination>/<info.name>`. A multi-file torrent maps to `<destination>/<info.name>/<file path>`. Magnet `dn` never overrides `info.name`.
 
-### 6.4 Metadata acquisition
+### 7.4 Metadata acquisition
 
 A magnet or bare-hash session uses this metadata-only profile:
 
@@ -205,7 +427,7 @@ Fetched metadata remains in bounded memory for the run and is discarded at exit.
 
 Treating `private=1` as public is deliberate. A private torrent may be disclosed to the default tracker and embedded peers and may fail because its tracker expects authentication. Leech does not attempt to preserve BEP 27 isolation.
 
-## 7. Selection and storage mapping
+## 8. Selection and storage mapping
 
 The normalized metadata becomes an immutable file table. Every original file-list position is retained for BEP 53 indexing, while each entry separately records whether it has an output path. Entries also carry length, attributes, and their half-open range in the v1 concatenated byte space.
 
@@ -219,7 +441,7 @@ The destination directory is resolved once if it is a symlink. No descendant tra
 
 Selected zero-length files are created. Other selected files grow as verified ranges arrive and may be sparse while incomplete.
 
-## 8. Resume behavior
+## 9. Resume behavior
 
 Leech persists no resume state. After metadata and selection, resume mode scans output before transfer discovery:
 
@@ -235,7 +457,7 @@ If selected output is already complete, Leech exits without starting transfer di
 
 The optional no-progress timeout starts only when transfer begins. It resets only after a newly completed file piece verifies.
 
-## 9. Tracker subsystem
+## 10. Tracker subsystem
 
 Each unique tracker owns an independent state machine. Source tiers do not suppress one another, and the default tracker always participates.
 
@@ -247,7 +469,7 @@ Every run generates one cryptographically random:
 
 The same values are used across trackers, phases, and address families. The announced port is neither probed nor bound. `uploaded` is always zero.
 
-### 9.1 Accounting
+### 10.1 Accounting
 
 After metadata is known, `left` is the number of real torrent bytes not retained, not merely the selected amount. Skipped non-padding bytes remain left; padding is locally available as synthetic zeros. A partial selection never sends `completed`. Leech sends `completed` only when all regular-file bytes are retained and verified, then sends `stopped` because it exits instead of seeding.
 
@@ -255,17 +477,17 @@ During metadata-only discovery, approved profile exception `left=1` replaces exa
 
 `downloaded` counts received file-payload bytes, including data later discarded or redownloaded. Metadata and transport overhead are excluded.
 
-### 9.2 HTTP(S)
+### 10.2 HTTP(S)
 
 Leech owns the authoritative announce parameters: `info_hash`, `peer_id`, `port`, `uploaded`, `downloaded`, `left`, `event`, `compact`, `key`, and `numwant`. It also removes `ip`, `ipv4`, and `ipv6` and never generates them. Before each request, all existing occurrences of these keys are removed from the tracker URL and exactly one Leech-owned value is added as applicable. Other tracker-specific query data is preserved. Redirect targets are sanitized by the same rule.
 
 HTTP(S) uses bounded bodies, normal redirect limits, standard TLS verification, and compact mode. Responses may contain dictionary peers, compact IPv4 `peers`, and compact IPv6 `peers6`.
 
-### 9.3 UDP
+### 10.3 UDP
 
 UDP trackers implement BEP 15 connection IDs and lifetimes, transaction matching, the specified `15 × 2^n` transaction retransmission schedule, IPv4 and IPv6 response strides, and BEP 41 URL data. This transaction schedule is separate from tracker-loop backoff after a transaction fails. For a dual-stack hostname, one resolved endpoint per available family receives announces with the same session identity.
 
-### 9.4 Tracker state machine
+### 10.4 Tracker state machine
 
 For each phase and tracker:
 
@@ -282,7 +504,7 @@ On a phase transition or final shutdown, the session first cancels and joins eve
 
 Tracker and magnet endpoints may be public, private, or loopback. Invalid ports, unspecified addresses, and multicast addresses are rejected. This intentionally permits untrusted inputs to induce connections to local unicast services.
 
-## 10. Candidate peers and dialing
+## 11. Candidate peers and dialing
 
 Candidate endpoints enter one bounded set keyed by resolved IP and port. DNS results are bounded. TCP and uTP are two attempts for one endpoint, not separate candidates.
 
@@ -300,11 +522,11 @@ Tracker-supplied peer IDs are not used for candidate deduplication. If supplied,
 
 Blacklisted endpoints are not retried in the run. Ordinary failures and timeouts use per-endpoint backoff rather than strikes.
 
-## 11. Peer-wire behavior
+## 12. Peer-wire behavior
 
 The peer layer consumes a reliable `net.Conn` stream from TCP or uTP and runs one framing/state machine.
 
-### 11.1 Local state and no-upload boundary
+### 12.1 Local state and no-upload boundary
 
 Leech always keeps the remote choked and advertises no availability:
 
@@ -316,7 +538,7 @@ Leech sends `interested` only while the remote advertises a wanted piece and `no
 
 The outbound peer-message API contains no file `piece` encoder and no metadata `data` encoder. Transport ACKs, tracker requests, peer control messages, metadata requests/rejects, and block requests are permitted; torrent payload responses are impossible through the API.
 
-### 11.2 Fast Extension
+### 12.2 Fast Extension
 
 Allowed Fast and availability are independent. Leech may request a choked piece only when the remote has both advertised that piece as available and included it in Leech's Allowed Fast set. Allowed Fast alone never implies availability. Suggest Piece is parsed and may be ignored.
 
@@ -324,7 +546,7 @@ When Fast is negotiated, receiving `Have None` immediately replaces the remote p
 
 With Fast negotiated, every request remains outstanding across a choke until exactly one matching piece or reject arrives or the connection closes. Sending cancel or reaching the local request timeout does not erase the expected terminal response; it moves the request to a bounded tombstone so a late matching piece or reject is consumed safely. If adding a required tombstone would exceed the cap, Leech closes the connection without a strike before forgetting any request. Without Fast, choke implicitly releases pending requests, while the same bounded tombstone rule permits race-delayed matching pieces described by BEP 3.
 
-### 11.3 Extension protocol
+### 12.3 Extension protocol
 
 Extension IDs are directional and per connection:
 
@@ -333,7 +555,7 @@ Extension IDs are directional and per connection:
 - Repeated handshakes apply additive enable/disable updates.
 - Unknown extension names and bounded unknown extension messages are ignored.
 
-### 11.4 Requests and framing
+### 12.4 Requests and framing
 
 - Request blocks are at most 16 KiB and never cross a piece boundary.
 - A peer pipeline is bounded and clamps any `reqq` hint to the local cap.
@@ -345,7 +567,7 @@ Extension IDs are directional and per connection:
 
 Persistently choked peers that neither deliver data nor offer useful Allowed Fast pieces are rotated out.
 
-## 12. Piece scheduling and verification
+## 13. Piece scheduling and verification
 
 The coordinator tracks remote availability, wanted pieces, block state, outstanding requests, and endpoint provenance.
 
@@ -353,7 +575,7 @@ Bulk mode chooses the rarest wanted piece among connected peers, with randomized
 
 A block normally has one active request. Once every remaining block has been assigned, endgame may duplicate outstanding requests across productive peers. The first accepted response wins and triggers cancels for redundant requests.
 
-### 12.1 Cache staging
+### 13.1 Cache staging
 
 Leech creates no cache workspace until validated metadata, selection, and resume establish that network piece transfer is required. It then creates a random private workspace under Go's platform user-cache directory, normally `$XDG_CACHE_HOME/leech` or `~/.cache/leech` on Linux. Directories use `0700` and files `0600` where supported.
 
@@ -370,7 +592,7 @@ On success, one output committer opens each affected selected file without follo
 
 A cache or output error fails the session. Verified output remains available for future resume. On orderly exit, the finalizer and all cache handles are joined and closed before workspace removal. If the primary operation succeeded, final close or removal failure becomes the returned error; if a primary failure already exists, cleanup failures are secondary diagnostics. Crashes and immediate second signals may leave ignored workspaces.
 
-## 13. uTP
+## 14. uTP
 
 The in-tree uTP implementation provides an outgoing-only `net.Conn`-compatible stream over one connected UDP socket. It implements BEP 29, not a general transport framework.
 
@@ -390,7 +612,7 @@ It covers:
 
 It does not accept unsolicited SYN packets, share a listener, perform hole punching, or expose server APIs. The peer layer depends only on `net.Conn` and does not branch by transport after dialing.
 
-## 14. Concurrency and lifecycle
+## 15. Concurrency and lifecycle
 
 Ownership boundaries are:
 
@@ -412,11 +634,11 @@ Ordinary transfer shutdown is ordered:
 5. Send `completed` when applicable, then bounded `stopped` announces through separate one-shot operations.
 6. Close all remaining owned cache resources.
 7. Remove the current workspace.
-8. Return the primary result, applying the cleanup-error rule from §12.1.
+8. Return the primary result, applying the cleanup-error rule from §13.1.
 
 Metadata-only phase transition uses the same quiescence rule but sends only `stopped` and creates no cache workspace. A second termination signal may bypass cleanup.
 
-## 15. Supported bounds
+## 16. Supported bounds
 
 These are fixed supported-domain limits, not tuning promises:
 
@@ -458,7 +680,7 @@ All arithmetic is checked in 64 bits before conversion to `int`, allocation, see
 
 Malformed encoded values are never byte-truncated. A complete compact peer string must have a valid stride. Once valid, endpoint records beyond retention limits may be dropped whole and reported diagnostically.
 
-## 16. Security and trust boundaries
+## 17. Security and trust boundaries
 
 Torrent files, metadata peers, trackers, peer messages, paths, cache payload, and existing output are untrusted.
 
@@ -486,7 +708,7 @@ Accepted residual risks are:
 - poor or failed downloads when peers refuse to serve a nonreciprocating client;
 - nonstandard `left=1` accounting before metadata.
 
-## 17. Failure semantics
+## 18. Failure semantics
 
 - Malformed, v2, hybrid, or out-of-bounds metadata fails before output or cache creation.
 - `private=1` does not fail and has no special behavior.
@@ -498,12 +720,28 @@ Accepted residual risks are:
 - Partial verified output remains in final paths for later resume.
 - Final tracker-event failure never replaces the primary result.
 
-## 18. Validation
+## 19. Validation
 
 Validation is local and deterministic; it never uses existing clients or live trackers.
 
 Required evidence includes:
 
+- CLI parser tests covering every option form, `--`, hash-shaped paths, repeated
+  file selection, list-mode conflicts, log levels, bad arity, malformed durations,
+  and unsupported stdin;
+- CLI golden tests covering help text, usage failures, quoted untrusted names,
+  redacted tracker diagnostics, log filtering, TTY status replacement, non-TTY
+  line output, and JSON-quoted file lists;
+- CLI selection tests covering exact paths, each supported metacharacter,
+  directories, multiple patterns, `**`, no matches, padding, symlinks,
+  single-file torrents, and explicit selection overriding magnet `so`;
+- CLI lifecycle tests proving that command-line and pre-network validation
+  failures create no output or cache files and send no network traffic, that local
+  file listings stay offline, and that remote listings stop after metadata
+  acquisition without touching output or piece-cache paths;
+- CLI integration tests covering output mapping, default overwrite, optional
+  resume, bulk and streaming scheduling, no-progress timeout behavior, exit
+  statuses, partial-output messages, and first-signal cleanup;
 - golden vectors for bencoding, exact info hashes, compact endpoints, peer frames, Fast messages, BEP 10 directionality, metadata messages, UDP trackers, and uTP packets;
 - fuzzing of parsers and state-machine transitions for bencoding, metainfo, magnets, trackers, peer wire, BEP 6, BEP 10, metadata transfer, uTP, transport racing, peer-ID deduplication, strike accounting, and session shutdown;
 - properties for checked ranges, file normalization, BEP 53 indexing, selection, block coverage, rarity, tracker accounting, and sequence wraparound;
@@ -525,7 +763,7 @@ Tests observe bounded, read-only per-session debug events or counters for ordina
 
 Production builds are pure Go. Race tooling may enable cgo or require a C toolchain where the current Go release requires it.
 
-## 19. Key tradeoffs
+## 20. Key tradeoffs
 
 - **No upload:** preserves product identity but substantially reduces swarm cooperation.
 - **Premetadata `left=1`:** enables tracker-based metadata discovery without knowing size, but is not BEP-defined accounting.
