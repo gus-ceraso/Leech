@@ -311,7 +311,7 @@ func fullSelection(meta torrent.Metainfo, selection *torrent.SelectionPlan) bool
 		selected[file.Index] = struct{}{}
 	}
 	for _, file := range meta.Files {
-		if file.Kind != torrent.RegularFile || file.Range.End == file.Range.Begin {
+		if file.Kind != torrent.RegularFile {
 			continue
 		}
 		if _, ok := selected[file.Index]; !ok {
