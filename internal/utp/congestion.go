@@ -2,6 +2,7 @@ package utp
 
 import (
 	"errors"
+	"math/bits"
 	"time"
 
 	"github.com/gus-ceraso/Leech/internal/limits"
@@ -215,9 +216,7 @@ func (c *CongestionController) ObserveDelay(now time.Time, reported time.Duratio
 	// window utilization. One packet per observation is deliberately modest;
 	// it avoids an unbounded jump when ACKs arrive in a burst while preserving
 	// the required direction and byte-based window semantics.
-	gain := int64(c.packet)
-	gain = gain * int64(offTarget) / int64(c.target)
-	gain = gain * int64(outstanding) / int64(c.maxWindow)
+	gain := boundedGain(c.packet, offTarget, c.target, outstanding, c.maxWindow)
 	if gain == 0 && offTarget != 0 {
 		if offTarget > 0 {
 			gain = 1
@@ -270,6 +269,73 @@ func (c *CongestionController) OnTimeout() {
 	}
 	c.packet = c.minPacket
 	c.maxWindow = uint32(c.minPacket)
+}
+
+// boundedGain evaluates packet * offTarget / target * outstanding / window
+// without allowing an intermediate product to wrap. Only the final change
+// that can affect the bounded window is needed: positive gain is capped at
+// the remaining supported window, and negative gain is capped at the current
+// window. The two staged divisions preserve the BEP expression's truncation
+// order while mulDivCap handles products wider than uint64 safely.
+func boundedGain(packet int, offTarget, target time.Duration, outstanding, maxWindow uint32) int64 {
+	if packet <= 0 || offTarget == 0 || target <= 0 || outstanding == 0 || maxWindow == 0 {
+		return 0
+	}
+	negative := offTarget < 0
+	absOffTarget := uint64(offTarget)
+	if negative {
+		// Avoid negating the minimum signed integer in a general helper. The
+		// current caller's timestamp range is smaller, but this keeps the
+		// arithmetic invariant explicit.
+		absOffTarget = uint64(-(offTarget + 1)) + 1
+	}
+	windowLimit := uint64(limits.UTPBufferBytes)
+	capGain := uint64(maxWindow)
+	if !negative {
+		if uint64(maxWindow) >= windowLimit {
+			return 0
+		}
+		capGain = windowLimit - uint64(maxWindow)
+	}
+	if capGain == 0 {
+		return 0
+	}
+
+	// If the first quotient exceeds this threshold, the final quotient is
+	// already at least capGain. The multiplication is bounded by 4 MiB².
+	firstCap := capGain*uint64(maxWindow)/uint64(outstanding) + 1
+	first := mulDivCap(uint64(packet), absOffTarget, uint64(target), firstCap)
+	second := mulDivCap(first, uint64(outstanding), uint64(maxWindow), capGain)
+	if second == 0 {
+		second = 1
+	}
+	if negative {
+		return -int64(second)
+	}
+	return int64(second)
+}
+
+// mulDivCap returns min(cap, floor(a*b/denominator)). It uses a 128-bit
+// product comparison before division, so no product can wrap and the bounded
+// result remains exact even when a*b does not fit in uint64.
+func mulDivCap(a, b, denominator, cap uint64) uint64 {
+	if a == 0 || b == 0 || denominator == 0 || cap == 0 {
+		return 0
+	}
+	productHigh, productLow := bits.Mul64(a, b)
+	capHigh, capLow := bits.Mul64(cap, denominator)
+	if productHigh > capHigh || (productHigh == capHigh && productLow >= capLow) {
+		return cap
+	}
+	if productHigh >= denominator {
+		// The quotient would exceed uint64, and therefore also exceeds cap.
+		return cap
+	}
+	quotient, _ := bits.Div64(productHigh, productLow, denominator)
+	if quotient > cap {
+		return cap
+	}
+	return quotient
 }
 
 // UpdateRTT applies the BEP 29 estimator to one packet that was transmitted
