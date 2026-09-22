@@ -705,6 +705,11 @@ copies of this implementation successfully talking to each other.
   arithmetic, SACKs, retransmission, congestion control, window bounds, and
   cancellation. Keep tuning suggestions separate from correctness fixes.
 
+  Initial R4 review found open correctness fixes: update outgoing ACK/window/delay
+  fields and STATE ACK headers in U4; reject handshake RESET in U4; prevent
+  post-FIN delivery in U2; and bound congestion arithmetic in U3. Recheck those
+  fixes and full-stream coverage before marking R4 complete.
+
 ## Group 5: Complete CLI and lifecycle
 
 ### L1. Logs, status, and signal adapter
