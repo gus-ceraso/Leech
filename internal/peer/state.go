@@ -26,6 +26,7 @@ type PeerStateConfig struct {
 	LastPieceLength uint32
 	Fast            bool
 	ReqQ            uint32
+	ReqQSet         bool
 }
 
 // StateEffect reports a decoded message's coordinator-visible consequence.
@@ -87,7 +88,7 @@ func NewPeerStateWithConfig(config PeerStateConfig) (*PeerState, error) {
 	}
 	requests := NewRequestTable(config.Fast)
 	reqq := ClampReqQ(config.ReqQ)
-	if config.ReqQ == 0 {
+	if !config.ReqQSet && config.ReqQ == 0 {
 		reqq = limits.PeerRequests
 	}
 	return &PeerState{
@@ -121,17 +122,28 @@ func (s *PeerState) ReqQ() int {
 	return s.reqQ
 }
 
-// SetReqQ applies a later remote reqq hint and returns the effective local
-// pipeline cap. A zero hint means that the remote did not advertise a limit.
+// SetReqQ applies a later, explicitly present remote reqq hint and returns the
+// effective local pipeline cap. Use SetReqQHint when presence is optional.
 func (s *PeerState) SetReqQ(reqq uint32) int {
 	if s == nil {
 		return 0
 	}
 	s.reqQ = ClampReqQ(reqq)
-	if reqq == 0 {
-		s.reqQ = limits.PeerRequests
-	}
 	return s.reqQ
+}
+
+// SetReqQHint preserves the distinction between a missing reqq dictionary
+// key and an explicitly advertised zero. A missing hint leaves the supported
+// local cap in place; an explicit zero permits no outstanding requests.
+func (s *PeerState) SetReqQHint(reqq uint32, present bool) int {
+	if s == nil {
+		return 0
+	}
+	if !present {
+		s.reqQ = limits.PeerRequests
+		return s.reqQ
+	}
+	return s.SetReqQ(reqq)
 }
 
 func (s *PeerState) Requests() *RequestTable {

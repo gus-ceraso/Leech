@@ -108,7 +108,7 @@ func TestPeerStateIncomingRequestsNeverProducePayload(t *testing.T) {
 	if len(effect.Response.Payload) != 12 {
 		t.Fatal("reject response does not identify the request")
 	}
-	if _, err := state.ApplyMessage(Message{ID: RequestID, Payload: payload}); !errors.Is(err, ErrIncomingRequest) {
+	if _, err := state.ApplyMessage(Message{ID: RequestID, Payload: payload}); !errors.Is(err, ErrIncomingRequest) || !IsProtocolViolation(err) || ClassOf(err) != ClassProtocolViolation {
 		t.Fatalf("repeated incoming request error = %v", err)
 	}
 	nonFast, err := NewPeerState(3, false)
@@ -118,6 +118,44 @@ func TestPeerStateIncomingRequestsNeverProducePayload(t *testing.T) {
 	effect, err = nonFast.ApplyMessage(Message{ID: RequestID, Payload: payload})
 	if err != nil || effect.Response != nil {
 		t.Fatalf("non-Fast incoming request = %#v, %v", effect, err)
+	}
+}
+
+func TestPeerStateUnsolicitedTerminalIsProtocolViolation(t *testing.T) {
+	state, err := NewPeerStateWithConfig(PeerStateConfig{PieceCount: 1, PieceLength: 1024, Fast: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := make([]byte, 9)
+	if _, err := state.ApplyMessage(Message{ID: PieceID, Payload: payload}); !errors.Is(err, ErrUnexpectedTerminal) || !IsProtocolViolation(err) || ClassOf(err) != ClassProtocolViolation {
+		t.Fatalf("unsolicited piece error = %v, class=%v", err, ClassOf(err))
+	}
+	reject := blockPayload(0, 0, 1)
+	if _, err := state.ApplyMessage(Message{ID: RejectRequestID, Payload: reject}); !errors.Is(err, ErrUnexpectedTerminal) || !IsProtocolViolation(err) {
+		t.Fatalf("unsolicited reject error = %v", err)
+	}
+}
+
+func TestPeerStateReqQPresence(t *testing.T) {
+	implicit, err := NewPeerStateWithConfig(PeerStateConfig{PieceCount: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if implicit.ReqQ() != 128 {
+		t.Fatalf("missing reqq = %d", implicit.ReqQ())
+	}
+	explicit, err := NewPeerStateWithConfig(PeerStateConfig{PieceCount: 1, ReqQSet: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if explicit.ReqQ() != 0 {
+		t.Fatalf("explicit zero reqq = %d", explicit.ReqQ())
+	}
+	if got := explicit.SetReqQHint(0, false); got != 128 {
+		t.Fatalf("missing later reqq = %d", got)
+	}
+	if got := explicit.SetReqQ(129); got != 128 {
+		t.Fatalf("clamped later reqq = %d", got)
 	}
 }
 
