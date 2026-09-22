@@ -98,6 +98,21 @@ func NewTransfer(config TransferConfig) (*Transfer, error) {
 	if config.PieceCount == 0 || config.PieceLength == 0 || config.LastPieceLength == 0 {
 		return nil, fmt.Errorf("%w: full torrent piece geometry is required", ErrTransferConfig)
 	}
+	if config.LastPieceLength > config.PieceLength {
+		return nil, fmt.Errorf("%w: invalid full torrent piece geometry", ErrTransferConfig)
+	}
+	for _, mapping := range config.Selection.PiecePlans() {
+		if mapping.Piece.Index < 0 || uint32(mapping.Piece.Index) >= config.PieceCount {
+			return nil, fmt.Errorf("%w: selected piece %d is outside full torrent", ErrTransferConfig, mapping.Piece.Index)
+		}
+		length := mapping.Piece.Range.End - mapping.Piece.Range.Begin
+		if length <= 0 || uint64(length) > uint64(config.PieceLength) {
+			return nil, fmt.Errorf("%w: selected piece %d has invalid length", ErrTransferConfig, mapping.Piece.Index)
+		}
+		if uint32(mapping.Piece.Index+1) == config.PieceCount && uint32(length) != config.LastPieceLength {
+			return nil, fmt.Errorf("%w: selected final piece length does not match full torrent", ErrTransferConfig)
+		}
+	}
 	scheduler, err := NewScheduler(config.Selection, config.SchedulerConfig)
 	if err != nil {
 		return nil, err
@@ -280,6 +295,10 @@ func (t *Transfer) startPeer(ctx context.Context, input ConnectedPeer) (*transfe
 func (t *Transfer) drive(ctx context.Context, peers []*transferPeer) error {
 	for _, p := range peers {
 		if p == nil || p.done {
+			continue
+		}
+		if t.scheduler.IsBlacklisted(p.input.Endpoint) {
+			_ = t.disconnectPeer(p, fmt.Errorf("peer endpoint blacklisted"))
 			continue
 		}
 		if p.state.Choked() {
