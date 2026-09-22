@@ -183,6 +183,8 @@ func (d *MetadataDiscovery) Run(ctx context.Context) (result MetadataResult, pri
 
 	set := config.TrackerSet
 	ownSet := false
+	var pool *peer.CandidatePool
+	var err error
 	if set == nil {
 		ownSet = true
 		identity := config.Identity
@@ -207,7 +209,7 @@ func (d *MetadataDiscovery) Run(ctx context.Context) (result MetadataResult, pri
 			Clock:     config.TrackerClock,
 			Random:    config.Random,
 			OnUpdate:  callback,
-			NeedPeers: func() bool { return true },
+			NeedPeers: func() bool { return pool == nil || pool.Len() == 0 },
 		})
 		if err != nil {
 			return MetadataResult{}, fmt.Errorf("%w: tracker set: %v", ErrMetadataConfig, err)
@@ -228,7 +230,7 @@ func (d *MetadataDiscovery) Run(ctx context.Context) (result MetadataResult, pri
 	local.Reserved[5] |= metadataExtensionReservedBit
 
 	resolver := config.Resolver
-	pool, err := peer.NewCandidatePool(peer.CandidatePoolConfig{Resolver: resolver})
+	pool, err = peer.NewCandidatePool(peer.CandidatePoolConfig{Resolver: resolver})
 	if err != nil {
 		return MetadataResult{}, fmt.Errorf("%w: candidate pool: %v", ErrMetadataConfig, err)
 	}
