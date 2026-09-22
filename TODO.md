@@ -632,9 +632,13 @@ local metadata-discovery tests. **References:** DESIGN §§6, 7.4, 15.
   of file-payload requests. Assert the phase boundary under the race detector.
   Initial local fixtures cover multi-block metadata, refusal, repeated extension
   IDs, one invalid complete candidate, cancellation, and request rejection.
-  Add explicit wrong-size, retry, tracker-loss, no-file-payload-request, and
-  phase-boundary evidence before M2 acceptance; L2/V1 cover full magnet and
-  bare-hash command flows.
+  R3 requires five more deterministic fixtures before sign-off: wrong advertised
+  size rotates to a second peer without a strike or mixed blocks; refusal or
+  timeout rotates with ordinary backoff; a transmitted but unanswered tracker
+  `started` still gets `stopped` with no later regular announce; an incoming
+  core payload request reads and serves no file data; and discovery returns
+  only after metadata peers and tracker loops join. L2/V1 cover full magnet
+  and bare-hash command flows.
 
 **Acceptance:** the metadata milestone obtains valid metainfo from local fixtures
 and returns only after workers stop. It creates no piece workspace/output,
