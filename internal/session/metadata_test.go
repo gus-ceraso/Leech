@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -22,6 +23,13 @@ type metadataFixtureTracker struct {
 	requests []tracker.AnnounceRequest
 	urls     []string
 	port     uint16
+	ports    []uint16
+}
+
+func TestNewMetadataDiscoveryAcceptsZeroInfoHash(t *testing.T) {
+	if _, err := NewMetadataDiscovery(MetadataConfig{}); err != nil {
+		t.Fatalf("zero info hash rejected: %v", err)
+	}
 }
 
 func (f *metadataFixtureTracker) Announce(_ context.Context, trackerURL string, request tracker.AnnounceRequest) (tracker.HTTPAnnounceResult, error) {
@@ -29,11 +37,17 @@ func (f *metadataFixtureTracker) Announce(_ context.Context, trackerURL string, 
 	f.requests = append(f.requests, request)
 	f.urls = append(f.urls, trackerURL)
 	f.mu.Unlock()
-	return tracker.HTTPAnnounceResult{
-		Interval:    time.Second,
-		Transmitted: true,
-		Peers:       []tracker.HTTPPeer{{Host: "127.0.0.1", Port: f.port}},
-	}, nil
+	f.mu.Lock()
+	ports := append([]uint16(nil), f.ports...)
+	if len(ports) == 0 {
+		ports = []uint16{f.port}
+	}
+	f.mu.Unlock()
+	peers := make([]tracker.HTTPPeer, 0, len(ports))
+	for _, port := range ports {
+		peers = append(peers, tracker.HTTPPeer{Host: "127.0.0.1", Port: port})
+	}
+	return tracker.HTTPAnnounceResult{Interval: time.Second, Transmitted: true, Peers: peers}, nil
 }
 
 func (f *metadataFixtureTracker) snapshot() []tracker.AnnounceRequest {
@@ -173,6 +187,100 @@ func TestMetadataDiscoveryRejectsInvalidCompleteCandidateAndReportsStrike(t *tes
 	}
 }
 
+func TestMetadataDiscoveryRotatesRefusalAndAcceptsRepeatedExtensionID(t *testing.T) {
+	info := largeTestInfo(t)
+	digest := sha1.Sum(info)
+	var expected torrent.InfoHash
+	copy(expected[:], digest[:])
+	fixture := &metadataFixtureTracker{ports: []uint16{51415, 51416}}
+	dial := func(ctx context.Context, _ string, address string) (net.Conn, error) {
+		client, server := net.Pipe()
+		if strings.HasSuffix(address, ":51415") {
+			go serveRefusingMetadataPeer(t, server, expected)
+		} else {
+			go serveMetadataPeerWithIDChange(t, server, expected, info)
+		}
+		return client, nil
+	}
+	result, err := DiscoverMetadata(context.Background(), MetadataConfig{
+		InfoHash:    expected,
+		HTTP:        fixture,
+		TCPDial:     dial,
+		Identity:    tracker.Identity{PeerID: [20]byte{3}, Port: 49154},
+		PeerTimeout: time.Second,
+	})
+	if err != nil {
+		t.Fatalf("DiscoverMetadata: %v", err)
+	}
+	if result.Metainfo.InfoHash != expected {
+		t.Fatalf("info hash = %x, want %x", result.Metainfo.InfoHash, expected)
+	}
+}
+
+func TestMetadataDiscoveryCancellationClosesSilentPeer(t *testing.T) {
+	info := testInfo(t)
+	digest := sha1.Sum(info)
+	var expected torrent.InfoHash
+	copy(expected[:], digest[:])
+	serverDone := make(chan struct{})
+	dial := func(context.Context, string, string) (net.Conn, error) {
+		client, server := net.Pipe()
+		go serveSilentMetadataPeer(t, server, expected, serverDone)
+		return client, nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+	defer cancel()
+	_, err := DiscoverMetadata(ctx, MetadataConfig{
+		InfoHash:    expected,
+		Peers:       []torrent.PeerAddress{{Host: "127.0.0.1", Port: 51417}},
+		HTTP:        &metadataFixtureTracker{},
+		TCPDial:     dial,
+		PeerTimeout: time.Minute,
+		Identity:    tracker.Identity{PeerID: [20]byte{4}, Port: 49155},
+	})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error = %v, want context deadline", err)
+	}
+	select {
+	case <-serverDone:
+	case <-time.After(time.Second):
+		t.Fatal("silent metadata peer was not joined")
+	}
+}
+
+func TestMetadataDiscoveryRejectsIncomingMetadataRequest(t *testing.T) {
+	info := testInfo(t)
+	digest := sha1.Sum(info)
+	var expected torrent.InfoHash
+	copy(expected[:], digest[:])
+	seenReject := make(chan bool, 1)
+	dial := func(context.Context, string, string) (net.Conn, error) {
+		client, server := net.Pipe()
+		go serveNoUploadMetadataPeer(t, server, expected, info, seenReject)
+		return client, nil
+	}
+	result, err := DiscoverMetadata(context.Background(), MetadataConfig{
+		InfoHash: expected,
+		Peers:    []torrent.PeerAddress{{Host: "127.0.0.1", Port: 51418}},
+		HTTP:     &metadataFixtureTracker{}, TCPDial: dial,
+		Identity: tracker.Identity{PeerID: [20]byte{5}, Port: 49156},
+	})
+	if err != nil {
+		t.Fatalf("DiscoverMetadata: %v", err)
+	}
+	if result.Metainfo.InfoHash != expected {
+		t.Fatalf("info hash = %x, want %x", result.Metainfo.InfoHash, expected)
+	}
+	select {
+	case rejected := <-seenReject:
+		if !rejected {
+			t.Fatal("incoming metadata request was not rejected")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("metadata peer did not report request response")
+	}
+}
+
 func serveMetadataPeer(t *testing.T, conn net.Conn, infoHash torrent.InfoHash, metadata []byte, done chan struct{}) {
 	t.Helper()
 	defer close(done)
@@ -218,6 +326,134 @@ func serveMetadataPeer(t *testing.T, conn net.Conn, infoHash torrent.InfoHash, m
 			return
 		}
 	}
+}
+
+func serveRefusingMetadataPeer(t *testing.T, conn net.Conn, infoHash torrent.InfoHash) {
+	t.Helper()
+	defer conn.Close()
+	remote := peer.Handshake{InfoHash: [20]byte(infoHash), PeerID: [20]byte{10}, Reserved: [8]byte{5: 0x10}}
+	if _, err := peer.ReadHandshake(conn, &remote.InfoHash, nil); err != nil {
+		return
+	}
+	if err := peer.WriteHandshake(conn, remote.InfoHash, remote.PeerID, remote.Reserved); err != nil {
+		return
+	}
+	if _, err := peer.ReadMessage(conn); err != nil {
+		return
+	}
+	if err := writeTestFrame(conn, extensionHandshakeFrame(7, 1)); err != nil {
+		return
+	}
+	_, _ = peer.ReadMessage(conn)
+	_ = writeTestFrame(conn, metadataControlFrame(7, peer.MetadataReject, 0))
+}
+
+func serveMetadataPeerWithIDChange(t *testing.T, conn net.Conn, infoHash torrent.InfoHash, metadata []byte) {
+	t.Helper()
+	defer conn.Close()
+	remote := peer.Handshake{InfoHash: [20]byte(infoHash), PeerID: [20]byte{11}, Reserved: [8]byte{5: 0x10}}
+	if _, err := peer.ReadHandshake(conn, &remote.InfoHash, nil); err != nil {
+		return
+	}
+	if err := peer.WriteHandshake(conn, remote.InfoHash, remote.PeerID, remote.Reserved); err != nil {
+		return
+	}
+	if _, err := peer.ReadMessage(conn); err != nil {
+		return
+	}
+	total := int64(len(metadata))
+	if err := writeTestFrame(conn, extensionHandshakeFrame(7, total)); err != nil {
+		return
+	}
+	for piece := uint32(0); ; piece++ {
+		message, err := peer.ReadMessage(conn)
+		if err != nil || message.ID != peer.ExtendedID || len(message.Payload) == 0 {
+			return
+		}
+		request, err := peer.ParseMetadataControl(message.Payload[1:])
+		if err != nil || request.Type != peer.MetadataRequest || request.Piece != piece {
+			return
+		}
+		if piece == 0 {
+			if err := writeTestFrame(conn, extensionHandshakeFrame(9, total)); err != nil {
+				return
+			}
+		}
+		begin := int(piece) * 16 << 10
+		end := begin + 16<<10
+		if end > len(metadata) {
+			end = len(metadata)
+		}
+		if err := writeTestFrame(conn, metadataDataFrame(1, piece, total, metadata[begin:end])); err != nil {
+			return
+		}
+		if end == len(metadata) {
+			return
+		}
+	}
+}
+
+func serveSilentMetadataPeer(t *testing.T, conn net.Conn, infoHash torrent.InfoHash, done chan struct{}) {
+	t.Helper()
+	defer close(done)
+	defer conn.Close()
+	remote := peer.Handshake{InfoHash: [20]byte(infoHash), PeerID: [20]byte{12}, Reserved: [8]byte{5: 0x10}}
+	if _, err := peer.ReadHandshake(conn, &remote.InfoHash, nil); err != nil {
+		return
+	}
+	if err := peer.WriteHandshake(conn, remote.InfoHash, remote.PeerID, remote.Reserved); err != nil {
+		return
+	}
+	_, _ = peer.ReadMessage(conn)
+	_, _ = peer.ReadMessage(conn)
+}
+
+func serveNoUploadMetadataPeer(t *testing.T, conn net.Conn, infoHash torrent.InfoHash, metadata []byte, result chan bool) {
+	t.Helper()
+	defer conn.Close()
+	remote := peer.Handshake{InfoHash: [20]byte(infoHash), PeerID: [20]byte{13}, Reserved: [8]byte{5: 0x10}}
+	if _, err := peer.ReadHandshake(conn, &remote.InfoHash, nil); err != nil {
+		result <- false
+		return
+	}
+	if err := peer.WriteHandshake(conn, remote.InfoHash, remote.PeerID, remote.Reserved); err != nil {
+		result <- false
+		return
+	}
+	if _, err := peer.ReadMessage(conn); err != nil {
+		result <- false
+		return
+	}
+	total := int64(len(metadata))
+	if err := writeTestFrame(conn, extensionHandshakeFrame(7, total)); err != nil {
+		result <- false
+		return
+	}
+	message, err := peer.ReadMessage(conn)
+	if err != nil || message.ID != peer.ExtendedID || len(message.Payload) == 0 {
+		result <- false
+		return
+	}
+	request, err := peer.ParseMetadataControl(message.Payload[1:])
+	if err != nil || request.Type != peer.MetadataRequest {
+		result <- false
+		return
+	}
+	if err := writeTestFrame(conn, metadataControlFrame(1, peer.MetadataRequest, 0)); err != nil {
+		result <- false
+		return
+	}
+	message, err = peer.ReadMessage(conn)
+	if err != nil || message.ID != peer.ExtendedID || len(message.Payload) == 0 {
+		result <- false
+		return
+	}
+	control, err := peer.ParseMetadataControl(message.Payload[1:])
+	if err != nil || control.Type != peer.MetadataReject {
+		result <- false
+		return
+	}
+	result <- writeTestFrame(conn, metadataDataFrame(1, 0, total, metadata)) == nil
 }
 
 func largeTestInfo(t *testing.T) []byte {
@@ -266,6 +502,14 @@ func metadataDataFrame(id byte, piece uint32, total int64, block []byte) []byte 
 		{Key: []byte("total_size"), Value: bencode.Value{Type: bencode.Integer, Int: total}},
 	}})
 	return extensionFrame(id, append(header, block...))
+}
+
+func metadataControlFrame(id byte, typ peer.MetadataMessageType, piece uint32) []byte {
+	body, _ := bencode.Encode(bencode.Value{Type: bencode.Dictionary, Dict: []bencode.Entry{
+		{Key: []byte("msg_type"), Value: bencode.Value{Type: bencode.Integer, Int: int64(typ)}},
+		{Key: []byte("piece"), Value: bencode.Value{Type: bencode.Integer, Int: int64(piece)}},
+	}})
+	return extensionFrame(id, body)
 }
 
 func extensionFrame(id byte, body []byte) []byte {
