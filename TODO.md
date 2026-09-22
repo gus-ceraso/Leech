@@ -332,7 +332,9 @@ starting transfer discovery when selection is already complete.
   explicitly present empty padding `path` list; BEP 47 permits omission, not an
   empty list. I3 also accepts invalid UTF-8 in announce URLs because Go's URL
   parser percent-encodes the raw invalid byte. Return both to the I3 worker with
-  focused fixtures.
+  focused fixtures. R1 also found that I4 accepts up to 100,000 patterns and
+  files but may perform roughly 10 billion pattern comparisons. Ask the I4
+  worker for a bounded-work fix that preserves the supported selection domain.
 
 ## Group 2: Peer protocol and the first download
 
