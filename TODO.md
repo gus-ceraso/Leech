@@ -476,6 +476,10 @@ and peer-replacement policy. **References:** DESIGN §§4.6, 12–13.
 - [ ] Rotate persistently choked/unproductive peers while retaining useful data
   suppliers and useful Allowed Fast peers. Use fixed initial timings and ordinary
   endpoint backoff, not corruption penalties or extra upload behavior.
+- [ ] Let transfer wait for and admit later handshaken peers after current peers
+  disconnect, without spinning or ending the default indefinite retry. Seed
+  resume-verified pieces and metadata-phase endpoint strikes before transfer;
+  report each newly verified piece after output commit for timeout/accounting.
 - [ ] Test changing availability, scarce pieces, winner/late-response races,
   duplicate payload accounting, tombstone pressure, replacement, and reconnects.
   Add event-sequence fuzz coverage for the new transitions.
