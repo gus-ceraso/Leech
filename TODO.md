@@ -498,10 +498,10 @@ idle connections, and endgame cannot double-commit a block or leak request slots
     concurrent `Start`/`Close` join-safe.
   - [ ] P2: enforce initial availability message ordering, so late bitfields
     cannot restore availability after `Have None`.
-  - [ ] D3: treat closed worker channels and Fast tombstone-cap choke as
+  - [x] D3: treat closed worker channels and Fast tombstone-cap choke as
     peer-local disconnects; release every initial peer on startup failure;
     preserve explicit `reqq=0`; expose received-payload accounting and a
-    pre-peer-shutdown callback for ordered tracker quiescence.
+    pre-peer-shutdown callback for ordered tracker quiescence (`f43f7c6`).
 
 ## Group 3: Trackers and metadata discovery
 
