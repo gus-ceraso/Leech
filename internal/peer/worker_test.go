@@ -55,6 +55,9 @@ func TestConnectionWorkerCloseBeforeStartSealsWorker(t *testing.T) {
 	if err := worker.Wait(); !errors.Is(err, ErrWorkerClosed) && err != nil {
 		t.Fatalf("Wait after Close before Start = %v", err)
 	}
+	if err := worker.Send(Message{ID: ChokeID}); !errors.Is(err, ErrWorkerClosed) {
+		t.Fatalf("Send after Close before Start = %v", err)
+	}
 	_ = remote.Close()
 }
 

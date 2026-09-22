@@ -113,6 +113,14 @@ func (w *ConnectionWorker) SendContext(ctx context.Context, message Message) err
 		ctx = context.Background()
 	}
 	w.Start(context.Background())
+	// A closed done channel and a buffered command slot can both be ready. A
+	// single select would then randomly accept a command after Close. Check
+	// terminal state first so sequential sends after Close are deterministic.
+	select {
+	case <-w.done:
+		return ErrWorkerClosed
+	default:
+	}
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
