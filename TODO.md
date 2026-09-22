@@ -198,21 +198,21 @@ storage side effects, and the documented CLI examples parse as specified.
 **Depends on:** I1. **Owns:** `internal/torrent/metainfo.go` and normalization
 tests. **References:** DESIGN §§7.2–7.3, 8, 16; BEPs 3, 12, 47, 52.
 
-- [ ] Bound file reads and metadata bytes, hash the exact `info` span, and accept
+- [x] Bound file reads and metadata bytes, hash the exact `info` span, and accept
   both a full metainfo file and a fetched info dictionary at the appropriate
   boundary. Preserve unknown keys in the hash while ignoring their semantics.
-- [ ] Validate single-file versus multi-file exclusivity, piece length/count,
+- [x] Validate single-file versus multi-file exclusivity, piece length/count,
   SHA-1 string length, UTF-8 where required, checked total length, and all metadata
   limits. Reject v2 and hybrid structures.
-- [ ] Build immutable file and piece tables with half-open ranges and every
+- [x] Build immutable file and piece tables with half-open ranges and every
   original file-list position. Normalize padding without a path, symlinks without
   a length, and ignored attributes correctly. Validate names, path structure,
   duplicates, and file/directory collisions; S1 adds filesystem-specific checks.
-- [ ] Retain the conventional `info.name` output root. Recognize but ignore
+- [x] Retain the conventional `info.name` output root. Recognize but ignore
   `private=1` and expose it for the required warning. Extract flattened
   `announce-list` trackers, or `announce` when the list is absent; I2's helper is
   connected during I4 integration, so I3 need not wait for I2.
-- [ ] Add normalization/range properties, golden info hashes, and metainfo fuzzing,
+- [x] Add normalization/range properties, golden info hashes, and metainfo fuzzing,
   including zero-length content, omitted fields, overflow, and malformed tables.
 
 **Acceptance:** invalid metadata fails before output/cache creation; valid
