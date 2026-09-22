@@ -303,13 +303,19 @@ func fullSelection(meta torrent.Metainfo, selection *torrent.SelectionPlan) bool
 	if selection == nil {
 		return false
 	}
-	regular := 0
+	selected := make(map[int]struct{}, len(selection.SelectedFiles()))
+	for _, file := range selection.SelectedFiles() {
+		selected[file.Index] = struct{}{}
+	}
 	for _, file := range meta.Files {
-		if file.Kind == torrent.RegularFile {
-			regular++
+		if file.Kind != torrent.RegularFile || file.Range.End == file.Range.Begin {
+			continue
+		}
+		if _, ok := selected[file.Index]; !ok {
+			return false
 		}
 	}
-	return len(selection.SelectedFiles()) == regular
+	return true
 }
 
 func realTorrentBytes(meta torrent.Metainfo) int64 {
