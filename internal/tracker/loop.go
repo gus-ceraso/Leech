@@ -279,12 +279,19 @@ func (s *TrackerSet) Close(ctx context.Context) error {
 	}
 	s.mu.Lock()
 	if s.closed {
+		run := s.current
 		owned := s.ownedUDP
 		s.mu.Unlock()
-		if owned != nil {
-			return owned.Close()
+		var err error
+		if run != nil {
+			err = run.Finalize(ctx, false)
 		}
-		return nil
+		if owned != nil {
+			if closeErr := owned.Close(); err == nil {
+				err = closeErr
+			}
+		}
+		return err
 	}
 	s.closed = true
 	run := s.current

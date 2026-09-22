@@ -19,6 +19,27 @@ type loopHTTPResponse struct {
 	err    error
 }
 
+type loopUDP struct {
+	mu       sync.Mutex
+	requests []AnnounceRequest
+	result   AnnounceResult
+	err      error
+}
+
+func (f *loopUDP) Announce(_ context.Context, _ string, request AnnounceRequest) (AnnounceResult, error) {
+	f.mu.Lock()
+	f.requests = append(f.requests, request)
+	result, err := f.result, f.err
+	f.mu.Unlock()
+	return result, err
+}
+
+func (f *loopUDP) snapshot() []AnnounceRequest {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]AnnounceRequest(nil), f.requests...)
+}
+
 func (f *loopHTTP) Announce(_ context.Context, _ string, request AnnounceRequest) (HTTPAnnounceResult, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -110,6 +131,162 @@ func TestTrackerSetCountsUniqueURLsForBound(t *testing.T) {
 	if got := set.Trackers(); len(got) != 1 || got[0] != trackers[0] {
 		t.Fatalf("deduplicated trackers = %v", got)
 	}
+}
+
+func TestHTTPDepletionCanRerequestBeforeInterval(t *testing.T) {
+	fake := &loopHTTP{responses: []loopHTTPResponse{{result: HTTPAnnounceResult{Interval: time.Minute, Transmitted: true}}}}
+	clock := newFixtureClock()
+	updates := make(chan Update, 4)
+	set, err := NewTrackerSet(TrackerSetConfig{
+		Trackers:  []string{"http://early.test/announce"},
+		Identity:  Identity{Port: 49152},
+		HTTP:      fake,
+		Clock:     clock,
+		NeedPeers: func() bool { return true },
+		OnUpdate:  func(update Update) { updates <- update },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := set.Start(context.Background(), TransferPhase)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer run.Finalize(context.Background(), false)
+	select {
+	case <-updates:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for initial HTTP announce")
+	}
+	timer := clock.nextActive(t)
+	clock.advance(trackerEarlyRerequest)
+	clock.fire(timer)
+	select {
+	case update := <-updates:
+		if update.Request.Event != EventNone {
+			t.Fatalf("early rerequest event = %v", update.Request.Event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for HTTP early rerequest")
+	}
+	if got := len(fake.snapshot()); got != 2 {
+		t.Fatalf("HTTP announces = %d, want 2", got)
+	}
+}
+
+func TestUDPWaitsForIntervalEvenWhenPeersAreNeeded(t *testing.T) {
+	fake := &loopUDP{result: AnnounceResult{Interval: time.Minute, Transmitted: true}}
+	clock := newFixtureClock()
+	updates := make(chan Update, 4)
+	set, err := NewTrackerSet(TrackerSetConfig{
+		Trackers:  []string{"udp://interval.test:6969/announce"},
+		Identity:  Identity{Port: 49152},
+		UDP:       fake,
+		Clock:     clock,
+		NeedPeers: func() bool { return true },
+		OnUpdate:  func(update Update) { updates <- update },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := set.Start(context.Background(), TransferPhase)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer run.Finalize(context.Background(), false)
+	select {
+	case <-updates:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for initial UDP announce")
+	}
+	timer := clock.nextActive(t)
+	clock.advance(59 * time.Second)
+	select {
+	case update := <-updates:
+		t.Fatalf("UDP announced before interval: %+v", update)
+	case <-time.After(20 * time.Millisecond):
+	}
+	clock.advance(time.Second)
+	clock.fire(timer)
+	select {
+	case update := <-updates:
+		if update.Request.Event != EventNone {
+			t.Fatalf("UDP regular event = %v", update.Request.Event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for UDP interval announce")
+	}
+	if got := len(fake.snapshot()); got != 2 {
+		t.Fatalf("UDP announces = %d, want 2", got)
+	}
+}
+
+func TestBEP31RetryDelayIsNotShortened(t *testing.T) {
+	fake := &loopHTTP{responses: []loopHTTPResponse{{
+		result: HTTPAnnounceResult{Transmitted: true},
+		err:    &HTTPError{Class: HTTPFailureTransient, Code: HTTPErrorTracker, RetryAfter: 5 * time.Minute},
+	}}}
+	clock := newFixtureClock()
+	updates := make(chan Update, 4)
+	set, err := NewTrackerSet(TrackerSetConfig{
+		Trackers: []string{"http://retry.test/announce"},
+		Identity: Identity{Port: 49152}, HTTP: fake, Clock: clock,
+		OnUpdate: func(update Update) { updates <- update },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := set.Start(context.Background(), TransferPhase)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer run.Finalize(context.Background(), false)
+	select {
+	case update := <-updates:
+		if update.Request.Event != EventStarted || !update.Transmitted {
+			t.Fatalf("retry update = %+v", update)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for retry response")
+	}
+	clock.advance(4 * time.Minute)
+	select {
+	case update := <-updates:
+		t.Fatalf("retry announced before BEP31 delay: %+v", update)
+	case <-time.After(20 * time.Millisecond):
+	}
+	timer := clock.nextActive(t)
+	clock.advance(time.Minute)
+	clock.fire(timer)
+	select {
+	case update := <-updates:
+		if !update.Activated {
+			t.Fatalf("retry did not activate: %+v", update)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for delayed retry")
+	}
+}
+
+func FuzzTrackerAccountingPhase(f *testing.F) {
+	f.Add(int64(0), int64(0), int64(0), true)
+	f.Add(int64(12), int64(4), int64(10), false)
+	f.Fuzz(func(t *testing.T, downloaded, retained, total int64, metadata bool) {
+		snapshot := Snapshot{Downloaded: downloaded, Retained: retained, Total: total, Metadata: metadata}
+		request, err := snapshot.Announce(Identity{Port: 49152}, [20]byte{1}, EventNone, -1)
+		if err != nil {
+			return
+		}
+		if request.Uploaded != 0 || request.Downloaded < 0 || request.Left < 0 {
+			t.Fatalf("invalid request from valid snapshot: %+v", request)
+		}
+		if metadata && request.Left != 1 {
+			t.Fatalf("metadata left = %d", request.Left)
+		}
+		if !metadata && request.Left != total-retained {
+			t.Fatalf("transfer left = %d, want %d", request.Left, total-retained)
+		}
+	})
 }
 
 func TestTrackerPermanentFailureDisablesOnlyThatTrackerAcrossPhases(t *testing.T) {
