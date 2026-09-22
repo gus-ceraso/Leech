@@ -731,7 +731,7 @@ joined workers. The peer layer sees an ordinary `net.Conn`; it needs no uTP
 branches. Correctness is demonstrated by independent fixtures, not just two
 copies of this implementation successfully talking to each other.
 
-- [ ] **R4 — uTP review:** one reviewer checks U1–U4 as a major task group.
+- [x] **R4 — uTP review:** one reviewer checks U1–U4 as a major task group.
   Compare packet/state behavior directly with local BEP 29, especially sequence
   arithmetic, SACKs, retransmission, congestion control, window bounds, and
   cancellation. Keep tuning suggestions separate from correctness fixes.
@@ -742,8 +742,8 @@ copies of this implementation successfully talking to each other.
   extreme RTT/RTO overflow, and missing full `Conn` stream simulation. U4 fixed
   the wakeup and added independent stream/race fixtures in `ee2fef7`. U3 fixed
   RTO saturation in `497c2ce`. R4's production recheck passed; its final
-  sign-off awaits a test assertion that observes the exact timed-out packet's
-  retransmission before acknowledging it.
+  sign-off followed `7214254`, which asserts the exact timed-out packet's
+  retransmission before acknowledging it. Focused race checks passed.
 
 ## Group 5: Complete CLI and lifecycle
 
