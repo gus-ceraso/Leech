@@ -273,22 +273,22 @@ confined; output preparation can be tested independently with A0's file ranges.
 `internal/storage/finalize.go`, and their tests.
 **References:** DESIGN §§13.1, 15–18.
 
-- [ ] Create a random private workspace under `os.UserCacheDir()/leech` only on
+- [x] Create a random private workspace under `os.UserCacheDir()/leech` only on
   an explicit transfer-needed call. Use directory `0700` and file `0600` where
   supported. Enforce staged-piece count and total declared-length budgets before
   admission; never use whole-piece memory or a memory fallback.
-- [ ] Stage block-sized writes in per-piece random-access files and synthesize
+- [x] Stage block-sized writes in per-piece random-access files and synthesize
   padding. Keep block coverage and endpoint provenance coordinator-owned; pass
   immutable snapshots to the finalizer when needed. Define block-buffer ownership
   through the write completion event.
-- [ ] Serialize finalization: hash the whole staged piece using bounded buffers,
+- [x] Serialize finalization: hash the whole staged piece using bounded buffers,
   then write only selected intersections. Report mismatch and contributors to
   the coordinator. Remove the piece after mismatch, or after every successful
   selected write and close; never commit corrupt data.
-- [ ] Make open/read/write/short-write/close/removal errors fatal. Preserve the
+- [x] Make open/read/write/short-write/close/removal errors fatal. Preserve the
   primary error and report secondary cleanup failures. Close/join staging work
   before removing only this run's workspace; ignore abandoned workspaces.
-- [ ] Test cross-file and skipped-file boundaries, padding, mixed contributors,
+- [x] Test cross-file and skipped-file boundaries, padding, mixed contributors,
   hash failures, budget exhaustion, unavailable/full cache, output failures,
   cleanup failures, and cancellation during finalization.
 
