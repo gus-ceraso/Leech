@@ -1,0 +1,416 @@
+package peer
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net"
+	"net/netip"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+	"unicode"
+
+	"github.com/gus-ceraso/Leech/internal/limits"
+)
+
+var (
+	ErrCandidateConfig = errors.New("invalid candidate configuration")
+	ErrCandidate       = errors.New("invalid peer candidate")
+	ErrCandidateLimit  = errors.New("peer candidate limit reached")
+	ErrCandidateDNS    = errors.New("peer candidate resolution failed")
+)
+
+// Candidate is an endpoint received from a tracker or a magnet. Host may be
+// an IP literal or a DNS name. A tracker-supplied peer ID is only an optional
+// expected handshake value; it never participates in endpoint deduplication.
+type Candidate struct {
+	Host           string
+	Port           uint16
+	ExpectedPeerID [20]byte
+	HasExpectedID  bool
+}
+
+// ResolvedCandidate is a candidate after DNS resolution. Endpoint is the
+// identity used by both transports and is therefore the only candidate key.
+type ResolvedCandidate struct {
+	Endpoint       Endpoint
+	ExpectedPeerID [20]byte
+	HasExpectedID  bool
+}
+
+// String renders an endpoint in the standard host:port form used by dialers
+// and diagnostics.
+func (e Endpoint) String() string {
+	if !e.Addr.IsValid() {
+		return "<invalid>"
+	}
+	return netip.AddrPortFrom(e.Addr, e.Port).String()
+}
+
+// Resolver is deliberately small so DNS results can be bounded in tests and
+// production. It matches net.Resolver and the tracker resolver seam.
+type Resolver interface {
+	LookupIPAddr(context.Context, string) ([]net.IPAddr, error)
+}
+
+// CandidatePoolConfig controls bounded candidate admission. Zero values use
+// the supported limits and the system resolver.
+type CandidatePoolConfig struct {
+	Resolver      Resolver
+	MaxCandidates int
+	MaxDNSAnswers int
+}
+
+// CandidatePool owns one deduplicated, bounded set of resolved endpoints.
+// It is safe for tracker and magnet producers to call concurrently. The
+// session coordinator still owns when admitted candidates are dialed.
+type CandidatePool struct {
+	resolver      Resolver
+	maxCandidates int
+	maxDNSAnswers int
+
+	mu         sync.Mutex
+	candidates map[Endpoint]ResolvedCandidate
+}
+
+// NewCandidatePool validates bounds and returns an empty candidate set.
+func NewCandidatePool(config CandidatePoolConfig) (*CandidatePool, error) {
+	maxCandidates := config.MaxCandidates
+	if maxCandidates == 0 {
+		maxCandidates = limits.Candidates
+	}
+	maxDNSAnswers := config.MaxDNSAnswers
+	if maxDNSAnswers == 0 {
+		maxDNSAnswers = limits.DNSAnswers
+	}
+	if maxCandidates < 1 || maxCandidates > limits.Candidates || maxDNSAnswers < 1 || maxDNSAnswers > limits.DNSAnswers {
+		return nil, ErrCandidateConfig
+	}
+	resolver := config.Resolver
+	if resolver == nil {
+		resolver = net.DefaultResolver
+	}
+	return &CandidatePool{
+		resolver:      resolver,
+		maxCandidates: maxCandidates,
+		maxDNSAnswers: maxDNSAnswers,
+		candidates:    make(map[Endpoint]ResolvedCandidate),
+	}, nil
+}
+
+// ResolveCandidate validates and resolves one candidate. Results are ordered
+// by the resolver's answer order, with duplicate addresses removed. DNS
+// answers after the supported bound are ignored before endpoint admission.
+func ResolveCandidate(ctx context.Context, resolver Resolver, candidate Candidate) ([]ResolvedCandidate, error) {
+	return resolveCandidate(ctx, resolver, candidate, limits.DNSAnswers)
+}
+
+func resolveCandidate(ctx context.Context, resolver Resolver, candidate Candidate, maxDNSAnswers int) ([]ResolvedCandidate, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if maxDNSAnswers < 1 || maxDNSAnswers > limits.DNSAnswers {
+		return nil, ErrCandidateConfig
+	}
+	if candidate.Port == 0 {
+		return nil, fmt.Errorf("%w: port must be between 1 and 65535", ErrCandidate)
+	}
+	if candidate.Host == "" {
+		return nil, fmt.Errorf("%w: empty host", ErrCandidate)
+	}
+	if addr, err := netip.ParseAddr(candidate.Host); err == nil {
+		endpoint, ok := normalizedEndpoint(addr, candidate.Port)
+		if !ok {
+			return nil, fmt.Errorf("%w: address is unspecified or multicast", ErrCandidate)
+		}
+		return []ResolvedCandidate{withExpected(endpoint, candidate)}, nil
+	}
+	if !validCandidateHost(candidate.Host) {
+		return nil, fmt.Errorf("%w: malformed hostname", ErrCandidate)
+	}
+	if resolver == nil {
+		resolver = net.DefaultResolver
+	}
+	answers, err := resolver.LookupIPAddr(ctx, candidate.Host)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrCandidateDNS, err)
+	}
+	if len(answers) > maxDNSAnswers {
+		answers = answers[:maxDNSAnswers]
+	}
+	seen := make(map[Endpoint]struct{}, len(answers))
+	result := make([]ResolvedCandidate, 0, len(answers))
+	for _, answer := range answers {
+		addr, ok := netip.AddrFromSlice(answer.IP)
+		if !ok {
+			continue
+		}
+		if answer.Zone != "" {
+			addr = addr.WithZone(answer.Zone)
+		}
+		endpoint, ok := normalizedEndpoint(addr, candidate.Port)
+		if !ok {
+			continue
+		}
+		if _, exists := seen[endpoint]; exists {
+			continue
+		}
+		seen[endpoint] = struct{}{}
+		result = append(result, withExpected(endpoint, candidate))
+	}
+	if len(result) == 0 {
+		return nil, fmt.Errorf("%w: no usable addresses", ErrCandidateDNS)
+	}
+	return result, nil
+}
+
+func validCandidateHost(host string) bool {
+	if host == "" || len(host) > limits.PathBytes || host != strings.TrimSpace(host) {
+		return false
+	}
+	for _, r := range host {
+		if unicode.IsSpace(r) || unicode.IsControl(r) || strings.ContainsRune("/;?#\\[]%", r) {
+			return false
+		}
+	}
+	return true
+}
+
+// NormalizeEndpoint validates an already resolved endpoint. IPv4-mapped IPv6
+// values are unmapped so they share identity with their IPv4 form.
+func NormalizeEndpoint(endpoint Endpoint) (Endpoint, error) {
+	normalized, ok := normalizedEndpoint(endpoint.Addr, endpoint.Port)
+	if !ok {
+		return Endpoint{}, fmt.Errorf("%w: endpoint is invalid", ErrCandidate)
+	}
+	return normalized, nil
+}
+
+func normalizedEndpoint(addr netip.Addr, port uint16) (Endpoint, bool) {
+	addr = addr.Unmap()
+	if port == 0 || !addr.IsValid() || addr.IsUnspecified() || addr.IsMulticast() ||
+		(!addr.IsGlobalUnicast() && !addr.IsLoopback() && !addr.IsLinkLocalUnicast()) {
+		return Endpoint{}, false
+	}
+	return Endpoint{Addr: addr, Port: port}, true
+}
+
+func withExpected(endpoint Endpoint, candidate Candidate) ResolvedCandidate {
+	return ResolvedCandidate{Endpoint: endpoint, ExpectedPeerID: candidate.ExpectedPeerID, HasExpectedID: candidate.HasExpectedID}
+}
+
+// Admit resolves and adds one candidate. Duplicate endpoints are harmless and
+// return false. If a duplicate first arrived without an expected ID, a later
+// copy with one supplies that optional validation value.
+func (p *CandidatePool) Admit(ctx context.Context, candidate Candidate) ([]ResolvedCandidate, error) {
+	if p == nil {
+		return nil, ErrCandidateConfig
+	}
+	resolved, err := resolveCandidate(ctx, p.resolver, candidate, p.maxDNSAnswers)
+	if err != nil {
+		return nil, err
+	}
+	added := make([]ResolvedCandidate, 0, len(resolved))
+	for _, item := range resolved {
+		ok, err := p.Add(item)
+		if err != nil {
+			return added, err
+		}
+		if ok {
+			added = append(added, item)
+		}
+	}
+	return added, nil
+}
+
+// Add inserts one already-resolved candidate. It performs the same endpoint
+// normalization as NormalizeEndpoint, so callers cannot bypass admission
+// filtering by skipping DNS.
+func (p *CandidatePool) Add(candidate ResolvedCandidate) (bool, error) {
+	if p == nil {
+		return false, ErrCandidateConfig
+	}
+	endpoint, err := NormalizeEndpoint(candidate.Endpoint)
+	if err != nil {
+		return false, err
+	}
+	candidate.Endpoint = endpoint
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if current, exists := p.candidates[endpoint]; exists {
+		if !current.HasExpectedID && candidate.HasExpectedID {
+			p.candidates[endpoint] = candidate
+		}
+		return false, nil
+	}
+	if len(p.candidates) >= p.maxCandidates {
+		return false, ErrCandidateLimit
+	}
+	p.candidates[endpoint] = candidate
+	return true, nil
+}
+
+// Snapshot returns candidates in stable endpoint order. The returned slice is
+// independent of the pool and can be handed to a dial manager.
+func (p *CandidatePool) Snapshot() []ResolvedCandidate {
+	if p == nil {
+		return nil
+	}
+	p.mu.Lock()
+	result := make([]ResolvedCandidate, 0, len(p.candidates))
+	for _, candidate := range p.candidates {
+		result = append(result, candidate)
+	}
+	p.mu.Unlock()
+	sort.Slice(result, func(i, j int) bool {
+		return endpointLess(result[i].Endpoint, result[j].Endpoint)
+	})
+	return result
+}
+
+func (p *CandidatePool) Len() int {
+	if p == nil {
+		return 0
+	}
+	p.mu.Lock()
+	n := len(p.candidates)
+	p.mu.Unlock()
+	return n
+}
+
+func endpointLess(a, b Endpoint) bool {
+	if order := a.Addr.Compare(b.Addr); order != 0 {
+		return order < 0
+	}
+	return a.Port < b.Port
+}
+
+// EndpointBackoff tracks ordinary dial failures independently of transport,
+// candidate source, and peer ID. It does not record corruption strikes;
+// protocol and piece penalties remain coordinator-owned.
+type EndpointBackoff struct {
+	mu     sync.Mutex
+	states map[Endpoint]endpointBackoffState
+}
+
+type endpointBackoffState struct {
+	failures  uint8
+	notBefore time.Time
+	blacklist bool
+}
+
+const (
+	endpointFailureBase = time.Second
+	endpointFailureMax  = 5 * time.Minute
+)
+
+// NewEndpointBackoff creates empty endpoint health state.
+func NewEndpointBackoff() *EndpointBackoff {
+	return &EndpointBackoff{states: make(map[Endpoint]endpointBackoffState)}
+}
+
+// Ready reports whether an endpoint may be attempted at now. A zero now uses
+// time.Now, which keeps normal callers concise while deterministic tests pass a
+// fixed value explicitly.
+func (b *EndpointBackoff) Ready(endpoint Endpoint, now time.Time) bool {
+	if b == nil {
+		return false
+	}
+	endpoint, err := NormalizeEndpoint(endpoint)
+	if err != nil {
+		return false
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	b.mu.Lock()
+	state := b.states[endpoint]
+	b.mu.Unlock()
+	return !state.blacklist && !now.Before(state.notBefore)
+}
+
+// RecordFailure records one ordinary failure and returns the resulting
+// not-before time. The bounded exponential delay is shared by TCP and uTP.
+func (b *EndpointBackoff) RecordFailure(endpoint Endpoint, now time.Time) time.Time {
+	if b == nil {
+		return now
+	}
+	endpoint, err := NormalizeEndpoint(endpoint)
+	if err != nil {
+		return now
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	b.mu.Lock()
+	state := b.states[endpoint]
+	if state.failures < 8 {
+		state.failures++
+	}
+	delay := endpointFailureBase
+	for i := uint8(1); i < state.failures && delay < endpointFailureMax; i++ {
+		delay *= 2
+		if delay >= endpointFailureMax {
+			delay = endpointFailureMax
+			break
+		}
+	}
+	state.notBefore = now.Add(delay)
+	b.states[endpoint] = state
+	b.mu.Unlock()
+	return state.notBefore
+}
+
+// RecordSuccess clears ordinary failure backoff. It never clears a blacklist.
+func (b *EndpointBackoff) RecordSuccess(endpoint Endpoint) {
+	if b == nil {
+		return
+	}
+	endpoint, err := NormalizeEndpoint(endpoint)
+	if err != nil {
+		return
+	}
+	b.mu.Lock()
+	state := b.states[endpoint]
+	state.failures = 0
+	state.notBefore = time.Time{}
+	b.states[endpoint] = state
+	b.mu.Unlock()
+}
+
+// Blacklist permanently blocks an endpoint for the current run. The caller
+// decides whether the reason is a severe protocol violation or a thresholded
+// corruption strike; both reasons share endpoint identity.
+func (b *EndpointBackoff) Blacklist(endpoint Endpoint) {
+	if b == nil {
+		return
+	}
+	endpoint, err := NormalizeEndpoint(endpoint)
+	if err != nil {
+		return
+	}
+	b.mu.Lock()
+	state := b.states[endpoint]
+	state.blacklist = true
+	b.states[endpoint] = state
+	b.mu.Unlock()
+}
+
+func (b *EndpointBackoff) IsBlacklisted(endpoint Endpoint) bool {
+	if b == nil {
+		return false
+	}
+	endpoint, err := NormalizeEndpoint(endpoint)
+	if err != nil {
+		return false
+	}
+	b.mu.Lock()
+	blocked := b.states[endpoint].blacklist
+	b.mu.Unlock()
+	return blocked
+}
