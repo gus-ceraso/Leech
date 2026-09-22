@@ -2,10 +2,14 @@ package cli
 
 import (
 	"bytes"
+	"context"
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/gus-ceraso/Leech/internal/bencode"
 )
@@ -106,9 +110,11 @@ func TestRunLocalListingDoesNotTouchOutputOnInvalidMetadata(t *testing.T) {
 
 func TestRunRejectsRemoteListingWithoutStartingWorkers(t *testing.T) {
 	var output bytes.Buffer
-	err := Run(Options{Source: "magnet:?xt=urn:btih:0123456789012345678901234567890123456789", ListFiles: true}, &output)
-	if err != ErrRemoteListingUnavailable {
-		t.Fatalf("error = %v, want ErrRemoteListingUnavailable", err)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	err := RunContext(ctx, Options{Source: "magnet:?xt=urn:btih:0123456789012345678901234567890123456789", ListFiles: true}, &output, io.Discard)
+	if !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context cancellation", err)
 	}
 	if !reflect.DeepEqual(output.Bytes(), []byte(nil)) {
 		t.Fatalf("remote listing wrote output: %q", output.String())

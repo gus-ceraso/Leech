@@ -21,23 +21,19 @@ var (
 
 // Run executes one command with a background context and no diagnostics.
 func Run(opts Options, stdout io.Writer) error {
-	if opts.ListFiles {
-		source, err := torrent.ParseSource(opts.Source)
-		if err != nil {
-			return err
-		}
-		if source.Kind != torrent.SourcePath {
-			// Preserve the original library boundary for callers that use Run
-			// without a context. The executable uses RunContext for remote lists.
-			return ErrRemoteListingUnavailable
-		}
-	}
 	return RunContext(context.Background(), opts, stdout, io.Discard)
 }
 
 // RunContext executes one command. Standard output remains reserved for file
 // listings; all progress and diagnostics go to stderr through Reporter.
 func RunContext(ctx context.Context, opts Options, stdout, stderr io.Writer) error {
+	return RunWithSession(ctx, opts, stdout, stderr, session.RunConfig{})
+}
+
+// RunWithSession executes one command with injected session dependencies. It
+// is the deterministic acceptance seam for local trackers, resolvers, and
+// transport dialers; the executable uses RunContext with production defaults.
+func RunWithSession(ctx context.Context, opts Options, stdout, stderr io.Writer, dependencies session.RunConfig) error {
 	if stdout == nil {
 		return fmt.Errorf("cli: nil output writer")
 	}
@@ -50,18 +46,41 @@ func RunContext(ctx context.Context, opts Options, stdout, stderr io.Writer) err
 		return err
 	}
 	reporter := NewReporter(opts.LogLevel, stderr)
-	result, err := session.Run(ctx, session.RunConfig{
-		Source: source, OutputDir: opts.Output, Patterns: opts.Files,
-		ListFiles: opts.ListFiles, Resume: opts.Resume, Streaming: opts.Stream,
-		Timeout: opts.Timeout,
-		OnPhase: func(phase string) { _ = reporter.Phase(phase) },
-		OnProgress: func(progress session.RunProgress) {
-			_ = reporter.Status(Status{Phase: "transfer", VerifiedSelectedBytes: uint64(maxInt64(0, progress.VerifiedSelectedBytes)),
-				SelectedBytes: uint64(maxInt64(0, progress.SelectedBytes))})
-		},
-		OnWarning:   func(message string) { _ = reporter.Warning("%s", message) },
-		OnSecondary: func(shutdownErr error) { _ = reporter.SecondaryFailure(shutdownErr) },
-	})
+	dependencies.Source = source
+	dependencies.SourceRaw = opts.Source
+	dependencies.OutputDir = opts.Output
+	dependencies.Patterns = append([]string(nil), opts.Files...)
+	dependencies.ListFiles = opts.ListFiles
+	dependencies.Resume = opts.Resume
+	dependencies.Streaming = opts.Stream
+	dependencies.Timeout = opts.Timeout
+	oldPhase, oldProgress := dependencies.OnPhase, dependencies.OnProgress
+	oldWarning, oldSecondary := dependencies.OnWarning, dependencies.OnSecondary
+	dependencies.OnPhase = func(phase string) {
+		if oldPhase != nil {
+			oldPhase(phase)
+		}
+		_ = reporter.Phase(phase)
+	}
+	dependencies.OnProgress = func(progress session.RunProgress) {
+		if oldProgress != nil {
+			oldProgress(progress)
+		}
+		_ = reporter.Status(Status{Phase: "transfer", VerifiedSelectedBytes: uint64(maxInt64(0, progress.VerifiedSelectedBytes)), SelectedBytes: uint64(maxInt64(0, progress.SelectedBytes))})
+	}
+	dependencies.OnWarning = func(message string) {
+		if oldWarning != nil {
+			oldWarning(message)
+		}
+		_ = reporter.Warning("%s", message)
+	}
+	dependencies.OnSecondary = func(shutdownErr error) {
+		if oldSecondary != nil {
+			oldSecondary(shutdownErr)
+		}
+		_ = reporter.SecondaryFailure(shutdownErr)
+	}
+	result, err := session.Run(ctx, dependencies)
 	if err != nil {
 		_ = reporter.PrimaryFailure(err, !opts.ListFiles)
 		return err

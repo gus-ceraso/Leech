@@ -29,9 +29,13 @@ func main() {
 	adapter := cli.NewSignalAdapter(cancel)
 	err = cli.RunContext(ctx, opts, os.Stdout, os.Stderr)
 	var signalEvent cli.SignalEvent
-	select {
-	case signalEvent = <-adapter.Events():
-	default:
+	if ctx.Err() != nil {
+		signalEvent, _ = adapter.Wait()
+	} else {
+		select {
+		case signalEvent = <-adapter.Events():
+		default:
+		}
 	}
 	adapter.Close()
 	if signalEvent.Signal != nil {
