@@ -248,6 +248,17 @@ func TestMetadataDiscoveryCancellationClosesSilentPeer(t *testing.T) {
 	}
 }
 
+func TestMetadataDiscoveryCancellationUnblocksMetadataWrite(t *testing.T) {
+	client, server := net.Pipe()
+	defer server.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	_, err := fetchMetadata(ctx, client, time.Minute)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error = %v, want context deadline", err)
+	}
+}
+
 func TestMetadataDiscoveryRejectsIncomingMetadataRequest(t *testing.T) {
 	info := testInfo(t)
 	digest := sha1.Sum(info)
