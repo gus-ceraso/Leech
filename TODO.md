@@ -224,20 +224,20 @@ metadata exposes consistent ranges and original indices without storing payload.
 local listing path in `internal/cli/run.go`.
 **References:** DESIGN §§4.2–4.4, 8; BEPs 47, 53.
 
-- [ ] Implement case-sensitive exact and glob selection with `/`, `*`, `?`, and
+- [x] Implement case-sensitive exact and glob selection with `/`, `*`, `?`, and
   `[]`; reject `**` and malformed patterns. A matching directory selects its
   descendants. Union repeated matches without duplicate work.
-- [ ] Apply explicit selectors instead of magnet `so`. Interpret `so` against
+- [x] Apply explicit selectors instead of magnet `so`. Interpret `so` against
   original file positions, including padding and symlinks; reject selected
   symlinks and selections without regular files. Handle single-file index zero.
-- [ ] Map selected ranges to wanted pieces, selected output intersections, and
+- [x] Map selected ranges to wanted pieces, selected output intersections, and
   synthetic zero padding. Preserve unwanted non-padding ranges that a full piece
   still needs for verification. Include selected zero-length files.
-- [ ] Wire local `.torrent --list-files`: validate metadata, emit JSON-quoted
+- [x] Wire local `.torrent --list-files`: validate metadata, emit JSON-quoted
   selectable paths in torrent order, and omit padding/symlinks. Do not validate
   the destination or touch output/cache paths. Merge tracker sources for later
   download use through I2's helper.
-- [ ] Cover directory/glob semantics, overlap, no matches, index bounds, padding,
+- [x] Cover directory/glob semantics, overlap, no matches, index bounds, padding,
   symlinks, and exact listing output. Prove local listing makes no network calls.
 
 **Acceptance:** offline listing works, and the same immutable selection plan can
