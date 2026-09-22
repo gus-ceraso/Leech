@@ -32,14 +32,13 @@ func (e PeerEvent) HasMessage() bool {
 // reader and writer are joined by Close, Run, or Wait. The connection itself
 // is closed to unblock a raw Read when cancellation occurs.
 type ConnectionWorker struct {
-	conn      net.Conn
-	options   ReadOptions
-	commands  chan Message
-	events    chan PeerEvent
-	startOnce sync.Once
-	closeOnce sync.Once
-	wg        sync.WaitGroup
-	done      chan struct{}
+	conn       net.Conn
+	options    ReadOptions
+	commands   chan Message
+	events     chan PeerEvent
+	finishOnce sync.Once
+	wg         sync.WaitGroup
+	done       chan struct{}
 
 	mu       sync.Mutex
 	cancel   context.CancelFunc
@@ -73,27 +72,25 @@ func (w *ConnectionWorker) Start(ctx context.Context) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	w.startOnce.Do(func() {
-		workerCtx, cancel := context.WithCancel(ctx)
-		w.mu.Lock()
-		w.cancel = cancel
-		w.started = true
-		alreadyClosing := w.closing
+	w.mu.Lock()
+	if w.started || w.closing {
 		w.mu.Unlock()
-		w.wg.Add(3)
-		go w.readLoop(workerCtx)
-		go w.writeLoop(workerCtx)
-		go w.cancelWatcher(workerCtx)
-		if alreadyClosing {
-			cancel()
-			_ = w.conn.Close()
-		}
-		go func() {
-			w.wg.Wait()
-			close(w.done)
-			close(w.events)
-		}()
-	})
+		return
+	}
+	workerCtx, cancel := context.WithCancel(ctx)
+	w.cancel = cancel
+	w.started = true
+	// Register every worker before releasing mu. Close can therefore either
+	// prevent this block entirely or wait for all registered goroutines.
+	w.wg.Add(3)
+	go w.readLoop(workerCtx)
+	go w.writeLoop(workerCtx)
+	go w.cancelWatcher(workerCtx)
+	go func() {
+		w.wg.Wait()
+		w.finish()
+	}()
+	w.mu.Unlock()
 }
 
 // Run starts the worker and waits for both I/O loops. Its returned error is
@@ -135,18 +132,23 @@ func (w *ConnectionWorker) Send(message Message) error {
 // Close cancels both loops and closes the owned transport to unblock reads.
 // It is idempotent and waits for all worker goroutines before returning.
 func (w *ConnectionWorker) Close() error {
-	w.closeOnce.Do(func() {
-		w.mu.Lock()
+	w.mu.Lock()
+	if !w.closing {
 		w.closing = true
-		cancel := w.cancel
-		w.mu.Unlock()
-		if cancel != nil {
-			cancel()
-		}
-		_ = w.conn.Close()
-	})
-	if w.isStarted() {
+	}
+	started := w.started
+	cancel := w.cancel
+	w.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	_ = w.conn.Close()
+	if started {
 		<-w.done
+	} else {
+		// Closing before Start permanently seals the worker. Start observes
+		// closing under the same mutex and cannot launch a later goroutine.
+		w.finish()
 	}
 	return w.Err()
 }
@@ -163,6 +165,13 @@ func (w *ConnectionWorker) Err() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.terminal
+}
+
+func (w *ConnectionWorker) finish() {
+	w.finishOnce.Do(func() {
+		close(w.done)
+		close(w.events)
+	})
 }
 
 func (w *ConnectionWorker) isStarted() bool {
