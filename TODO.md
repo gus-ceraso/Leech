@@ -329,8 +329,8 @@ starting transfer discovery when selection is already complete.
   R1 fixes to recheck:
 
   - [x] I1: reject duplicate empty dictionary keys (`6061e62`).
-  - [ ] I3: reject an explicitly empty padding `path` list and invalid UTF-8
-    metainfo announce URLs.
+  - [x] I3: reject an explicitly empty padding `path` list and invalid UTF-8
+    metainfo announce URLs (`8fdb1d0`).
   - [ ] I4: bound selection work for up to 100,000 files and patterns without
     narrowing the supported selection domain.
   - [ ] S3: scan resume mappings one at a time to avoid cloning millions of
