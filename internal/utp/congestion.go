@@ -2,6 +2,7 @@ package utp
 
 import (
 	"errors"
+	"math"
 	"math/bits"
 	"time"
 
@@ -351,7 +352,7 @@ func (c *CongestionController) UpdateRTT(sample time.Duration) {
 		c.rtt = sample
 		c.rttVar = sample / 2
 		c.rttSet = true
-		c.rto = c.rtt + c.rttVar*4
+		c.rto = saturatingDurationAdd(c.rtt, saturatingDurationMultiply(c.rttVar, 4))
 		if c.rto < minimumRTO {
 			c.rto = minimumRTO
 		}
@@ -360,16 +361,46 @@ func (c *CongestionController) UpdateRTT(sample time.Duration) {
 	// Keep the estimator in separate fields without exposing them as tuning
 	// knobs. These values are initialized lazily to avoid a second constructor
 	// state for the first sample.
-	delta := c.rtt - sample
-	if delta < 0 {
-		delta = -delta
-	}
-	c.rttVar += (delta - c.rttVar) / 4
-	c.rtt += (sample - c.rtt) / 8
-	c.rto = c.rtt + c.rttVar*4
+	delta := absoluteDurationDifference(c.rtt, sample)
+	c.rttVar = saturatingDurationAdd(c.rttVar, (delta-c.rttVar)/4)
+	c.rtt = saturatingDurationAdd(c.rtt, (sample-c.rtt)/8)
+	c.rto = saturatingDurationAdd(c.rtt, saturatingDurationMultiply(c.rttVar, 4))
 	if c.rto < minimumRTO {
 		c.rto = minimumRTO
 	}
+}
+
+func saturatingDurationMultiply(value time.Duration, multiplier int64) time.Duration {
+	if value <= 0 || multiplier <= 0 {
+		return 0
+	}
+	if value > time.Duration(math.MaxInt64)/time.Duration(multiplier) {
+		return time.Duration(math.MaxInt64)
+	}
+	return value * time.Duration(multiplier)
+}
+
+func saturatingDurationAdd(a, b time.Duration) time.Duration {
+	if b > 0 && a > time.Duration(math.MaxInt64)-b {
+		return time.Duration(math.MaxInt64)
+	}
+	if b < 0 && a < time.Duration(math.MinInt64)-b {
+		return time.Duration(math.MinInt64)
+	}
+	return a + b
+}
+
+func absoluteDurationDifference(a, b time.Duration) time.Duration {
+	if a >= b {
+		if b < 0 && a > time.Duration(math.MaxInt64)+b {
+			return time.Duration(math.MaxInt64)
+		}
+		return a - b
+	}
+	if a < 0 && b > time.Duration(math.MaxInt64)+a {
+		return time.Duration(math.MaxInt64)
+	}
+	return b - a
 }
 
 func (c *CongestionController) hasRTT() bool { return c.rttSet }
