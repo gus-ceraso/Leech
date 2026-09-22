@@ -445,13 +445,17 @@ func fetchMetadata(ctx context.Context, conn net.Conn, timeout time.Duration) ([
 	if err := state.WriteHandshake(conn); err != nil {
 		return nil, err
 	}
+	var deadline time.Time
+	if timeout > 0 {
+		deadline = time.Now().Add(timeout)
+	}
 
 	// Take the first bounded size advertised by this connection. A later
 	// repeated handshake may update the peer's extension mapping, but it cannot
 	// replace the candidate geometry already chosen for this supplier.
 	var size int64
 	for messageCount := 0; messageCount < metadataMessageLimit; messageCount++ {
-		message, err := readPeerMessage(ctx, conn, timeout)
+		message, err := readPeerMessage(ctx, conn, deadline)
 		if err != nil {
 			return nil, err
 		}
@@ -489,7 +493,7 @@ func fetchMetadata(ctx context.Context, conn net.Conn, timeout time.Duration) ([
 		}
 		received := false
 		for messageCount := 0; messageCount < metadataMessageLimit; messageCount++ {
-			message, err := readPeerMessage(ctx, conn, timeout)
+			message, err := readPeerMessage(ctx, conn, deadline)
 			if err != nil {
 				return nil, err
 			}
@@ -544,9 +548,9 @@ func requestMetadataPiece(ctx context.Context, conn net.Conn, state *peer.Extens
 	return peer.WriteMetadataRequest(conn, id, piece)
 }
 
-func readPeerMessage(ctx context.Context, conn net.Conn, timeout time.Duration) (peer.Message, error) {
-	if timeout > 0 {
-		_ = conn.SetReadDeadline(time.Now().Add(timeout))
+func readPeerMessage(ctx context.Context, conn net.Conn, deadline time.Time) (peer.Message, error) {
+	if !deadline.IsZero() {
+		_ = conn.SetReadDeadline(deadline)
 		defer conn.SetReadDeadline(time.Time{})
 	}
 	type response struct {
