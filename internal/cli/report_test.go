@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -85,6 +86,17 @@ func TestReporterNonTTYOmitsStatus(t *testing.T) {
 	}
 	if output.String() != "debug: worker joined\n" {
 		t.Fatalf("debug output = %q", output.String())
+	}
+}
+
+func TestDefaultTerminalDetectorRejectsDevNull(t *testing.T) {
+	file, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	if isTerminalWriter(file) {
+		t.Fatal("/dev/null was classified as an interactive terminal")
 	}
 }
 

@@ -299,8 +299,7 @@ func isTerminalWriter(writer io.Writer) bool {
 	if !ok {
 		return false
 	}
-	info, err := file.Stat()
-	return err == nil && info.Mode()&os.ModeCharDevice != 0
+	return isTTYFile(file)
 }
 
 // QuoteName quotes and escapes untrusted text for a permanent diagnostic.
@@ -457,7 +456,11 @@ func truncateString(value string, maxBytes int) string {
 		return value
 	}
 	if maxBytes <= 3 {
-		return value[:maxBytes]
+		limit := maxBytes
+		for limit > 0 && !utf8.RuneStart(value[limit]) {
+			limit--
+		}
+		return value[:limit]
 	}
 	limit := maxBytes - 3
 	for limit > 0 && !utf8.RuneStart(value[limit]) {
