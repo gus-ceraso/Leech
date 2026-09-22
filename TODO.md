@@ -328,7 +328,9 @@ starting transfer discovery when selection is already complete.
 
   R1 found that I1's canonical encoder accepts two empty dictionary keys because
   its duplicate-key sentinel is `nil`. Return this to the I1 worker for a small
-  fix and regression test before closing R1.
+  fix and regression test before closing R1. R1 also found that I3 accepts an
+  explicitly present empty padding `path` list; BEP 47 permits omission, not an
+  empty list. Return this to the I3 worker with a focused fixture.
 
 ## Group 2: Peer protocol and the first download
 
