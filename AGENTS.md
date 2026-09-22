@@ -3,6 +3,7 @@
 ## Context map
 
 - Nested `AGENTS.md` files: none.
+- `DESIGN.md` defines the behavior; `TODO.md` tracks implementation tasks, dependencies, and review groups. Task sequencing does not relax the design's contracts.
 - `beps/` contains the project's authoritative, up-to-date BitTorrent specifications. Treat BEP 3 as the base protocol and consult the relevant extension BEPs directly.
 
 ## Product boundary
