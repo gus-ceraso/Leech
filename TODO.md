@@ -501,7 +501,8 @@ idle connections, and endgame cannot double-commit a block or leak request slots
   - [x] D3: treat closed worker channels and Fast tombstone-cap choke as
     peer-local disconnects; release every initial peer on startup failure;
     preserve explicit `reqq=0`; expose received-payload accounting and a
-    pre-peer-shutdown callback for ordered tracker quiescence (`f43f7c6`).
+    pre-peer-shutdown callback for ordered tracker quiescence (`f43f7c6`);
+    recover when a worker closes during scheduling (`909a369`).
 
 ## Group 3: Trackers and metadata discovery
 
