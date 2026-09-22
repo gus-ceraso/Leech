@@ -307,6 +307,141 @@ func TestWaitPeerEventReportsClosedWorkerAsPeerLocal(t *testing.T) {
 	}
 }
 
+func TestTransferDriveClosedWorkerReleasesForLivePeer(t *testing.T) {
+	data := []byte("x")
+	meta := singleFileMeta(data)
+	selection, err := torrent.Select(meta, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	left1, remote1 := net.Pipe()
+	left2, remote2 := net.Pipe()
+	defer remote2.Close()
+	transfer, err := NewTransfer(TransferConfig{
+		Selection: selection, Output: &storage.Plan{},
+		Stager: storage.NewStager(storage.StagerConfig{CacheRoot: filepath.Join(t.TempDir(), "cache"), MaxPieces: 1, MaxBytes: int64(len(data))}),
+		Peers: []ConnectedPeer{
+			{ID: "closed", Endpoint: endpoint(64), Conn: left1},
+			{ID: "live", Endpoint: endpoint(65), Conn: left2},
+		},
+		PieceCount: 1, PieceLength: uint32(len(data)), LastPieceLength: uint32(len(data)),
+	})
+	if err != nil {
+		left1.Close()
+		left2.Close()
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if err := transfer.stager.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer transfer.stager.Cleanup(nil)
+	p1, err := transfer.startPeer(ctx, transfer.peers[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	p2, err := transfer.startPeer(ctx, transfer.peers[1])
+	if err != nil {
+		_ = p1.worker.Close()
+		t.Fatal(err)
+	}
+	peers := []*transferPeer{p1, p2}
+	for _, p := range peers {
+		if _, err := p.state.ApplyMessage(peer.Message{ID: peer.BitfieldID, Payload: []byte{0x80}}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := p.state.ApplyMessage(peer.Message{ID: peer.UnchokeID}); err != nil {
+			t.Fatal(err)
+		}
+		if err := transfer.scheduler.SetAvailability(p.input.ID, []int{0}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_ = remote1.Close()
+	deadline := time.Now().Add(time.Second)
+	for p1.worker.Err() == nil && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if p1.worker.Err() == nil {
+		t.Fatal("closed worker did not report a terminal error")
+	}
+	if err := transfer.drive(ctx, &peers); !errors.Is(err, peer.ErrWorkerClosed) {
+		t.Fatalf("drive closed worker error = %v, want ErrWorkerClosed", err)
+	}
+	if !p1.done {
+		t.Fatal("closed worker was not disconnected")
+	}
+	if got := transfer.scheduler.ActiveRequests(); got != 0 {
+		t.Fatalf("active requests after closed peer = %d, want 0", got)
+	}
+	if err := transfer.drive(ctx, &peers); err != nil {
+		t.Fatalf("drive live peer: %v", err)
+	}
+	if len(p2.active) != 1 || transfer.scheduler.ActiveRequests() != 1 {
+		t.Fatalf("live peer assignment = active %d scheduler %d, want 1/1", len(p2.active), transfer.scheduler.ActiveRequests())
+	}
+	_ = p2.worker.Close()
+}
+
+func TestTransferRunContinuesAfterDriveSeesClosedWorker(t *testing.T) {
+	data := []byte("drive-recovery")
+	meta := singleFileMeta(data)
+	selection, err := torrent.Select(meta, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	plan, err := storage.Validate(root, meta, selection.SelectedIndices())
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, firstRemote := net.Pipe()
+	firstDone := make(chan error, 1)
+	go func() {
+		if err := writeFixtureFrame(firstRemote, peer.BitfieldID, []byte{0x80}); err != nil {
+			firstDone <- err
+			return
+		}
+		if err := writeFixtureFrame(firstRemote, peer.UnchokeID, nil); err != nil {
+			firstDone <- err
+			return
+		}
+		_ = firstRemote.Close()
+		firstDone <- nil
+	}()
+	second, secondDone := startFixturePeer(t, [20]byte{19, 19, 19}, []fixturePiece{{index: 0, data: data}}, false, false)
+	transfer, err := NewTransfer(TransferConfig{
+		Selection: selection, Output: plan,
+		Stager:         storage.NewStager(storage.StagerConfig{CacheRoot: filepath.Join(t.TempDir(), "cache"), MaxPieces: 1, MaxBytes: int64(len(data))}),
+		LocalHandshake: peer.Handshake{InfoHash: [20]byte{19, 19, 19}, PeerID: [20]byte{4, 5, 6}},
+		Peers: []ConnectedPeer{
+			{ID: "closed-before-send", Endpoint: endpoint(66), Conn: first, Handshake: peer.Handshake{InfoHash: [20]byte{19, 19, 19}, PeerID: [20]byte{7, 7, 7}}},
+			{ID: "usable", Endpoint: endpoint(67), Conn: second, Handshake: peer.Handshake{InfoHash: [20]byte{19, 19, 19}, PeerID: [20]byte{3, 2, 1}}},
+		},
+		PieceCount: 1, PieceLength: uint32(len(data)), LastPieceLength: uint32(len(data)),
+	})
+	if err != nil {
+		_ = first.Close()
+		_ = second.Close()
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := transfer.Run(ctx); err != nil {
+		t.Fatalf("transfer: %v", err)
+	}
+	if err := <-firstDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-secondDone; err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(filepath.Join(root, "fixture"))
+	if err != nil || string(got) != string(data) {
+		t.Fatalf("output = %q, %v", got, err)
+	}
+}
+
 func TestTransferTombstoneLimitClosesPeerWithoutStrike(t *testing.T) {
 	data := make([]byte, 1024)
 	selection, err := torrent.Select(singleFileMeta(data), nil, nil)

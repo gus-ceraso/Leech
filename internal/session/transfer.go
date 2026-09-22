@@ -326,6 +326,9 @@ func (t *Transfer) Run(ctx context.Context) error {
 			break
 		}
 		if err := t.drive(ctx, &peers); err != nil {
+			if errors.Is(err, peer.ErrWorkerClosed) && (countLive(peers) > 0 || acquired != nil) {
+				continue
+			}
 			primary = err
 			break
 		}
@@ -353,10 +356,7 @@ func (t *Transfer) Run(ctx context.Context) error {
 		}
 		if result.PeerClosed {
 			p := peers[result.Index]
-			cause := p.worker.Err()
-			if cause == nil {
-				cause = peer.ErrDisconnected
-			}
+			cause := t.workerCause(p, peer.ErrDisconnected)
 			if err := t.disconnectPeer(p, cause); err != nil && countLive(peers) == 0 && acquired == nil {
 				primary = err
 			}
@@ -538,6 +538,12 @@ func (t *Transfer) drive(ctx context.Context, peers *[]*transferPeer) error {
 				_ = t.scheduler.RejectBlock(p.input.ID, request.Block)
 				continue
 			}
+			// A worker can terminate between the event wait and this drive
+			// pass. Return the peer-local closure before queueing another
+			// command so its scheduler assignments are released together.
+			if p.worker.Err() != nil {
+				return t.disconnectWorker(p)
+			}
 			if err := p.state.AddRequest(request.Block); err != nil {
 				_ = t.scheduler.RejectBlock(p.input.ID, request.Block)
 				continue
@@ -545,6 +551,9 @@ func (t *Transfer) drive(ctx context.Context, peers *[]*transferPeer) error {
 			p.active[request.Block] = struct{}{}
 			message := peer.Message{ID: peer.RequestID, Payload: blockPayload(request.Block)}
 			if err := p.worker.SendContext(ctx, message); err != nil {
+				if p.worker.Err() != nil || errors.Is(err, peer.ErrWorkerClosed) {
+					return t.disconnectWorker(p)
+				}
 				_ = p.state.CancelRequest(request.Block)
 				_ = t.scheduler.RejectBlock(p.input.ID, request.Block)
 				delete(p.active, request.Block)
@@ -739,6 +748,9 @@ func (t *Transfer) handleEventWithPeers(ctx context.Context, peers []*transferPe
 		return nil
 	}
 	if event.Err != nil {
+		if peer.IsProtocolViolation(event.Err) {
+			t.scheduler.SevereViolation(p.input.Endpoint)
+		}
 		return t.disconnectPeer(p, event.Err)
 	}
 	if event.Message.KeepAlive {
@@ -947,6 +959,25 @@ func (t *Transfer) disconnectPeer(p *transferPeer, cause error) error {
 		cause = peer.ErrDisconnected
 	}
 	return cause
+}
+
+func (t *Transfer) workerCause(p *transferPeer, fallback error) error {
+	cause := fallback
+	if p != nil && p.worker != nil && p.worker.Err() != nil {
+		cause = p.worker.Err()
+	}
+	if peer.IsProtocolViolation(cause) {
+		t.scheduler.SevereViolation(p.input.Endpoint)
+	}
+	return cause
+}
+
+func (t *Transfer) disconnectWorker(p *transferPeer) error {
+	cause := t.workerCause(p, peer.ErrWorkerClosed)
+	_ = t.disconnectPeer(p, cause)
+	// Keep the peer-local sentinel for Run's recovery decision while retaining
+	// the worker's terminal cause for errors.Is and diagnostics.
+	return fmt.Errorf("%w: %w", peer.ErrWorkerClosed, cause)
 }
 
 func setStage(t *Transfer, index int, stage *storage.PieceStage) bool {
