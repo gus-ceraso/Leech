@@ -441,13 +441,17 @@ func (d *MetadataDiscovery) now() time.Time {
 }
 
 func fetchMetadata(ctx context.Context, conn net.Conn, timeout time.Duration) ([]byte, error) {
-	state := peer.NewExtensionState()
-	if err := state.WriteHandshake(conn); err != nil {
-		return nil, err
-	}
 	var deadline time.Time
 	if timeout > 0 {
 		deadline = time.Now().Add(timeout)
+	}
+	state := peer.NewExtensionState()
+	handshake, err := state.EncodeHandshake()
+	if err != nil {
+		return nil, err
+	}
+	if err := writeWithContext(ctx, conn, handshake, deadline); err != nil {
+		return nil, err
 	}
 
 	// Take the first bounded size advertised by this connection. A later
@@ -467,7 +471,7 @@ func fetchMetadata(ctx context.Context, conn net.Conn, timeout time.Duration) ([
 			return nil, err
 		}
 		if len(event.Response) != 0 {
-			if err := writeAll(conn, event.Response); err != nil {
+			if err := writeWithContext(ctx, conn, event.Response, deadline); err != nil {
 				return nil, err
 			}
 		}
@@ -488,7 +492,7 @@ func fetchMetadata(ctx context.Context, conn net.Conn, timeout time.Duration) ([
 	}
 	blocks := (size + int64(limits.BlockBytes) - 1) / int64(limits.BlockBytes)
 	for piece := int64(0); piece < blocks; piece++ {
-		if err := requestMetadataPiece(ctx, conn, state, uint32(piece)); err != nil {
+		if err := requestMetadataPiece(ctx, conn, state, uint32(piece), deadline); err != nil {
 			return nil, err
 		}
 		received := false
@@ -505,7 +509,7 @@ func fetchMetadata(ctx context.Context, conn net.Conn, timeout time.Duration) ([
 				return nil, err
 			}
 			if len(event.Response) != 0 {
-				if err := writeAll(conn, event.Response); err != nil {
+				if err := writeWithContext(ctx, conn, event.Response, deadline); err != nil {
 					return nil, err
 				}
 			}
@@ -537,7 +541,7 @@ func fetchMetadata(ctx context.Context, conn net.Conn, timeout time.Duration) ([
 	return assembler.Metadata()
 }
 
-func requestMetadataPiece(ctx context.Context, conn net.Conn, state *peer.ExtensionState, piece uint32) error {
+func requestMetadataPiece(ctx context.Context, conn net.Conn, state *peer.ExtensionState, piece uint32, deadline time.Time) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -545,7 +549,11 @@ func requestMetadataPiece(ctx context.Context, conn net.Conn, state *peer.Extens
 	if !ok {
 		return fmt.Errorf("%w: peer disabled ut_metadata", ErrMetadataRejected)
 	}
-	return peer.WriteMetadataRequest(conn, id, piece)
+	wire, err := peer.EncodeMetadataRequest(id, piece)
+	if err != nil {
+		return err
+	}
+	return writeWithContext(ctx, conn, wire, deadline)
 }
 
 func readPeerMessage(ctx context.Context, conn net.Conn, deadline time.Time) (peer.Message, error) {
@@ -569,6 +577,29 @@ func readPeerMessage(ctx context.Context, conn net.Conn, deadline time.Time) (pe
 		_ = conn.Close()
 		<-done
 		return peer.Message{}, ctx.Err()
+	}
+}
+
+// writeWithContext makes a bounded write joinable even when a test or custom
+// transport does not unblock its Write method on context cancellation. The
+// ordinary net.Conn deadline remains the candidate-wide timeout.
+func writeWithContext(ctx context.Context, conn net.Conn, data []byte, deadline time.Time) error {
+	if !deadline.IsZero() {
+		_ = conn.SetWriteDeadline(deadline)
+		defer conn.SetWriteDeadline(time.Time{})
+	}
+	done := make(chan error, 1)
+	go func() { done <- writeAll(conn, data) }()
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		_ = conn.Close()
+		err := <-done
+		if errors.Is(ctx.Err(), context.Canceled) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return ctx.Err()
+		}
+		return err
 	}
 }
 
