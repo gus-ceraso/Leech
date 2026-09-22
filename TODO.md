@@ -620,15 +620,15 @@ serves no metadata, and is not subject to the file-transfer no-progress timeout.
 **Depends on:** A0. **Owns:** `internal/utp/packet.go`, `sequence.go`, and the
 small test-only datagram link. **References:** DESIGN §§14, 16; BEP 29.
 
-- [ ] Implement v1 headers, packet types, extension chains, selective-ACK bits,
+- [x] Implement v1 headers, packet types, extension chains, selective-ACK bits,
   connection-ID representation, and checked timestamp/sequence wraparound.
   Reject malformed packets/extensions and enforce datagram bounds.
-- [ ] Define the narrow packet/action contracts shared by U2 and U3 so their
+- [x] Define the narrow packet/action contracts shared by U2 and U3 so their
   state logic can develop independently. Keep socket ownership for U4.
-- [ ] Build a deterministic test link supporting clock advancement and scripted
+- [x] Build a deterministic test link supporting clock advancement and scripted
   packet loss, delay, reordering, and duplication. Keep it specific to uTP tests;
   do not build a generic network simulation service.
-- [ ] Add independent BEP-derived packet vectors, sequence/SACK properties, and
+- [x] Add independent BEP-derived packet vectors, sequence/SACK properties, and
   packet fuzzing. Supply reusable wraparound and adversarial packet cases.
 
 **Acceptance:** U2/U3 can test state changes without sockets or wall-clock sleeps,
