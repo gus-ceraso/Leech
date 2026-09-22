@@ -7,6 +7,8 @@ import (
 	"net"
 	"testing"
 	"time"
+
+	"github.com/gus-ceraso/Leech/internal/peer"
 )
 
 // TestStateStreamLossAndWrap drives independent send and receive fixtures
@@ -270,4 +272,84 @@ func TestTransportPayloadActionsAreIndependentFixtures(t *testing.T) {
 	if result := state.Handle(Packet{Type: State, AckNr: 10, WindowSize: 4 << 20}, time.Unix(301, 0)); result.Err != nil {
 		t.Fatalf("ACK handling: %v", result.Err)
 	}
+}
+
+func TestConnCarriesBEP3PeerHandshake(t *testing.T) {
+	server, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	serverErr := make(chan error, 1)
+	var infoHash [20]byte
+	var clientID [20]byte
+	var serverID [20]byte
+	for index := range infoHash {
+		infoHash[index] = byte(index + 1)
+		clientID[index] = byte(0xa0 + index)
+		serverID[index] = byte(0xd0 + index)
+	}
+	go func() { serverErr <- servePeerHandshake(server, infoHash, clientID, serverID) }()
+
+	conn, err := DialContext(context.Background(), "utp4", server.LocalAddr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	reserved := [8]byte{0, 0, 0, 0, 0, 0, 0, peer.FastExtensionBit}
+	if err := peer.WriteHandshake(conn, infoHash, clientID, reserved); err != nil {
+		t.Fatalf("WriteHandshake over uTP: %v", err)
+	}
+	handshake, err := peer.ReadHandshake(conn, &infoHash, &serverID)
+	if err != nil {
+		t.Fatalf("ReadHandshake over uTP: %v", err)
+	}
+	if handshake.PeerID != serverID || handshake.Reserved != reserved {
+		t.Fatalf("peer handshake = %+v", handshake)
+	}
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func servePeerHandshake(server *net.UDPConn, infoHash, expectedClientID, serverID [20]byte) error {
+	packet, addr, err := readPacket(server)
+	if err != nil {
+		return err
+	}
+	if packet.Type != Syn {
+		return errors.New("first packet was not SYN")
+	}
+	if err := sendTo(server, Packet{Type: State, ConnectionID: packet.ConnectionID, SeqNr: 700, AckNr: packet.SeqNr, WindowSize: 4 << 20}, addr); err != nil {
+		return err
+	}
+	packet, addr, err = readPacket(server)
+	if err != nil {
+		return err
+	}
+	if packet.Type != Data {
+		return errors.New("peer handshake was not a DATA packet")
+	}
+	want := make([]byte, 1+len(peer.ProtocolName)+8+20+20)
+	want[0] = byte(len(peer.ProtocolName))
+	copy(want[1:], peer.ProtocolName)
+	// The client test advertises Fast in the final reserved byte.
+	want[1+len(peer.ProtocolName)+7] = peer.FastExtensionBit
+	copy(want[1+len(peer.ProtocolName)+8:], infoHash[:])
+	copy(want[1+len(peer.ProtocolName)+8+20:], expectedClientID[:])
+	if !bytes.Equal(packet.Payload, want) {
+		return errors.New("client BEP3 handshake wire mismatch")
+	}
+	if err := sendTo(server, Packet{Type: State, ConnectionID: packet.ConnectionID - 1, AckNr: packet.SeqNr, WindowSize: 4 << 20}, addr); err != nil {
+		return err
+	}
+	response := make([]byte, len(want))
+	response[0] = byte(len(peer.ProtocolName))
+	copy(response[1:], peer.ProtocolName)
+	response[1+len(peer.ProtocolName)+7] = peer.FastExtensionBit
+	copy(response[1+len(peer.ProtocolName)+8:], infoHash[:])
+	copy(response[1+len(peer.ProtocolName)+8+20:], serverID[:])
+	return sendTo(server, Packet{Type: Data, ConnectionID: packet.ConnectionID - 1, SeqNr: 701, AckNr: packet.SeqNr, WindowSize: 4 << 20, Payload: response}, addr)
 }
