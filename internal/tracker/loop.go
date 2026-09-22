@@ -23,6 +23,8 @@ const (
 	finalAnnounceTimeout   = 15 * time.Second
 )
 
+var ErrTrackerPhaseActive = errors.New("tracker phase is still active")
+
 // Phase identifies one independent announce phase. A phase always starts with
 // event=started, even when the same session previously ran a metadata phase.
 type Phase uint8
@@ -107,12 +109,13 @@ type TrackerSet struct {
 	numWant   int32
 	onUpdate  func(Update)
 
-	mu       sync.Mutex
-	disabled map[string]bool
-	active   bool
-	current  *PhaseRun
-	closed   bool
-	ownedUDP *UDPClient
+	mu              sync.Mutex
+	disabled        map[string]bool
+	active          bool
+	current         *PhaseRun
+	closed          bool
+	ownedUDP        *UDPClient
+	resourcesClosed bool
 }
 
 // NewTrackerSet creates the session-wide tracker owner. It does not perform
@@ -281,12 +284,16 @@ func (s *TrackerSet) Close(ctx context.Context) error {
 	if s.closed {
 		run := s.current
 		owned := s.ownedUDP
+		resourcesClosed := s.resourcesClosed
+		if !resourcesClosed {
+			s.resourcesClosed = true
+		}
 		s.mu.Unlock()
 		var err error
 		if run != nil {
 			err = run.Finalize(ctx, false)
 		}
-		if owned != nil {
+		if owned != nil && !resourcesClosed {
 			if closeErr := owned.Close(); err == nil {
 				err = closeErr
 			}
@@ -296,6 +303,7 @@ func (s *TrackerSet) Close(ctx context.Context) error {
 	s.closed = true
 	run := s.current
 	owned := s.ownedUDP
+	s.resourcesClosed = true
 	s.mu.Unlock()
 	var errs []error
 	if run != nil {
@@ -320,23 +328,26 @@ func (s *TrackerSet) CloseResources() error {
 		return nil
 	}
 	s.mu.Lock()
+	if s.active {
+		s.mu.Unlock()
+		return ErrTrackerPhaseActive
+	}
 	if s.closed {
 		owned := s.ownedUDP
+		resourcesClosed := s.resourcesClosed
+		if !resourcesClosed {
+			s.resourcesClosed = true
+		}
 		s.mu.Unlock()
-		if owned != nil {
+		if owned != nil && !resourcesClosed {
 			return owned.Close()
 		}
 		return nil
 	}
 	s.closed = true
-	run := s.current
 	owned := s.ownedUDP
+	s.resourcesClosed = true
 	s.mu.Unlock()
-	if run != nil {
-		// This is a defensive unblock for a caller that did not own a phase
-		// handle. The documented session path finalizes first.
-		run.Wait()
-	}
 	if owned != nil {
 		return owned.Close()
 	}

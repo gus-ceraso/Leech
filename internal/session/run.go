@@ -198,6 +198,7 @@ func Run(ctx context.Context, config RunConfig) (result RunResult, err error) {
 			if err := run.switchAccounting(meta); err != nil {
 				return RunResult{}, err
 			}
+			run.reportFinalUpdates()
 		} else {
 			// An injected set still needs the ordinary metadata phase for a
 			// magnet/hash source; its caller owns set construction and callbacks.
@@ -207,6 +208,7 @@ func Run(ctx context.Context, config RunConfig) (result RunResult, err error) {
 				return RunResult{}, discoverErr
 			}
 			meta = metadata
+			run.reportFinalUpdates()
 		}
 	default:
 		return RunResult{}, fmt.Errorf("%w: unknown source kind", ErrRunConfig)
@@ -418,6 +420,22 @@ func (c *coordinator) closeSet() error {
 		return nil
 	}
 	return c.set.CloseResources()
+}
+
+func (c *coordinator) reportFinalUpdates() {
+	if c == nil || !c.ownSet || c.updates == nil || c.config.OnSecondary == nil {
+		return
+	}
+	for {
+		select {
+		case update := <-c.updates:
+			if (update.Request.Event == tracker.EventStopped || update.Request.Event == tracker.EventCompleted) && update.Err != nil {
+				c.config.OnSecondary(update.Err)
+			}
+		default:
+			return
+		}
+	}
 }
 
 func (c *coordinator) switchAccounting(meta torrent.Metainfo) error {
