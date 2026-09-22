@@ -289,6 +289,48 @@ func FuzzTrackerAccountingPhase(f *testing.F) {
 	})
 }
 
+func FuzzTrackerFinalEventOrdering(f *testing.F) {
+	f.Add(uint8(0), false, true)
+	f.Add(uint8(1), true, true)
+	f.Add(uint8(1), true, false)
+	f.Fuzz(func(t *testing.T, phaseByte uint8, fullCompletion, startedTransmitted bool) {
+		phase := Phase(phaseByte % 2)
+		// Finalize is idempotent, so a duplicate call must describe the same
+		// terminal sequence rather than append another event.
+		first := []Event(nil)
+		if startedTransmitted {
+			first = finalEventSequence(phase, fullCompletion)
+		}
+		second := append([]Event(nil), first...)
+		if len(first) != len(second) {
+			t.Fatalf("duplicate finalization changed sequence: %v, %v", first, second)
+		}
+		for i, event := range first {
+			if event != EventCompleted && event != EventStopped {
+				t.Fatalf("final event %d = %v", i, event)
+			}
+			if i > 0 && first[i-1] == EventStopped {
+				t.Fatalf("normal/final event follows stopped: %v", first)
+			}
+		}
+		if len(first) > 0 && first[len(first)-1] != EventStopped {
+			t.Fatalf("final sequence does not end stopped: %v", first)
+		}
+		if phase == MetadataPhase && containsEvent(first, EventCompleted) {
+			t.Fatalf("metadata sequence completed: %v", first)
+		}
+	})
+}
+
+func containsEvent(events []Event, want Event) bool {
+	for _, event := range events {
+		if event == want {
+			return true
+		}
+	}
+	return false
+}
+
 func TestTrackerPermanentFailureDisablesOnlyThatTrackerAcrossPhases(t *testing.T) {
 	fake := &loopHTTP{responses: []loopHTTPResponse{{result: HTTPAnnounceResult{Transmitted: true}, err: &HTTPError{Class: HTTPFailureNever, Code: HTTPErrorTracker}}}}
 	clock := newFixtureClock()

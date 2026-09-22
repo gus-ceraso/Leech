@@ -371,13 +371,10 @@ func (r *PhaseRun) Finalize(ctx context.Context, fullCompletion bool) error {
 		go func(state *trackerState) {
 			defer finalWG.Done()
 			var errs []error
-			if fullCompletion {
-				if err := r.sendOne(finalCtx, state, EventCompleted); err != nil {
-					errs = append(errs, fmt.Errorf("tracker %s completed: %w", trackerLabel(state.tracker), err))
+			for _, event := range finalEventSequence(r.phase, fullCompletion) {
+				if err := r.sendOne(finalCtx, state, event); err != nil {
+					errs = append(errs, fmt.Errorf("tracker %s %s: %w", trackerLabel(state.tracker), eventName(event), err))
 				}
-			}
-			if err := r.sendOne(finalCtx, state, EventStopped); err != nil {
-				errs = append(errs, fmt.Errorf("tracker %s stopped: %w", trackerLabel(state.tracker), err))
 			}
 			results <- finalResult{tracker: state.tracker, errs: errs}
 		}(state)
@@ -397,6 +394,16 @@ func (r *PhaseRun) Finalize(ctx context.Context, fullCompletion bool) error {
 	r.set.active = false
 	r.set.mu.Unlock()
 	return err
+}
+
+// finalEventSequence is the small phase transition seam used by Finalize and
+// fuzz tests. Every eligible phase has one terminal stopped event; only a full
+// transfer can prepend completed.
+func finalEventSequence(phase Phase, fullCompletion bool) []Event {
+	if phase == TransferPhase && fullCompletion {
+		return []Event{EventCompleted, EventStopped}
+	}
+	return []Event{EventStopped}
 }
 
 // boundedFinalContext deliberately detaches final tracker events from the
