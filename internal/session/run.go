@@ -175,7 +175,7 @@ func Run(ctx context.Context, config RunConfig) (RunResult, error) {
 		if err != nil {
 			return RunResult{}, err
 		}
-		if config.TrackerSet == nil {
+		if config.TrackerSet == nil && !config.ListFiles {
 			// A local .torrent is validated completely before any network owner is
 			// constructed.  This preserves offline validation and lets the
 			// metainfo's tracker list replace the source's default-only list.
