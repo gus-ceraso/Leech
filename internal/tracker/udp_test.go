@@ -30,6 +30,18 @@ func (d fixtureDialer) DialContext(context.Context, string, string) (net.Conn, e
 	return d.conn, nil
 }
 
+type blockingDialer struct {
+	entered chan struct{}
+	release chan struct{}
+	conn    net.Conn
+}
+
+func (d *blockingDialer) DialContext(context.Context, string, string) (net.Conn, error) {
+	close(d.entered)
+	<-d.release
+	return d.conn, nil
+}
+
 type fixtureConn struct {
 	mu       sync.Mutex
 	reads    chan []byte
@@ -451,6 +463,42 @@ func TestUDPClientCloseInterruptsInFlightExchange(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("client close did not interrupt announce")
+	}
+}
+
+func TestUDPClientCloseDuringDialDoesNotInstallSocket(t *testing.T) {
+	dialer := &blockingDialer{entered: make(chan struct{}), release: make(chan struct{}), conn: newFixtureConn(nil)}
+	client := NewUDPClient(Config{
+		Resolver: fixtureResolver{ips: []net.IPAddr{{IP: net.ParseIP("127.0.0.1")}}},
+		Dialer:   dialer,
+		Clock:    newFixtureClock(),
+		Random:   bytesReader{0, 0, 0, 1},
+	})
+	done := make(chan error, 1)
+	go func() {
+		_, err := client.Announce(context.Background(), "udp://tracker.test:1", testRequest())
+		done <- err
+	}()
+	select {
+	case <-dialer.entered:
+	case <-time.After(time.Second):
+		t.Fatal("dial did not start")
+	}
+	if err := client.Close(); err != nil {
+		t.Fatalf("close during dial: %v", err)
+	}
+	close(dialer.release)
+	select {
+	case err := <-done:
+		var trackerErr *Error
+		if !errors.As(err, &trackerErr) || trackerErr.Code != ErrorClosed {
+			t.Fatalf("error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("announce did not finish after close during dial")
+	}
+	if _, err := client.Announce(context.Background(), "udp://tracker.test:1", testRequest()); err == nil {
+		t.Fatal("announce after close unexpectedly succeeded")
 	}
 }
 

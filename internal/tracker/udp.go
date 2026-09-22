@@ -91,12 +91,14 @@ const (
 	ErrorAction      ErrorCode = "action"
 	ErrorTracker     ErrorCode = "tracker"
 	ErrorCanceled    ErrorCode = "canceled"
+	ErrorClosed      ErrorCode = "closed"
 )
 
 var (
-	ErrInvalidURL = errors.New("invalid UDP tracker URL")
-	ErrTimeout    = errors.New("UDP tracker transaction timed out")
-	ErrMalformed  = errors.New("malformed UDP tracker response")
+	ErrInvalidURL   = errors.New("invalid UDP tracker URL")
+	ErrTimeout      = errors.New("UDP tracker transaction timed out")
+	ErrMalformed    = errors.New("malformed UDP tracker response")
+	ErrClientClosed = errors.New("UDP tracker client is closed")
 )
 
 // Error reports a tracker-local transaction failure. Transmitted is true when
@@ -165,6 +167,7 @@ type UDPClient struct {
 	mu       sync.Mutex
 	randomMu sync.Mutex
 	sessions map[string]*udpSession
+	closed   bool
 }
 
 type udpSession struct {
@@ -207,6 +210,11 @@ func NewUDPClient(cfg Config) *UDPClient {
 // once. Any in-flight transaction observes the resulting read error.
 func (c *UDPClient) Close() error {
 	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return nil
+	}
+	c.closed = true
 	sessions := make([]*udpSession, 0, len(c.sessions))
 	for _, s := range c.sessions {
 		sessions = append(sessions, s)
@@ -241,6 +249,9 @@ func (c *UDPClient) Close() error {
 // successful result; every family attempt remains visible in Families.
 func (c *UDPClient) Announce(ctx context.Context, trackerURL string, req AnnounceRequest) (AnnounceResult, error) {
 	var result AnnounceResult
+	if c.isClosed() {
+		return result, &Error{Code: ErrorClosed, Operation: "announce", Err: ErrClientClosed}
+	}
 	u, err := parseUDPURL(trackerURL)
 	if err != nil {
 		return result, &Error{Code: ErrorInvalidURL, Operation: "resolve", Err: err}
@@ -341,6 +352,10 @@ func (c *UDPClient) announceFamily(ctx context.Context, endpoint netip.AddrPort,
 	}
 	key := network + "|" + endpoint.Addr().String() + "|" + strconv.Itoa(int(endpoint.Port()))
 	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return udpAnnounceResponse{}, false, &Error{Code: ErrorClosed, Operation: "announce", Err: ErrClientClosed}
+	}
 	s := c.sessions[key]
 	if s == nil {
 		s = &udpSession{endpoint: endpoint}
@@ -383,6 +398,9 @@ func (c *UDPClient) announceFamily(ctx context.Context, endpoint netip.AddrPort,
 }
 
 func (c *UDPClient) ensureConnection(ctx context.Context, s *udpSession, network string) error {
+	if c.isClosed() {
+		return &Error{Code: ErrorClosed, Operation: "connect", Err: ErrClientClosed}
+	}
 	now := c.clock.Now()
 	s.connMu.RLock()
 	conn := s.conn
@@ -402,9 +420,16 @@ func (c *UDPClient) ensureConnection(ctx context.Context, s *udpSession, network
 	if err != nil {
 		return &Error{Code: ErrorDial, Operation: "connect", Err: err}
 	}
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		_ = conn.Close()
+		return &Error{Code: ErrorClosed, Operation: "connect", Err: ErrClientClosed}
+	}
 	s.connMu.Lock()
 	s.conn = conn
 	s.connMu.Unlock()
+	c.mu.Unlock()
 	tx, err := c.transactionID()
 	if err != nil {
 		_ = conn.Close()
@@ -455,6 +480,12 @@ func (c *UDPClient) transactionID() (uint32, error) {
 		return 0, err
 	}
 	return binary.BigEndian.Uint32(b[:]), nil
+}
+
+func (c *UDPClient) isClosed() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.closed
 }
 
 // exchange sends one packet and waits with the BEP 15 schedule: the initial
