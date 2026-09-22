@@ -94,6 +94,76 @@ func TestPeerStateAvailabilityAndAllowedFastAreIndependent(t *testing.T) {
 	}
 }
 
+func TestPeerStateInitialAvailabilityOrdering(t *testing.T) {
+	state, err := NewPeerStateWithConfig(PeerStateConfig{PieceCount: 8, Fast: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := state.ApplyMessage(Message{ID: BitfieldID, Payload: []byte{0x80}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := state.ApplyMessage(Message{ID: AllowedFastID, Payload: uint32Payload(3)}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := state.ApplyMessage(Message{ID: HaveNoneID}); err != nil {
+		t.Fatal(err)
+	}
+	if state.Availability(0) || !state.AllowedFast(3) {
+		t.Fatalf("Have None did not clear ordinary availability: ordinary=%v allowed=%v", state.Availability(0), state.AllowedFast(3))
+	}
+	// A stale initial Bitfield or Have All is structurally valid, but cannot
+	// restore ordinary availability after the first availability frame.
+	if _, err := state.ApplyMessage(Message{ID: BitfieldID, Payload: []byte{0x80}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := state.ApplyMessage(Message{ID: HaveAllID}); err != nil {
+		t.Fatal(err)
+	}
+	if state.Availability(0) || state.Availability(7) || !state.AllowedFast(3) {
+		t.Fatalf("late initial availability restored stale state: ordinary0=%v ordinary7=%v allowed3=%v", state.Availability(0), state.Availability(7), state.AllowedFast(3))
+	}
+	// Have None remains an idempotent clear and does not clear Allowed Fast.
+	if _, err := state.ApplyMessage(Message{ID: HaveNoneID}); err != nil {
+		t.Fatal(err)
+	}
+	if state.Availability(0) || !state.AllowedFast(3) {
+		t.Fatal("repeated Have None changed the independent Allowed Fast state")
+	}
+	if _, err := state.ApplyMessage(Message{ID: BitfieldID, Payload: nil}); !IsProtocolViolation(err) {
+		t.Fatalf("malformed late Bitfield error = %v", err)
+	}
+}
+
+func TestPeerStateRepeatedInitialAvailabilityDoesNotRestoreState(t *testing.T) {
+	for _, first := range []Message{
+		{ID: BitfieldID, Payload: []byte{0x80}},
+		{ID: HaveAllID},
+		{ID: HaveNoneID},
+	} {
+		state, err := NewPeerStateWithConfig(PeerStateConfig{PieceCount: 8, Fast: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := state.ApplyMessage(first); err != nil {
+			t.Fatalf("first %#v: %v", first, err)
+		}
+		if _, err := state.ApplyMessage(Message{ID: HaveNoneID}); err != nil {
+			t.Fatalf("clear after %#v: %v", first, err)
+		}
+		if _, err := state.ApplyMessage(Message{ID: HaveAllID}); err != nil {
+			t.Fatalf("late Have All after %#v: %v", first, err)
+		}
+		if _, err := state.ApplyMessage(Message{ID: BitfieldID, Payload: []byte{0xff}}); err != nil {
+			t.Fatalf("late Bitfield after %#v: %v", first, err)
+		}
+		for index := uint32(0); index < 8; index++ {
+			if state.Availability(index) {
+				t.Fatalf("first %#v restored stale piece %d", first, index)
+			}
+		}
+	}
+}
+
 func TestPeerStateIncomingRequestsNeverProducePayload(t *testing.T) {
 	state, err := NewPeerState(3, true)
 	if err != nil {
@@ -233,5 +303,30 @@ func FuzzPeerStateMessages(f *testing.F) {
 			t.Fatal(err)
 		}
 		_, _ = state.ApplyMessage(Message{ID: id, Payload: payload})
+	})
+}
+
+func FuzzPeerInitialAvailabilitySequences(f *testing.F) {
+	f.Add([]byte{0, 1, 2, 3, 2, 1})
+	f.Add([]byte{2, 2, 0, 3, 1})
+	f.Fuzz(func(t *testing.T, input []byte) {
+		state, err := NewPeerStateWithConfig(PeerStateConfig{PieceCount: 8, Fast: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, value := range input {
+			var message Message
+			switch value % 4 {
+			case 0:
+				message = Message{ID: BitfieldID, Payload: []byte{0x80}}
+			case 1:
+				message = Message{ID: HaveAllID}
+			case 2:
+				message = Message{ID: HaveNoneID}
+			default:
+				message = Message{ID: AllowedFastID, Payload: uint32Payload(uint32(value % 8))}
+			}
+			_, _ = state.ApplyMessage(message)
+		}
 	})
 }

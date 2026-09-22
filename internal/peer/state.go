@@ -61,6 +61,7 @@ type PeerState struct {
 	fast            bool
 	choked          bool
 	interested      bool
+	initialSeen     bool
 	reqQ            int
 	availability    bitSet
 	allowedFast     bitSet
@@ -236,20 +237,39 @@ func (s *PeerState) ApplyMessage(message Message) (StateEffect, error) {
 	case HaveID:
 		index := binary.BigEndian.Uint32(message.Payload)
 		s.availability.set(index, true)
+		// A peer may omit its initial Bitfield. Once it has sent an
+		// incremental Have, a later initial availability frame is stale.
+		s.initialSeen = true
 		effect.InterestChanged, effect.Interested = s.refreshInterestChange()
 	case HaveAllID:
+		if s.initialSeen {
+			// BEP 3 permits Bitfield only as the first availability frame.
+			// Ignore a repeated Have All rather than restoring stale state.
+			break
+		}
 		s.availability.fill()
+		s.initialSeen = true
 		effect.InterestChanged, effect.Interested = s.refreshInterestChange()
 	case HaveNoneID:
 		if !s.fast {
 			return effect, protocolError("peer state", "Have None without negotiated Fast")
 		}
+		// Have None is always a safe empty-state correction. In particular,
+		// it must clear stale ordinary availability without clearing Allowed
+		// Fast, even if a peer sent a duplicate initial frame.
 		s.availability.clear()
+		s.initialSeen = true
 		effect.InterestChanged, effect.Interested = s.refreshInterestChange()
 	case BitfieldID:
+		if s.initialSeen {
+			// The payload was still structurally validated above. Do not let
+			// a late Bitfield restore availability cleared by Have None.
+			break
+		}
 		if err := s.applyBitfield(message.Payload); err != nil {
 			return effect, err
 		}
+		s.initialSeen = true
 		effect.InterestChanged, effect.Interested = s.refreshInterestChange()
 	case AllowedFastID:
 		if !s.fast {
