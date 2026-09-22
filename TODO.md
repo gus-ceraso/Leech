@@ -601,23 +601,28 @@ produce the intended peer-local error classification.
 **Depends on:** I2, I3, P2, P3, T3, M1. **Owns:** `internal/session/metadata.go` and
 local metadata-discovery tests. **References:** DESIGN §§6, 7.4, 15.
 
-- [ ] Start independent metadata trackers with `left=1`, accept embedded/tracker
+- [x] Start independent metadata trackers with `left=1`, accept embedded/tracker
   candidates, and keep only handshake winners that support metadata. Use P3's
   dialer seams; real uTP wiring is L2's responsibility.
-- [ ] Try the first bounded advertised size without a consensus wait. Have one
+- [x] Try the first bounded advertised size without a consensus wait. Have one
   endpoint supply the complete candidate with the metadata request cap; do not
   combine suppliers. Keep candidate data only in bounded run memory.
-- [ ] Validate blocks, complete canonical bencoding, and exact info hash. Give
+- [x] Validate blocks, complete canonical bencoding, and exact info hash. Give
   the sole supplier one strike for a complete invalid candidate, retaining
   endpoint penalties across retries and later phases. Rotate peers or advertised
   sizes after failure; treat ordinary rejection/timeouts as ordinary failures.
-- [ ] Once the candidate passes hash/bencoding validation, cancel and join
+- [x] Once the candidate passes hash/bencoding validation, cancel and join
   tracker loops, dials, and metadata peers, then attempt bounded stopped events
   before full normalization. Return immutable metadata and bounded retained
   endpoint values, never a live network worker or cache workspace.
 - [ ] Test magnet/bare hashes, wrong sizes/hashes, refusing peers, ID changes,
   corruption strikes, repeated retry/cancellation, tracker loss, and the absence
   of file-payload requests. Assert the phase boundary under the race detector.
+  Initial local fixtures cover multi-block metadata, refusal, repeated extension
+  IDs, one invalid complete candidate, cancellation, and request rejection.
+  Add explicit wrong-size, retry, tracker-loss, no-file-payload-request, and
+  phase-boundary evidence before M2 acceptance; L2/V1 cover full magnet and
+  bare-hash command flows.
 
 **Acceptance:** the metadata milestone obtains valid metainfo from local fixtures
 and returns only after workers stop. It creates no piece workspace/output,
