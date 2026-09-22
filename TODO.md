@@ -729,21 +729,21 @@ copies of this implementation successfully talking to each other.
 presentation/signal tests. This can run while uTP and metadata work continue.
 **References:** DESIGN §§4.5, 4.9–4.10, 15.
 
-- [ ] Implement the exact log levels/default, permanent phase/result lines, and
+- [x] Implement the exact log levels/default, permanent phase/result lines, and
   stdout/stderr separation. Quote/escape untrusted names; redact tracker URL
   userinfo/path/query and never echo a full magnet, including through wrapped
   errors. Keep diagnostics bounded.
-- [ ] At info/debug on an interactive stderr, show one replaceable line updated
+- [x] At info/debug on an interactive stderr, show one replaceable line updated
   at most once per second, with the defined phase/progress fields. Noninteractive
   stderr gets enabled permanent lines only. Use no color or terminal dependency;
   isolate the minimal platform-specific terminal detection if needed.
-- [ ] Report no-transfer-needed resume, selection-versus-torrent completion,
+- [x] Report no-transfer-needed resume, selection-versus-torrent completion,
   resumable verified partial output, and ignored `private=1` accurately. Keep a
   primary error distinct from secondary shutdown diagnostics.
-- [ ] Implement the signal adapter: first SIGINT/SIGTERM requests graceful
+- [x] Implement the signal adapter: first SIGINT/SIGTERM requests graceful
   cancellation with the right exit reason; a second may terminate immediately.
   Keep process exit out of the reusable session code.
-- [ ] Add golden log/status tests using injected terminal/time state and helper
+- [x] Add golden log/status tests using injected terminal/time state and helper
   process tests for signal behavior. Include escaped control characters and
   credential-bearing URLs in error cases.
 
