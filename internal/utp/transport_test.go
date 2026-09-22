@@ -5,7 +5,10 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
+	"io"
 	"net"
+	"net/netip"
 	"testing"
 	"time"
 
@@ -217,6 +220,351 @@ func TestConcurrentConnOperationsCloseUnderRace(t *testing.T) {
 	}
 }
 
+func TestConnWriteBackpressureWakesOnACK(t *testing.T) {
+	server, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	const payloadBytes = (4 << 20) + (64 << 10)
+	serverErr := make(chan error, 1)
+	go func() { serverErr <- serveAcknowledgeStream(server, payloadBytes) }()
+	conn, err := DialContext(context.Background(), "utp4", server.LocalAddr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if err := conn.SetWriteDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	payload := bytes.Repeat([]byte{'p'}, payloadBytes)
+	start := time.Now()
+	n, err := conn.Write(payload)
+	if err != nil || n != len(payload) {
+		t.Fatalf("backpressured Write = %d/%d, %v", n, len(payload), err)
+	}
+	if elapsed := time.Since(start); elapsed >= 10*time.Second {
+		t.Fatalf("backpressured Write reached deadline: %s", elapsed)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func serveAcknowledgeStream(server *net.UDPConn, wantBytes int) error {
+	packet, addr, err := readPacket(server)
+	if err != nil {
+		return err
+	}
+	if packet.Type != Syn {
+		return errors.New("backpressure fixture did not receive SYN")
+	}
+	const peerWindow = 64 << 10
+	if err := sendTo(server, Packet{Type: State, ConnectionID: packet.ConnectionID, SeqNr: 1_000, AckNr: packet.SeqNr, WindowSize: peerWindow}, addr); err != nil {
+		return err
+	}
+	var received int
+	// The SYN's sequence number establishes the first DATA sequence. Do not
+	// infer it from the first datagram observed: a scripted link may reorder
+	// that packet before the first one.
+	receiver := NewReceiveState(packet.SeqNr.Add(1))
+	seen := make(map[Sequence]struct{})
+	scratch := make([]byte, 64<<10)
+	packets := 0
+	for received < wantBytes {
+		packet, addr, err = readPacket(server)
+		if err != nil {
+			pending, buffered := receiver.Buffered()
+			return fmt.Errorf("read after %d packets, %d/%d bytes, ack=%d next=%d pending=%d buffered=%d: %w", packets, received, wantBytes, receiver.AckNumber(), receiver.NextSequence(), pending, buffered, err)
+		}
+		packets++
+		if packet.Type != Data {
+			continue
+		}
+		if result := receiver.Receive(packet); result.WindowFull || receiver.Err() != nil {
+			return fmt.Errorf("backpressure fixture receive window failed at packet %d: %+v err=%v", packets, result, receiver.Err())
+		}
+		for {
+			if n, _ := receiver.Read(scratch); n == 0 {
+				break
+			}
+		}
+		if _, exists := seen[packet.SeqNr]; !exists {
+			seen[packet.SeqNr] = struct{}{}
+			received += len(packet.Payload)
+		}
+		ack := receiver.AckPacket()
+		ack.ConnectionID = packet.ConnectionID - 1
+		ack.SeqNr = 1_001
+		ack.WindowSize = peerWindow
+		if err := sendTo(server, ack, addr); err != nil {
+			return err
+		}
+	}
+	if received != wantBytes {
+		return errors.New("backpressure fixture received the wrong byte count")
+	}
+	return nil
+}
+
+type scriptedStreamStats struct {
+	firstPacketDropped bool
+	timeoutObserved    bool
+	sackObserved       bool
+	peerDataDuplicated bool
+	peerDataReordered  bool
+	peerDataDelayed    bool
+	clientBytes        int
+}
+
+// TestConnScriptedStream exercises the complete Conn adapter against one
+// deliberately small fake peer. The peer tracks sequence numbers itself and
+// encodes cumulative and selective ACKs; it does not call SendState or
+// ReceiveState. Client DATA has one dropped packet and one timeout, with a
+// small advertised window forcing the writer to wait for ACK credit. Echo
+// DATA is sent across a sequence wrap with delay, reordering, duplication,
+// and an observed SACK from the client.
+func TestConnScriptedStream(t *testing.T) {
+	server, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	payload := make([]byte, 48<<10)
+	for index := range payload {
+		payload[index] = byte(index*31 + 7)
+	}
+	statsCh := make(chan scriptedStreamStats, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		stats, serveErr := serveScriptedStream(server, payload)
+		statsCh <- stats
+		errCh <- serveErr
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	conn, err := DialContext(ctx, "utp4", server.LocalAddr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if err := conn.SetDeadline(time.Now().Add(7 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := conn.Write(payload); n != len(payload) || err != nil {
+		t.Fatalf("scripted stream Write = %d/%d, %v", n, len(payload), err)
+	}
+	got := make([]byte, len(payload))
+	if _, err := io.ReadFull(conn, got); err != nil {
+		select {
+		case stats := <-statsCh:
+			t.Fatalf("scripted stream ReadFull: %v; peer stats=%+v err=%v", err, stats, <-errCh)
+		default:
+			t.Fatalf("scripted stream ReadFull: %v; peer still running", err)
+		}
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatal("scripted stream echo changed payload")
+	}
+
+	stats := <-statsCh
+	if err := <-errCh; err != nil {
+		t.Fatal(err)
+	}
+	if !stats.firstPacketDropped || !stats.timeoutObserved {
+		t.Fatalf("loss script did not exercise drop and timeout: %+v", stats)
+	}
+	if !stats.sackObserved || !stats.peerDataDuplicated || !stats.peerDataReordered || !stats.peerDataDelayed {
+		t.Fatalf("script did not exercise SACK and peer scheduling: %+v", stats)
+	}
+	if stats.clientBytes != len(payload) {
+		t.Fatalf("peer received %d/%d bytes", stats.clientBytes, len(payload))
+	}
+}
+
+func serveScriptedStream(server *net.UDPConn, want []byte) (scriptedStreamStats, error) {
+	var stats scriptedStreamStats
+	syn, addr, err := readPacket(server)
+	if err != nil {
+		return stats, err
+	}
+	if syn.Type != Syn {
+		return stats, errors.New("scripted peer did not receive SYN")
+	}
+	const peerWindow = 8 << 10
+	// Start the peer sequence at 0xffff so the echoed stream crosses the ring.
+	const peerSequence = Sequence(0xffff)
+	if err := sendTo(server, Packet{
+		Type:         State,
+		ConnectionID: syn.ConnectionID,
+		SeqNr:        peerSequence.Add(^uint16(0)),
+		AckNr:        syn.SeqNr,
+		WindowSize:   peerWindow,
+		Timestamp:    timestamp(time.Now()),
+	}, addr); err != nil {
+		return stats, err
+	}
+
+	first := syn.SeqNr.Add(1)
+	ack := first.Add(^uint16(0))
+	timeoutSeq := first.Add(4)
+	firstDropped := false
+	timeoutReleased := false
+	pending := make(map[Sequence][]byte)
+	seen := make(map[Sequence]struct{})
+	received := make([]byte, 0, len(want))
+	for len(received) < len(want) {
+		packet, packetAddr, readErr := readPacket(server)
+		if readErr != nil {
+			return stats, readErr
+		}
+		if packet.Type != Data {
+			continue
+		}
+		if packet.ConnectionID != syn.ConnectionID+1 {
+			return stats, errors.New("scripted peer received an unexpected connection ID")
+		}
+
+		if packet.SeqNr == first && !firstDropped {
+			firstDropped = true
+			stats.firstPacketDropped = true
+			continue
+		}
+		if packet.SeqNr == timeoutSeq && !timeoutReleased {
+			// Do not acknowledge this in-order packet. Sleeping past the
+			// initial RTO forces the client's timeout retransmission while
+			// preserving the same fake peer state.
+			time.Sleep(650 * time.Millisecond)
+			timeoutReleased = true
+			stats.timeoutObserved = true
+			if err := sendScriptAck(server, packetAddr, syn.ConnectionID, ack, pending, peerWindow); err != nil {
+				return stats, err
+			}
+			continue
+		}
+		if _, exists := seen[packet.SeqNr]; exists {
+			if err := sendScriptAck(server, packetAddr, syn.ConnectionID, ack, pending, peerWindow); err != nil {
+				return stats, err
+			}
+			continue
+		}
+		seen[packet.SeqNr] = struct{}{}
+		pending[packet.SeqNr] = append([]byte(nil), packet.Payload...)
+		for {
+			next := ack.Add(1)
+			data, ok := pending[next]
+			if !ok {
+				break
+			}
+			delete(pending, next)
+			received = append(received, data...)
+			ack = next
+		}
+		if err := sendScriptAck(server, packetAddr, syn.ConnectionID, ack, pending, peerWindow); err != nil {
+			return stats, err
+		}
+	}
+	stats.clientBytes = len(received)
+	if !bytes.Equal(received, want) {
+		return stats, errors.New("scripted peer reconstructed the wrong stream")
+	}
+
+	// Send one packet past the initial receive sequence first, and duplicate
+	// it. The client must advertise that gap with a SACK before the missing
+	// wrapped packet is released.
+	const echoPayload = 512
+	// Client DATA uses SYN ID plus one; packets sent back use the original
+	// receive ID from the SYN.
+	serverID := syn.ConnectionID
+	peerData := make([]Packet, 0, (len(want)+echoPayload-1)/echoPayload)
+	for offset, sequence := 0, peerSequence; offset < len(want); sequence = sequence.Add(1) {
+		end := offset + echoPayload
+		if end > len(want) {
+			end = len(want)
+		}
+		peerData = append(peerData, Packet{
+			Type:         Data,
+			ConnectionID: serverID,
+			SeqNr:        sequence,
+			WindowSize:   4 << 20,
+			Payload:      append([]byte(nil), want[offset:end]...),
+		})
+		offset = end
+	}
+	if len(peerData) < 3 {
+		return stats, errors.New("scripted peer stream was too short")
+	}
+	stats.peerDataDuplicated = true
+	stats.peerDataReordered = true
+	stats.peerDataDelayed = true
+	if err := sendTo(server, peerData[1], addr); err != nil {
+		return stats, err
+	}
+	if err := sendTo(server, peerData[1], addr); err != nil {
+		return stats, err
+	}
+	for {
+		ackPacket, _, ackErr := readPacket(server)
+		if ackErr != nil {
+			return stats, ackErr
+		}
+		if ackPacket.Type == State && len(ackPacket.SelectiveACKSequences()) != 0 {
+			stats.sackObserved = true
+			break
+		}
+	}
+	time.Sleep(20 * time.Millisecond)
+	if err := sendTo(server, peerData[0], addr); err != nil {
+		return stats, err
+	}
+	for index := 2; index < len(peerData); index++ {
+		if index == 4 {
+			// Hold one packet briefly, then send its successor to make the
+			// reordering visible to the receive state.
+			time.Sleep(10 * time.Millisecond)
+			stats.peerDataDelayed = true
+		}
+		if err := sendTo(server, peerData[index], addr); err != nil {
+			return stats, err
+		}
+	}
+	return stats, nil
+}
+
+func sendScriptAck(server *net.UDPConn, addr *net.UDPAddr, connectionID uint16, ack Sequence, pending map[Sequence][]byte, window uint32) error {
+	packet := Packet{
+		Type:         State,
+		ConnectionID: connectionID,
+		Timestamp:    timestamp(time.Now()),
+		AckNr:        ack,
+		SeqNr:        0x1234,
+		WindowSize:   window,
+	}
+	maxDistance := 0
+	for sequence := range pending {
+		distance, ok := SequenceDistance(ack, sequence)
+		if ok && distance >= 2 && int(distance) <= maxReceiveOffset && int(distance) > maxDistance {
+			maxDistance = int(distance)
+		}
+	}
+	if maxDistance != 0 {
+		length := ((maxDistance-2)/8 + 1 + 3) / 4 * 4
+		mask := make([]byte, length)
+		for sequence := range pending {
+			distance, ok := SequenceDistance(ack, sequence)
+			if !ok || distance < 2 || int(distance) > maxReceiveOffset {
+				continue
+			}
+			bit := int(distance) - 2
+			mask[bit/8] |= 1 << uint(bit%8)
+		}
+		packet.Extensions = []Extension{{Type: SelectiveACKExtension, Data: mask}}
+	}
+	return sendTo(server, packet, addr)
+}
+
 func serveEchoLoop(server *net.UDPConn) error {
 	packet, addr, err := readPacket(server)
 	if err != nil {
@@ -308,6 +656,48 @@ func TestConnCarriesBEP3PeerHandshake(t *testing.T) {
 		t.Fatalf("peer handshake = %+v", handshake)
 	}
 	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRaceEndpointUsesActualUTPDialContext(t *testing.T) {
+	server, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	var infoHash, clientID, serverID [20]byte
+	for index := range infoHash {
+		infoHash[index] = byte(index + 1)
+		clientID[index] = byte(0x40 + index)
+		serverID[index] = byte(0x90 + index)
+	}
+	serverErr := make(chan error, 1)
+	go func() { serverErr <- servePeerHandshake(server, infoHash, clientID, serverID) }()
+	local := peer.Handshake{InfoHash: infoHash, PeerID: clientID, Reserved: [8]byte{0, 0, 0, 0, 0, 0, 0, peer.FastExtensionBit}}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	result, err := peer.RaceEndpoint(ctx, peer.Endpoint{
+		Addr: netip.MustParseAddr("127.0.0.1"),
+		Port: uint16(server.LocalAddr().(*net.UDPAddr).Port),
+	}, peer.RaceConfig{
+		LocalHandshake: local,
+		UTPDial:        DialContext,
+		TCPDial: func(context.Context, string, string) (net.Conn, error) {
+			return nil, errors.New("scripted TCP loser")
+		},
+		UTPHeadStart: 5 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("RaceEndpoint: %v (server: %v)", err, <-serverErr)
+	}
+	if result.Transport != peer.TransportUTP || result.Conn == nil || result.Handshake.PeerID != serverID {
+		t.Fatalf("race result = %+v", result)
+	}
+	if err := result.Conn.Close(); err != nil {
 		t.Fatal(err)
 	}
 	if err := <-serverErr; err != nil {

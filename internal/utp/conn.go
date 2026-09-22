@@ -452,6 +452,12 @@ func (c *Conn) handleDatagram(wire []byte) {
 		c.setTerminalLocked(result.Err)
 		return
 	}
+	if result.AckedBytes > 0 {
+		// Write may be blocked on the bounded queue. An ACK returns exactly
+		// that many bytes of queue credit, so wake the waiting application
+		// writer after applying the ACK state transition.
+		signal(&c.writeWake)
+	}
 	for _, action := range result.Actions {
 		if action.Kind == ActionSend {
 			if err := c.writeActionLocked(action.Packet); err != nil {
