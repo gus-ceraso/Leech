@@ -397,21 +397,21 @@ is requested, and compatibility failure never becomes a corruption strike.
 **Depends on:** P1. **Owns:** `internal/peer/candidates.go`, `dial.go`, and race
 tests. **References:** DESIGN §§11, 15–16.
 
-- [ ] Resolve and normalize bounded endpoint candidates keyed by IP and port.
+- [x] Resolve and normalize bounded endpoint candidates keyed by IP and port.
   Permit loopback/private unicast addresses; reject invalid ports, unspecified,
   and multicast addresses. Bound DNS results, candidates, races, and live peers
   before spawning work; deduplicate across sources and transports.
-- [ ] Race injected uTP and TCP dial functions against the exact same resolved
+- [x] Race injected uTP and TCP dial functions against the exact same resolved
   endpoint, with uTP's short head start. Win only after a valid BEP 3 handshake;
   then cancel, close, and join the loser. Inspect phase capabilities afterward
   without reviving the loser. Bind the actual uTP dialer in L2.
-- [ ] Do not deduplicate on tracker-supplied peer IDs. Apply optional expected-ID
+- [x] Do not deduplicate on tracker-supplied peer IDs. Apply optional expected-ID
   validation and retain the older established connection on a live peer-ID
   collision. Release the ID when it closes, permitting later connections.
-- [ ] Keep ordinary failure backoff and endpoint blacklist state independent of
+- [x] Keep ordinary failure backoff and endpoint blacklist state independent of
   transport and peer-ID spoofing. Expose bounded outcomes to the coordinator,
   which owns admission/penalty decisions.
-- [ ] Use controlled dialers/clocks to test handshake races, a connected socket
+- [x] Use controlled dialers/clocks to test handshake races, a connected socket
   with a stalled handshake, both failures, cancellation, duplicate IDs,
   reconnects, DNS changes, and IPv4/IPv6. Fuzz event ordering and run race tests.
 
