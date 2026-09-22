@@ -565,6 +565,13 @@ func readPeerMessage(ctx context.Context, conn net.Conn, deadline time.Time) (pe
 		_ = conn.SetReadDeadline(deadline)
 		defer conn.SetReadDeadline(time.Time{})
 	}
+	var timeout <-chan time.Time
+	var timer *time.Timer
+	if !deadline.IsZero() {
+		timer = time.NewTimer(time.Until(deadline))
+		timeout = timer.C
+		defer timer.Stop()
+	}
 	type response struct {
 		message peer.Message
 		err     error
@@ -581,6 +588,10 @@ func readPeerMessage(ctx context.Context, conn net.Conn, deadline time.Time) (pe
 		_ = conn.Close()
 		<-done
 		return peer.Message{}, ctx.Err()
+	case <-timeout:
+		_ = conn.Close()
+		<-done
+		return peer.Message{}, context.DeadlineExceeded
 	}
 }
 
@@ -591,6 +602,13 @@ func writeWithContext(ctx context.Context, conn net.Conn, data []byte, deadline 
 	if !deadline.IsZero() {
 		_ = conn.SetWriteDeadline(deadline)
 		defer conn.SetWriteDeadline(time.Time{})
+	}
+	var timeout <-chan time.Time
+	var timer *time.Timer
+	if !deadline.IsZero() {
+		timer = time.NewTimer(time.Until(deadline))
+		timeout = timer.C
+		defer timer.Stop()
 	}
 	done := make(chan error, 1)
 	go func() { done <- writeAll(conn, data) }()
@@ -604,6 +622,10 @@ func writeWithContext(ctx context.Context, conn net.Conn, data []byte, deadline 
 			return ctx.Err()
 		}
 		return err
+	case <-timeout:
+		_ = conn.Close()
+		<-done
+		return context.DeadlineExceeded
 	}
 }
 
