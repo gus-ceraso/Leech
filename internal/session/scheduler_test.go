@@ -157,6 +157,26 @@ func TestSchedulerIgnoresUnwantedAndOutOfRangeAvailability(t *testing.T) {
 	}
 }
 
+func TestSchedulerSeedsMetadataStrikesBeforeAdmission(t *testing.T) {
+	plan := schedulerPlan(t, []torrent.File{regularFile(0, "a", 0, 32768)}, []torrent.Piece{piece(0, 0, 32768)}, nil)
+	s, err := NewScheduler(plan, Config{Shuffle: keepTieOrder})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SeedStrikes(map[peer.Endpoint]int{endpoint(1): 2, endpoint(2): 3}); err != nil {
+		t.Fatal(err)
+	}
+	if s.StrikeCount(endpoint(1)) != 2 || !s.IsBlacklisted(endpoint(2)) {
+		t.Fatalf("seeded state = %d/%v", s.StrikeCount(endpoint(1)), s.IsBlacklisted(endpoint(2)))
+	}
+	if err := s.AddPeer("blocked", endpoint(2)); !errors.Is(err, ErrInvalidSchedulerPeer) {
+		t.Fatalf("blacklisted endpoint admission = %v", err)
+	}
+	if err := s.SeedStrikes(map[peer.Endpoint]int{endpoint(3): 4}); !errors.Is(err, ErrSchedulerConfig) {
+		t.Fatalf("invalid seed = %v", err)
+	}
+}
+
 func TestSchedulerReassignsAndEnforcesRequestCaps(t *testing.T) {
 	plan := schedulerPlan(t, []torrent.File{regularFile(0, "a", 0, 32768)}, []torrent.Piece{piece(0, 0, 32768)}, nil)
 	s, err := NewScheduler(plan, Config{MaxPerPeer: 1, MaxGlobal: 1, MaxQueue: 1, MaxStagedPieces: 1, MaxStagedBytes: 32768, Shuffle: keepTieOrder})
@@ -205,6 +225,104 @@ func TestSchedulerReassignsAndEnforcesRequestCaps(t *testing.T) {
 	}
 	if got, err := s.NextRequests("two", 1); err != nil || len(got) != 0 {
 		t.Fatalf("blacklisted peer requests = %#v, %v", got, err)
+	}
+}
+
+func TestSchedulerStreamingPrioritizesEarlierAdmittedPiece(t *testing.T) {
+	plan := schedulerPlan(t,
+		[]torrent.File{regularFile(0, "a", 0, 32768), regularFile(1, "b", 32768, 65536)},
+		[]torrent.Piece{piece(0, 0, 32768), piece(1, 32768, 65536)}, nil)
+	s, err := NewScheduler(plan, Config{Streaming: true, MaxStagedPieces: 2, MaxStagedBytes: 65536, Shuffle: keepTieOrder})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"one", "two"} {
+		if err := s.AddPeer(id, endpoint(byte(len(id)))); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.SetAvailability(id, []int{0, 1}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	first, ok, err := s.ReservePiece("one")
+	if err != nil || !ok || first.PieceIndex != 0 {
+		t.Fatalf("first offer = %#v, %v, %v", first, ok, err)
+	}
+	if err := s.AdmitPiece(first); err != nil {
+		t.Fatal(err)
+	}
+	second, ok, err := s.ReservePiece("two")
+	if err != nil || !ok || second.PieceIndex != 1 {
+		t.Fatalf("second offer = %#v, %v, %v", second, ok, err)
+	}
+	if err := s.AdmitPiece(second); err != nil {
+		t.Fatal(err)
+	}
+	requests, err := s.NextRequests("two", 1)
+	if err != nil || len(requests) != 1 || requests[0].Block.Index != 0 {
+		t.Fatalf("stream request = %#v, %v; want piece 0", requests, err)
+	}
+
+	// A useful connection that cannot serve the current sequential piece may
+	// continue with a later available piece rather than idling.
+	if err := s.RejectBlock("two", requests[0].Block); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetAvailability("two", []int{1}); err != nil {
+		t.Fatal(err)
+	}
+	requests, err = s.NextRequests("two", 1)
+	if err != nil || len(requests) != 1 || requests[0].Block.Index != 1 {
+		t.Fatalf("fallback request = %#v, %v; want piece 1", requests, err)
+	}
+}
+
+func TestSchedulerEndgameWinnerCancelsDuplicateAssignments(t *testing.T) {
+	plan := schedulerPlan(t, []torrent.File{regularFile(0, "a", 0, 32768)}, []torrent.Piece{piece(0, 0, 32768)}, nil)
+	s, err := NewScheduler(plan, Config{MaxPerPeer: 4, MaxGlobal: 4, MaxQueue: 4, MaxStagedPieces: 1, MaxStagedBytes: 32768, Shuffle: keepTieOrder})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, item := range []struct {
+		id string
+		ep peer.Endpoint
+	}{{"one", endpoint(1)}, {"two", endpoint(2)}} {
+		if err := s.AddPeer(item.id, item.ep); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.SetAvailability(item.id, []int{0}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	offer, ok, err := s.ReservePiece("one")
+	if err != nil || !ok {
+		t.Fatalf("offer = %#v, %v", offer, err)
+	}
+	if err := s.AdmitPiece(offer); err != nil {
+		t.Fatal(err)
+	}
+	primary, err := s.NextRequests("one", 2)
+	if err != nil || len(primary) != 2 || !s.Endgame() {
+		t.Fatalf("primary = %#v, endgame=%v, err=%v", primary, s.Endgame(), err)
+	}
+	duplicates, err := s.NextRequests("two", 2)
+	if err != nil || len(duplicates) != 2 {
+		t.Fatalf("duplicates = %#v, err=%v", duplicates, err)
+	}
+	for _, request := range primary {
+		result, err := s.AcceptBlock("one", request.Block)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(result.Canceled) != 1 || result.Canceled[0].Peer != "two" || result.Canceled[0].Block != request.Block {
+			t.Fatalf("winner result = %#v for %#v", result, request)
+		}
+	}
+	if s.ActiveRequests() != 0 {
+		t.Fatalf("active requests = %d, want 0", s.ActiveRequests())
+	}
+	if s.Endgame() {
+		t.Fatal("endgame should end after all blocks have a winner")
 	}
 }
 

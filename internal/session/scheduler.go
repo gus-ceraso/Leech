@@ -43,7 +43,11 @@ type Config struct {
 	MaxQueue        int
 	MaxStagedPieces int
 	MaxStagedBytes  int64
-	Shuffle         ShuffleFunc
+	// Streaming gives lower piece indices priority while retaining the
+	// availability rule: a peer may use a later available piece when no
+	// earlier piece is available to it.
+	Streaming bool
+	Shuffle   ShuffleFunc
 }
 
 // Request is one wire request selected by the coordinator. Offset is relative
@@ -72,6 +76,10 @@ type PieceOffer struct {
 type BlockResult struct {
 	PieceIndex int
 	Complete   bool
+	// Canceled contains duplicate assignments which lost the endgame race.
+	// The transfer coordinator must preserve each request's peer-side
+	// terminal obligation before sending a wire cancel.
+	Canceled []Request
 }
 
 // VerificationResult is the coordinator's result after the finalizer checks a
@@ -115,7 +123,11 @@ type blockState struct {
 	active   bool
 	peerID   string
 	endpoint peer.Endpoint
-	done     bool
+	// assignments is non-empty exactly when active. The legacy peerID and
+	// endpoint fields retain the first assignment for cheap single-owner
+	// access; assignments is authoritative once endgame duplicates exist.
+	assignments map[string]peer.Endpoint
+	done        bool
 }
 
 type pieceStage uint8
@@ -332,6 +344,27 @@ func (s *Scheduler) AddPeer(id string, endpoint peer.Endpoint) error {
 	return s.AddPeerWithLimit(id, endpoint, s.cfg.MaxPerPeer)
 }
 
+// SeedStrikes imports endpoint corruption penalties accumulated during an
+// earlier phase, such as metadata acquisition. It must be called before the
+// endpoint is admitted; counts at three are treated as an existing blacklist.
+func (s *Scheduler) SeedStrikes(seed map[peer.Endpoint]int) error {
+	if s == nil {
+		return ErrSchedulerConfig
+	}
+	for endpoint, count := range seed {
+		if !validEndpoint(endpoint) || count < 0 || count > 3 {
+			return fmt.Errorf("%w: invalid seeded endpoint strike", ErrSchedulerConfig)
+		}
+	}
+	for endpoint, count := range seed {
+		s.strikes[endpoint] = count
+		if count >= 3 {
+			s.blacklist[endpoint] = struct{}{}
+		}
+	}
+	return nil
+}
+
 // AddPeerWithLimit adds a live connection and applies the remote reqq hint
 // after clamping it to the scheduler's local per-peer cap.
 func (s *Scheduler) AddPeerWithLimit(id string, endpoint peer.Endpoint, limit int) error {
@@ -370,13 +403,13 @@ func (s *Scheduler) RemovePeer(id string) error {
 	for _, piece := range s.pieces {
 		for i := range piece.blocks {
 			b := &piece.blocks[i]
-			if b.active && b.peerID == id {
-				b.active = false
-				b.peerID = ""
-				b.endpoint = peer.Endpoint{}
-				s.active--
-				p.active--
+			if !b.active || !hasAssignment(b, id) {
+				continue
 			}
+			delete(b.assignments, id)
+			s.active--
+			p.active--
+			refreshAssignments(b)
 		}
 	}
 	for word, value := range p.available {
@@ -457,7 +490,7 @@ func (s *Scheduler) ReservePiece(peerID string) (PieceOffer, bool, error) {
 	if s.staged+s.reserved >= s.cfg.MaxStagedPieces {
 		return PieceOffer{}, false, nil
 	}
-	index, ok, err := s.choosePiece(p, false)
+	index, ok, err := s.choosePiece(p, peerID, false, false)
 	if err != nil || !ok {
 		return PieceOffer{}, false, err
 	}
@@ -520,9 +553,9 @@ func (s *Scheduler) RejectPiece(offer PieceOffer) error {
 	return nil
 }
 
-// NextRequests assigns at most max blocks to one peer. A block has one active
-// assignment in this initial scheduler; rejected, timed-out, and disconnected
-// assignments return to the pending set.
+// NextRequests assigns at most max blocks to one peer. Normal scheduling gives
+// each block one assignment; after endgame is entered, an eligible peer may
+// receive a duplicate assignment within the same bounded request budgets.
 func (s *Scheduler) NextRequests(peerID string, max int) ([]Request, error) {
 	p, ok := s.peers[peerID]
 	if !ok {
@@ -548,8 +581,9 @@ func (s *Scheduler) NextRequests(peerID string, max int) ([]Request, error) {
 		return nil, nil
 	}
 	requests := make([]Request, 0, remaining)
+	endgame := s.endgameReady()
 	for len(requests) < remaining {
-		index, found, err := s.choosePiece(p, true)
+		index, found, err := s.choosePiece(p, peerID, true, endgame)
 		if err != nil {
 			return nil, err
 		}
@@ -558,14 +592,12 @@ func (s *Scheduler) NextRequests(peerID string, max int) ([]Request, error) {
 		}
 		piece := s.pieces[index]
 		for len(requests) < remaining {
-			blockIndex := firstPendingBlock(piece)
+			blockIndex := firstAssignableBlock(piece, peerID, endgame)
 			if blockIndex < 0 {
 				break
 			}
 			block := &piece.blocks[blockIndex]
-			block.active = true
-			block.peerID = peerID
-			block.endpoint = p.endpoint
+			assignBlock(block, peerID, p.endpoint)
 			p.active++
 			s.active++
 			requests = append(requests, Request{Peer: peerID, Endpoint: p.endpoint, Block: block.block})
@@ -574,12 +606,44 @@ func (s *Scheduler) NextRequests(peerID string, max int) ([]Request, error) {
 	return requests, nil
 }
 
-func (s *Scheduler) choosePiece(p *schedulerPeer, admittedOnly bool) (int, bool, error) {
+// Endgame reports whether every block that remains for an admitted piece has
+// at least one assignment. It is intentionally false while any wanted piece
+// still needs staging or any block remains unassigned.
+func (s *Scheduler) Endgame() bool {
+	return s != nil && s.endgameReady()
+}
+
+func (s *Scheduler) endgameReady() bool {
+	if s == nil || s.IsComplete() {
+		return false
+	}
+	remaining := false
+	for _, piece := range s.pieces {
+		if piece.complete {
+			continue
+		}
+		if piece.stage != stageAdmitted {
+			return false
+		}
+		for _, block := range piece.blocks {
+			if !block.done {
+				remaining = true
+				if !block.active {
+					return false
+				}
+			}
+		}
+	}
+	return remaining
+}
+
+func (s *Scheduler) choosePiece(p *schedulerPeer, peerID string, admittedOnly, endgame bool) (int, bool, error) {
 	bestRarity := int(^uint(0) >> 1)
+	bestIndex := int(^uint(0) >> 1)
 	candidates := make([]int, 0)
 	for _, index := range s.order {
 		piece := s.pieces[index]
-		if piece.complete || pendingBlocks(piece) == 0 || !peerHas(p, index) {
+		if piece.complete || !peerHas(p, index) {
 			continue
 		}
 		if admittedOnly {
@@ -589,12 +653,29 @@ func (s *Scheduler) choosePiece(p *schedulerPeer, admittedOnly bool) (int, bool,
 		} else if piece.stage != stageNone {
 			continue
 		}
+		if endgame {
+			if !hasAssignableBlock(piece, peerID, true) {
+				continue
+			}
+		} else if pendingBlocks(piece) == 0 {
+			continue
+		}
 		rarity := s.rarity(index)
-		if rarity < bestRarity {
+		if s.cfg.Streaming {
+			if index < bestIndex {
+				bestIndex = index
+				candidates = candidates[:0]
+			} else if index > bestIndex {
+				continue
+			}
+		}
+		if !s.cfg.Streaming && rarity < bestRarity {
 			bestRarity = rarity
 			candidates = candidates[:0]
 		}
-		if rarity == bestRarity {
+		if s.cfg.Streaming {
+			candidates = append(candidates, index)
+		} else if rarity == bestRarity {
 			candidates = append(candidates, index)
 		}
 	}
@@ -645,6 +726,79 @@ func pendingBlocks(piece *pieceState) int {
 		}
 	}
 	return n
+}
+
+func firstAssignableBlock(piece *pieceState, peerID string, endgame bool) int {
+	for i := range piece.blocks {
+		block := &piece.blocks[i]
+		if block.done {
+			continue
+		}
+		if !endgame {
+			if !block.active {
+				return i
+			}
+			continue
+		}
+		if !hasAssignment(block, peerID) {
+			return i
+		}
+	}
+	return -1
+}
+
+func hasAssignableBlock(piece *pieceState, peerID string, endgame bool) bool {
+	for i := range piece.blocks {
+		block := &piece.blocks[i]
+		if block.done {
+			continue
+		}
+		if !endgame && block.active {
+			continue
+		}
+		if endgame && hasAssignment(block, peerID) {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+func assignBlock(block *blockState, peerID string, endpoint peer.Endpoint) {
+	if block.assignments == nil {
+		block.assignments = make(map[string]peer.Endpoint)
+	}
+	block.assignments[peerID] = endpoint
+	block.active = true
+	if len(block.assignments) == 1 {
+		block.peerID = peerID
+		block.endpoint = endpoint
+	}
+}
+
+func hasAssignment(block *blockState, peerID string) bool {
+	if block == nil || !block.active {
+		return false
+	}
+	_, ok := block.assignments[peerID]
+	return ok
+}
+
+func refreshAssignments(block *blockState) {
+	if len(block.assignments) == 0 {
+		block.active = false
+		block.peerID = ""
+		block.endpoint = peer.Endpoint{}
+		return
+	}
+	block.active = true
+	if _, ok := block.assignments[block.peerID]; !ok {
+		for id, endpoint := range block.assignments {
+			block.peerID = id
+			block.endpoint = endpoint
+			break
+		}
+	}
 }
 
 func firstPendingBlock(piece *pieceState) int {
@@ -698,12 +852,28 @@ func (s *Scheduler) AcceptBlock(peerID string, block peer.Block) (BlockResult, e
 	if !ok {
 		return BlockResult{}, ErrBlockNotOutstanding
 	}
+	winnerEndpoint := b.assignments[peerID]
+	losers := make([]Request, 0, len(b.assignments)-1)
+	for loserID, endpoint := range b.assignments {
+		if loserID == peerID {
+			continue
+		}
+		losers = append(losers, Request{Peer: loserID, Endpoint: endpoint, Block: b.block})
+		if loser := s.peers[loserID]; loser != nil {
+			loser.active--
+		}
+		s.active--
+	}
+	sort.Slice(losers, func(i, j int) bool { return losers[i].Peer < losers[j].Peer })
+	b.assignments = nil
 	b.active = false
 	b.done = true
 	p.active--
 	s.active--
-	piece.contributors[b.endpoint] = struct{}{}
-	return BlockResult{PieceIndex: int(block.Index), Complete: allDone(piece)}, nil
+	b.peerID = peerID
+	b.endpoint = winnerEndpoint
+	piece.contributors[winnerEndpoint] = struct{}{}
+	return BlockResult{PieceIndex: int(block.Index), Complete: allDone(piece), Canceled: losers}, nil
 }
 
 // RejectBlock returns an exact outstanding block to the pending set without a
@@ -718,7 +888,8 @@ func (s *Scheduler) RejectBlock(peerID string, block peer.Block) error {
 	if !ok {
 		return ErrBlockNotOutstanding
 	}
-	b.active = false
+	delete(b.assignments, peerID)
+	refreshAssignments(b)
 	p.active--
 	s.active--
 	return nil
@@ -731,7 +902,7 @@ func (s *Scheduler) findActive(peerID string, block peer.Block) (*pieceState, *b
 	}
 	for i := range piece.blocks {
 		b := &piece.blocks[i]
-		if b.block == block && b.active && b.peerID == peerID {
+		if b.block == block && hasAssignment(b, peerID) {
 			return piece, b, true
 		}
 	}
@@ -851,13 +1022,13 @@ func (s *Scheduler) releaseEndpoint(endpoint peer.Endpoint) {
 		for _, piece := range s.pieces {
 			for i := range piece.blocks {
 				block := &piece.blocks[i]
-				if block.active && block.peerID == peerID && block.endpoint == endpoint {
-					block.active = false
-					block.peerID = ""
-					block.endpoint = peer.Endpoint{}
-					p.active--
-					s.active--
+				if !hasAssignment(block, peerID) {
+					continue
 				}
+				delete(block.assignments, peerID)
+				refreshAssignments(block)
+				p.active--
+				s.active--
 			}
 		}
 	}
