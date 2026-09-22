@@ -25,6 +25,7 @@ func main() {
 		return
 	}
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	adapter := cli.NewSignalAdapter(cancel)
 	err = cli.RunContext(ctx, opts, os.Stdout, os.Stderr)
 	var signalEvent cli.SignalEvent
