@@ -23,6 +23,8 @@ func main() {
 		fmt.Fprint(os.Stdout, cli.HelpText)
 		return
 	}
-	fmt.Fprintln(os.Stderr, "leech: command wiring is not implemented yet")
-	os.Exit(1)
+	if err := cli.Run(opts, os.Stdout); err != nil {
+		fmt.Fprintln(os.Stderr, "leech:", err)
+		os.Exit(1)
+	}
 }
