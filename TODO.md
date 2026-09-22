@@ -411,20 +411,20 @@ corruption strike. These tests need no working uTP implementation.
 **Depends on:** I4, P2. **Owns:** `internal/session/scheduler.go` and pure-state
 tests. **References:** DESIGN §§8, 12–13, 16.
 
-- [ ] Track wanted pieces, connected-peer rarity, block state, selected-byte
+- [x] Track wanted pieces, connected-peer rarity, block state, selected-byte
   progress, and contributor endpoints under one coordinator. Choose rarest-first
   with cryptographically randomized ties; accept controlled randomness in tests.
-- [ ] Split requests into at most 16 KiB without crossing piece boundaries or
+- [x] Split requests into at most 16 KiB without crossing piece boundaries or
   requesting padding. Stage whole wanted pieces while committing only selected
   intersections. Initially keep at most one active request per block.
-- [ ] Enforce per-peer/global request caps, queue capacity, staged-piece count,
+- [x] Enforce per-peer/global request caps, queue capacity, staged-piece count,
   and staged-byte admission together. Return work after disconnect or rejection;
   avoid spinning when no useful work is available.
-- [ ] Turn successful verification/commit results into completion/progress. On a
+- [x] Turn successful verification/commit results into completion/progress. On a
   hash mismatch, reschedule and add one strike per distinct contributing endpoint.
   Blacklist at three strikes across reconnects/transports; severe violations blacklist
   immediately. Keep compatibility and ordinary timeouts out of strike accounting.
-- [ ] Add properties for coverage, rarity changes, padding, request budgets,
+- [x] Add properties for coverage, rarity changes, padding, request budgets,
   progress, mixed contributors, and strike deduplication; fuzz scheduler events.
 
 **Acceptance:** a deterministic sequence of peer events produces bounded valid
