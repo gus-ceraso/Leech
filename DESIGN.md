@@ -1,8 +1,8 @@
 # Leech: Download-Only BitTorrent Client Design
 
-- **Status:** Ready for owner review
+- **Status:** Approved
 - **Design date:** 2026-09-19
-- **Implementation status:** Not started
+- **Implementation status:** In progress
 - **Primary specifications:** [`beps/`](beps/), especially BEP 3
 
 ## 1. Decision summary
