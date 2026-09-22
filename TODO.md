@@ -658,19 +658,19 @@ describe actual retained packets; receive memory remains within the fixed caps.
 **Depends on:** U1. **Owns:** `internal/utp/send.go`, `congestion.go`, and send-state
 tests. May run alongside U2. **References:** DESIGN §§14, 16; BEP 29.
 
-- [ ] Bound queued bytes and unacknowledged packets, segment writes, and respect
+- [x] Bound queued bytes and unacknowledged packets, segment writes, and respect
   the remote receive window. Process cumulative and selective ACKs without
   releasing bytes twice or advancing from invalid acknowledgments.
-- [ ] Implement RTT/RTO estimation, retransmission, duplicate-ACK loss detection,
+- [x] Implement RTT/RTO estimation, retransmission, duplicate-ACK loss detection,
   timeout backoff, and recovery from window pressure per BEP 29. Use controlled
   time for tests; no independent unowned retry goroutines.
-- [ ] Implement BEP 29's delay-based congestion control and packet sizing. Start
+- [x] Implement BEP 29's delay-based congestion control and packet sizing. Start
   with the specified algorithm and constants; defer performance tuning rather
   than substituting an unrestricted sender or omitting congestion control.
-- [ ] Account for timestamp/sequence wraparound and define send-side SYN/FIN
+- [x] Account for timestamp/sequence wraparound and define send-side SYN/FIN
   retransmission actions for U4. Keep queued transport bytes distinct from
   torrent-payload upload, which the peer API already forbids.
-- [ ] Test/fuzz ACK/SACK combinations, reordering, retransmission ambiguity,
+- [x] Test/fuzz ACK/SACK combinations, reordering, retransmission ambiguity,
   timeout/backoff, changing windows, delay samples, send limits, and wraparound.
 
 **Acceptance:** deterministic traces demonstrate recovery without duplicate
