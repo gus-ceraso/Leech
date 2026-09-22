@@ -141,6 +141,33 @@ func TestTransferLocalTCPSingleFile(t *testing.T) {
 	}
 }
 
+func TestTransferResumeCompleteSkipsNetworkAndStaging(t *testing.T) {
+	data := []byte("resume")
+	meta := singleFileMeta(data)
+	selection, err := torrent.Select(meta, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	plan, err := storage.Validate(root, meta, selection.SelectedIndices())
+	if err != nil {
+		t.Fatal(err)
+	}
+	transfer, err := NewTransfer(TransferConfig{
+		Selection: selection, Output: plan, ResumeComplete: []int{0},
+		PieceCount: 1, PieceLength: uint32(len(data)), LastPieceLength: uint32(len(data)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := transfer.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !transfer.scheduler.IsComplete() || transfer.Progress().Verified != int64(len(data)) {
+		t.Fatalf("resume progress = %#v", transfer.Progress())
+	}
+}
+
 func writeFixtureFrame(conn net.Conn, id byte, payload []byte) error {
 	frame := make([]byte, 4+1+len(payload))
 	binary.BigEndian.PutUint32(frame[:4], uint32(1+len(payload)))
@@ -365,6 +392,109 @@ func TestTransferDisconnectReassignsOutstandingBlock(t *testing.T) {
 	}
 	if string(got) != string(data) {
 		t.Fatalf("output = %q, want %q", got, data)
+	}
+}
+
+func TestTransferAdmitsPeerAfterAllCurrentPeersDisconnect(t *testing.T) {
+	data := []byte("late")
+	meta := singleFileMeta(data)
+	selection, err := torrent.Select(meta, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	plan, err := storage.Validate(root, meta, selection.SelectedIndices())
+	if err != nil {
+		t.Fatal(err)
+	}
+	infoHash := [20]byte{11, 11, 11}
+	firstConn, firstDone := startFixturePeer(t, infoHash, []fixturePiece{{index: 0, data: data}}, false, true)
+	secondConn, secondDone := startFixturePeer(t, infoHash, []fixturePiece{{index: 0, data: data}}, false, false)
+	provided := false
+	transfer, err := NewTransfer(TransferConfig{
+		Selection: selection, Output: plan,
+		Stager:         storage.NewStager(storage.StagerConfig{CacheRoot: filepath.Join(t.TempDir(), "cache"), MaxPieces: 1, MaxBytes: int64(len(data))}),
+		LocalHandshake: peer.Handshake{InfoHash: infoHash, PeerID: [20]byte{4, 5, 6}},
+		Peers:          []ConnectedPeer{{ID: "first", Endpoint: endpoint(1), Conn: firstConn, Handshake: peer.Handshake{InfoHash: infoHash, PeerID: [20]byte{1, 1, 1}}}},
+		AcquirePeer: func(ctx context.Context) (ConnectedPeer, error) {
+			if !provided {
+				select {
+				case <-firstDone:
+				case <-ctx.Done():
+					return ConnectedPeer{}, ctx.Err()
+				}
+				provided = true
+				return ConnectedPeer{ID: "late", Endpoint: endpoint(2), Conn: secondConn, Handshake: peer.Handshake{InfoHash: infoHash, PeerID: [20]byte{2, 2, 2}}}, nil
+			}
+			<-ctx.Done()
+			return ConnectedPeer{}, ctx.Err()
+		},
+		PieceCount: 1, PieceLength: uint32(len(data)), LastPieceLength: uint32(len(data)),
+	})
+	if err != nil {
+		firstConn.Close()
+		secondConn.Close()
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := transfer.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-secondDone; err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(filepath.Join(root, "fixture")); err != nil || string(got) != string(data) {
+		t.Fatalf("output = %q, %v", got, err)
+	}
+}
+
+func TestTransferEndgameDuplicateWinnerDoesNotDoubleCommit(t *testing.T) {
+	data := []byte("endgame")
+	meta := singleFileMeta(data)
+	selection, err := torrent.Select(meta, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	plan, err := storage.Validate(root, meta, selection.SelectedIndices())
+	if err != nil {
+		t.Fatal(err)
+	}
+	infoHash := [20]byte{12, 12, 12}
+	firstConn, firstDone := startFixturePeer(t, infoHash, []fixturePiece{{index: 0, data: data}}, false, false)
+	secondConn, secondDone := startFixturePeer(t, infoHash, []fixturePiece{{index: 0, data: data}}, false, false)
+	transfer, err := NewTransfer(TransferConfig{
+		Selection: selection, Output: plan,
+		Stager:         storage.NewStager(storage.StagerConfig{CacheRoot: filepath.Join(t.TempDir(), "cache"), MaxPieces: 1, MaxBytes: int64(len(data))}),
+		LocalHandshake: peer.Handshake{InfoHash: infoHash, PeerID: [20]byte{4, 5, 6}},
+		Peers: []ConnectedPeer{
+			{ID: "first", Endpoint: endpoint(1), Conn: firstConn, Handshake: peer.Handshake{InfoHash: infoHash, PeerID: [20]byte{1, 1, 1}}},
+			{ID: "second", Endpoint: endpoint(2), Conn: secondConn, Handshake: peer.Handshake{InfoHash: infoHash, PeerID: [20]byte{2, 2, 2}}},
+		},
+		PieceCount: 1, PieceLength: uint32(len(data)), LastPieceLength: uint32(len(data)),
+	})
+	if err != nil {
+		firstConn.Close()
+		secondConn.Close()
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := transfer.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-firstDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-secondDone; err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(filepath.Join(root, "fixture")); err != nil || string(got) != string(data) {
+		t.Fatalf("output = %q, %v", got, err)
+	}
+	if progress := transfer.Progress(); progress.Verified != int64(len(data)) {
+		t.Fatalf("progress = %#v", progress)
 	}
 }
 
@@ -816,7 +946,7 @@ func startFixturePeer(t *testing.T, infoHash [20]byte, pieces []fixturePiece, ba
 				}
 				return
 			}
-			if message.KeepAlive || message.ID == peer.InterestedID || message.ID == peer.NotInterestedID {
+			if message.KeepAlive || message.ID == peer.InterestedID || message.ID == peer.NotInterestedID || message.ID == peer.CancelID {
 				continue
 			}
 			if message.ID != peer.RequestID || len(message.Payload) != 12 {

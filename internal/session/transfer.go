@@ -14,7 +14,10 @@ import (
 	"net"
 	"net/netip"
 	"reflect"
+	"sync"
+	"time"
 
+	"github.com/gus-ceraso/Leech/internal/limits"
 	"github.com/gus-ceraso/Leech/internal/peer"
 	"github.com/gus-ceraso/Leech/internal/storage"
 	"github.com/gus-ceraso/Leech/internal/torrent"
@@ -23,7 +26,23 @@ import (
 var (
 	ErrTransferConfig = errors.New("invalid transfer configuration")
 	ErrTransferPeer   = errors.New("invalid transfer peer")
+	// ErrNoPeer tells the bounded admission loop that discovery currently has
+	// no handshaken candidate. It is retried with backoff.
+	ErrNoPeer = errors.New("no connected peer is available")
 )
+
+// PeerAcquire returns one already-handshaken candidate. The callback must
+// honor ctx so Transfer can join it during cancellation and shutdown. A
+// temporary lack of candidates should return ErrNoPeer.
+type PeerAcquire func(context.Context) (ConnectedPeer, error)
+
+// PieceVerified is emitted after a staged piece has passed SHA-1 verification
+// and its selected ranges have been committed to final output.
+type PieceVerified struct {
+	PieceIndex    int
+	PieceBytes    int64
+	SelectedBytes int64
+}
 
 // ConnectedPeer is a transport that has already completed the BEP 3
 // handshake.  Transfer never writes or reads a second handshake.  The
@@ -54,6 +73,21 @@ type TransferConfig struct {
 	PieceCount      uint32
 	PieceLength     uint32
 	LastPieceLength uint32
+	// AcquirePeer is an optional bounded admission seam for tracker/dial
+	// ownership. It runs independently so a slow discovery call never blocks
+	// existing peer events. ReleasePeer returns a disconnected candidate's
+	// dial slot to its owner.
+	AcquirePeer PeerAcquire
+	ReleasePeer func(ConnectedPeer)
+	// InitialStrikes carries endpoint penalties from metadata discovery.
+	InitialStrikes map[peer.Endpoint]int
+	// ResumeComplete contains selected piece indices verified by the resume
+	// phase. They are marked complete before any network worker starts.
+	ResumeComplete []int
+	// OnPieceVerified must return promptly; it is called after output commit.
+	OnPieceVerified func(PieceVerified)
+	// Now is a deterministic clock seam for peer replacement tests.
+	Now func() time.Time
 }
 
 // Transfer owns one transfer phase.  It starts no goroutines until Run.
@@ -69,6 +103,11 @@ type Transfer struct {
 	pieceCount      uint32
 	pieceLength     uint32
 	lastPieceLength uint32
+	acquirePeer     PeerAcquire
+	releasePeer     func(ConnectedPeer)
+	onPieceVerified func(PieceVerified)
+	now             func() time.Time
+	initialReleased bool
 }
 
 type transferPeer struct {
@@ -79,7 +118,18 @@ type transferPeer struct {
 	done               bool
 	removed            bool
 	availabilitySynced bool
+	startedAt          time.Time
+	lastUseful         time.Time
+	productive         bool
+	released           bool
 }
+
+const (
+	peerInitialGrace = 30 * time.Second
+	peerIdleLimit    = 60 * time.Second
+	peerAcquireBase  = 100 * time.Millisecond
+	peerAcquireMax   = 5 * time.Second
+)
 
 // NewTransfer validates immutable transfer inputs and creates the scheduler.
 // It performs no filesystem or network operation.
@@ -89,9 +139,6 @@ func NewTransfer(config TransferConfig) (*Transfer, error) {
 	}
 	if config.Output == nil {
 		return nil, fmt.Errorf("%w: nil output plan", ErrTransferConfig)
-	}
-	if len(config.Peers) == 0 {
-		return nil, fmt.Errorf("%w: no connected peers", ErrTransferConfig)
 	}
 	if config.PrepareMode != storage.Overwrite && config.PrepareMode != storage.Resume {
 		return nil, fmt.Errorf("%w: invalid prepare mode %d", ErrTransferConfig, config.PrepareMode)
@@ -117,6 +164,22 @@ func NewTransfer(config TransferConfig) (*Transfer, error) {
 	scheduler, err := NewScheduler(config.Selection, config.SchedulerConfig)
 	if err != nil {
 		return nil, err
+	}
+	if err := scheduler.SeedStrikes(config.InitialStrikes); err != nil {
+		return nil, err
+	}
+	seenResume := make(map[int]struct{}, len(config.ResumeComplete))
+	for _, index := range config.ResumeComplete {
+		if _, duplicate := seenResume[index]; duplicate {
+			return nil, fmt.Errorf("%w: duplicate resume piece %d", ErrTransferConfig, index)
+		}
+		seenResume[index] = struct{}{}
+		if err := scheduler.MarkComplete(index); err != nil {
+			return nil, fmt.Errorf("%w: resume piece %d: %v", ErrTransferConfig, index, err)
+		}
+	}
+	if len(config.Peers) == 0 && !scheduler.IsComplete() && config.AcquirePeer == nil {
+		return nil, fmt.Errorf("%w: no connected peers", ErrTransferConfig)
 	}
 	stager := config.Stager
 	if stager == nil {
@@ -156,6 +219,10 @@ func NewTransfer(config TransferConfig) (*Transfer, error) {
 		pieceCount:      config.PieceCount,
 		pieceLength:     config.PieceLength,
 		lastPieceLength: config.LastPieceLength,
+		acquirePeer:     config.AcquirePeer,
+		releasePeer:     config.ReleasePeer,
+		onPieceVerified: config.OnPieceVerified,
+		now:             config.Now,
 	}, nil
 }
 
@@ -171,7 +238,14 @@ func (t *Transfer) Run(ctx context.Context) error {
 		ctx = context.Background()
 	}
 	if err := ctx.Err(); err != nil {
+		t.releaseInitialPeers()
 		return err
+	}
+	// Resume may have verified every selected piece. In that case no staging,
+	// peer worker, or discovery operation is needed.
+	if t.scheduler.IsComplete() {
+		t.releaseInitialPeers()
+		return nil
 	}
 
 	// Prepare is intentionally one short operation.  Finalize opens only the
@@ -179,12 +253,15 @@ func (t *Transfer) Run(ctx context.Context) error {
 	// selected zero-length files and applies overwrite/resume semantics once.
 	prepared, err := t.output.Prepare(t.mode)
 	if err != nil {
+		t.releaseInitialPeers()
 		return err
 	}
 	if err := prepared.Close(); err != nil {
+		t.releaseInitialPeers()
 		return err
 	}
 	if err := t.stager.Start(ctx); err != nil {
+		t.releaseInitialPeers()
 		return t.stager.Cleanup(err)
 	}
 
@@ -192,9 +269,12 @@ func (t *Transfer) Run(ctx context.Context) error {
 	for i := range t.peers {
 		p, err := t.startPeer(ctx, t.peers[i])
 		if err != nil {
+			_ = t.peers[i].Conn.Close()
+			t.releaseInput(t.peers[i])
 			for _, started := range peers {
 				if started != nil {
 					_ = started.worker.Close()
+					t.release(started)
 				}
 			}
 			return t.stager.Cleanup(err)
@@ -202,25 +282,62 @@ func (t *Transfer) Run(ctx context.Context) error {
 		peers[i] = p
 	}
 
+	runCtx, stopAcquire := context.WithCancel(ctx)
+	var acquireWG sync.WaitGroup
+	var acquired <-chan acquireResult
+	if t.acquirePeer != nil {
+		results := make(chan acquireResult, 1)
+		acquired = results
+		acquireWG.Add(1)
+		go t.acquireLoop(runCtx, results, &acquireWG)
+	}
+	defer func() {
+		stopAcquire()
+		acquireWG.Wait()
+		t.drainAcquired(acquired)
+	}()
+	replacementTicker := time.NewTicker(time.Second)
+	defer replacementTicker.Stop()
+
 	var primary error
 	for primary == nil && !t.scheduler.IsComplete() {
 		if err := ctx.Err(); err != nil {
 			primary = err
 			break
 		}
-		if err := t.drive(ctx, peers); err != nil {
+		if err := t.drive(ctx, &peers); err != nil {
 			primary = err
 			break
 		}
 		if t.scheduler.IsComplete() {
 			break
 		}
-		if countLive(peers) == 0 {
+		if countLive(peers) == 0 && acquired == nil {
 			primary = peer.ErrDisconnected
 			break
 		}
-		event, index, ok := waitPeerEvent(ctx, peers)
-		if !ok {
+		result := waitPeerEventWithAdmission(ctx, peers, acquired, replacementTicker.C)
+		if result.Candidate != nil {
+			if err := t.admitCandidate(ctx, &peers, result.Candidate); err != nil {
+				primary = err
+			}
+			continue
+		}
+		if result.CandidateClosed {
+			acquired = nil
+			if countLive(peers) == 0 {
+				primary = peer.ErrDisconnected
+				break
+			}
+			continue
+		}
+		if result.ReplacementTick {
+			if err := t.rotateUnproductive(ctx, &peers); err != nil {
+				primary = err
+			}
+			continue
+		}
+		if !result.OK {
 			if err := ctx.Err(); err != nil {
 				primary = err
 			} else {
@@ -228,11 +345,11 @@ func (t *Transfer) Run(ctx context.Context) error {
 			}
 			break
 		}
-		if err := t.handleEvent(ctx, peers[index], event); err != nil {
+		if err := t.handleEventWithPeers(ctx, peers, peers[result.Index], result.Event); err != nil {
 			// A single endpoint failure is recoverable when another connected
 			// peer can finish the work. Protocol failures blacklist only that
 			// endpoint and follow the same reassignment path.
-			if peers[index].done && countLive(peers) > 0 && !errors.Is(err, storage.ErrStagingFatal) {
+			if peers[result.Index].done && (countLive(peers) > 0 || acquired != nil) && !errors.Is(err, storage.ErrStagingFatal) {
 				continue
 			}
 			primary = err
@@ -244,6 +361,7 @@ func (t *Transfer) Run(ctx context.Context) error {
 	for _, p := range peers {
 		if p != nil {
 			_ = p.worker.Close()
+			t.release(p)
 			if !p.removed {
 				_ = t.scheduler.RemovePeer(p.input.ID)
 				p.removed = true
@@ -251,6 +369,16 @@ func (t *Transfer) Run(ctx context.Context) error {
 		}
 	}
 	return t.stager.Cleanup(primary)
+}
+
+// Progress exposes the coordinator's verified selected-byte counters. The
+// scheduler is single-owner, so callers must read this after Run or from the
+// serialized OnPieceVerified callback rather than concurrently with Run.
+func (t *Transfer) Progress() Progress {
+	if t == nil {
+		return Progress{}
+	}
+	return t.scheduler.Progress()
 }
 
 func (t *Transfer) startPeer(ctx context.Context, input ConnectedPeer) (*transferPeer, error) {
@@ -279,6 +407,7 @@ func (t *Transfer) startPeer(ctx context.Context, input ConnectedPeer) (*transfe
 		// peer-wire frame sent before worker ownership begins.
 		if err := peer.WriteInitialAvailability(input.Conn, t.local, input.Handshake); err != nil {
 			_ = t.scheduler.RemovePeer(input.ID)
+			_ = input.Conn.Close()
 			return nil, err
 		}
 	}
@@ -290,11 +419,15 @@ func (t *Transfer) startPeer(ctx context.Context, input ConnectedPeer) (*transfe
 		LastPieceLength: t.lastPieceLength,
 	})
 	worker.Start(ctx)
-	return &transferPeer{input: input, worker: worker, state: state, active: make(map[peer.Block]struct{})}, nil
+	now := t.clock()
+	return &transferPeer{input: input, worker: worker, state: state, active: make(map[peer.Block]struct{}), startedAt: now, lastUseful: now}, nil
 }
 
-func (t *Transfer) drive(ctx context.Context, peers []*transferPeer) error {
-	for _, p := range peers {
+func (t *Transfer) drive(ctx context.Context, peers *[]*transferPeer) error {
+	if err := t.rotateUnproductive(ctx, peers); err != nil {
+		return err
+	}
+	for _, p := range *peers {
 		if p == nil || p.done {
 			continue
 		}
@@ -370,7 +503,173 @@ func (t *Transfer) drive(ctx context.Context, peers []*transferPeer) error {
 	return nil
 }
 
+type acquireResult struct {
+	peer ConnectedPeer
+}
+
+func (t *Transfer) acquireLoop(ctx context.Context, results chan<- acquireResult, wg *sync.WaitGroup) {
+	defer wg.Done()
+	delay := peerAcquireBase
+	for {
+		input, err := t.acquirePeer(ctx)
+		if err == nil {
+			select {
+			case results <- acquireResult{peer: input}:
+			case <-ctx.Done():
+				return
+			}
+			delay = peerAcquireBase
+			continue
+		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			if ctx.Err() != nil {
+				return
+			}
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return
+		case <-timer.C:
+		}
+		if delay < peerAcquireMax {
+			delay *= 2
+			if delay > peerAcquireMax {
+				delay = peerAcquireMax
+			}
+		}
+	}
+}
+
+func (t *Transfer) admitCandidate(ctx context.Context, peers *[]*transferPeer, input *ConnectedPeer) error {
+	if input == nil {
+		return nil
+	}
+	if input.Conn == nil {
+		t.releaseInput(*input)
+		return nil
+	}
+	stale := t.findUnproductive(*peers)
+	if countLive(*peers) >= limits.ActivePeers {
+		if stale == nil {
+			_ = input.Conn.Close()
+			t.releaseInput(*input)
+			return nil
+		}
+		_ = t.disconnectPeer(stale, fmt.Errorf("peer replaced after inactivity"))
+	}
+	p, err := t.startPeer(ctx, *input)
+	if err != nil {
+		_ = input.Conn.Close()
+		t.releaseInput(*input)
+		return nil
+	}
+	*peers = append(*peers, p)
+	if stale != nil && stale != p && !stale.done {
+		_ = t.disconnectPeer(stale, fmt.Errorf("peer replaced after inactivity"))
+	}
+	return nil
+}
+
+func (t *Transfer) rotateUnproductive(ctx context.Context, peers *[]*transferPeer) error {
+	_ = ctx
+	if stale := t.findUnproductive(*peers); stale != nil {
+		// Retiring the stale connection first frees the dial slot. The next
+		// AcquirePeer result can then be admitted without exceeding the active
+		// peer bound.
+		_ = t.disconnectPeer(stale, fmt.Errorf("peer replaced after inactivity"))
+	}
+	return nil
+}
+
+func (t *Transfer) findUnproductive(peers []*transferPeer) *transferPeer {
+	now := t.clock()
+	for _, p := range peers {
+		if p == nil || p.done || p.productive || t.usefulAllowedFast(p) {
+			continue
+		}
+		age := now.Sub(p.startedAt)
+		if age >= peerInitialGrace || now.Sub(p.lastUseful) >= peerIdleLimit {
+			return p
+		}
+	}
+	return nil
+}
+
+func (t *Transfer) usefulAllowedFast(p *transferPeer) bool {
+	if p == nil || !p.state.Choked() {
+		return false
+	}
+	for _, index := range t.selection.WantedPieces() {
+		if p.state.Availability(uint32(index)) && p.state.AllowedFast(uint32(index)) {
+			return true
+		}
+	}
+	return false
+}
+
+func (t *Transfer) clock() time.Time {
+	if t != nil && t.now != nil {
+		return t.now()
+	}
+	return time.Now()
+}
+
+func (t *Transfer) releaseInput(input ConnectedPeer) {
+	if t != nil && t.releasePeer != nil {
+		t.releasePeer(input)
+	}
+}
+
+func (t *Transfer) releaseInitialPeers() {
+	if t == nil || t.initialReleased {
+		return
+	}
+	t.initialReleased = true
+	for _, input := range t.peers {
+		if input.Conn != nil {
+			_ = input.Conn.Close()
+		}
+		t.releaseInput(input)
+	}
+}
+
+func (t *Transfer) release(p *transferPeer) {
+	if p == nil || p.released {
+		return
+	}
+	p.released = true
+	t.releaseInput(p.input)
+}
+
+func (t *Transfer) drainAcquired(candidates <-chan acquireResult) {
+	if candidates == nil {
+		return
+	}
+	for {
+		select {
+		case result, ok := <-candidates:
+			if !ok {
+				return
+			}
+			if result.peer.Conn != nil {
+				_ = result.peer.Conn.Close()
+			}
+			t.releaseInput(result.peer)
+		default:
+			return
+		}
+	}
+}
+
 func (t *Transfer) handleEvent(ctx context.Context, p *transferPeer, event peer.PeerEvent) error {
+	return t.handleEventWithPeers(ctx, nil, p, event)
+}
+
+func (t *Transfer) handleEventWithPeers(ctx context.Context, peers []*transferPeer, p *transferPeer, event peer.PeerEvent) error {
 	if p.done {
 		return nil
 	}
@@ -433,6 +732,16 @@ func (t *Transfer) handleEvent(ctx context.Context, p *transferPeer, event peer.
 		case peer.TerminalPiece:
 			delete(p.active, block)
 			data := event.Message.Payload[8:]
+			result, err := t.scheduler.AcceptBlock(p.input.ID, block)
+			if err != nil {
+				if errors.Is(err, ErrBlockNotOutstanding) {
+					// A duplicate endgame response arrived before the winner's
+					// cancel was observed by this peer. PeerState has already
+					// consumed its exact request terminal, so discard the payload.
+					return nil
+				}
+				return err
+			}
 			stage := stageFor(t, int(block.Index))
 			if stage == nil {
 				return fmt.Errorf("%w: piece %d has no stage", ErrTransferConfig, block.Index)
@@ -440,8 +749,9 @@ func (t *Transfer) handleEvent(ctx context.Context, p *transferPeer, event peer.
 			if err := stage.WriteBlockContext(ctx, int64(block.Begin), data); err != nil {
 				return err
 			}
-			result, err := t.scheduler.AcceptBlock(p.input.ID, block)
-			if err != nil {
+			p.productive = true
+			p.lastUseful = t.clock()
+			if err := t.cancelRedundant(ctx, peers, result.Canceled); err != nil {
 				return err
 			}
 			if result.Complete {
@@ -450,6 +760,11 @@ func (t *Transfer) handleEvent(ctx context.Context, p *transferPeer, event peer.
 		case peer.TerminalReject:
 			delete(p.active, block)
 			if err := t.scheduler.RejectBlock(p.input.ID, block); err != nil {
+				if errors.Is(err, ErrBlockNotOutstanding) {
+					// A redundant endgame request may have been settled by
+					// another peer before this reject arrived.
+					return nil
+				}
 				return err
 			}
 		case peer.TerminalLatePiece, peer.TerminalLateReject:
@@ -475,6 +790,38 @@ func (t *Transfer) syncPeerAvailability(p *transferPeer) error {
 	return t.scheduler.SetAvailability(p.input.ID, indices)
 }
 
+func (t *Transfer) cancelRedundant(ctx context.Context, peers []*transferPeer, canceled []Request) error {
+	for _, request := range canceled {
+		var loser *transferPeer
+		for _, candidate := range peers {
+			if candidate != nil && !candidate.done && candidate.input.ID == request.Peer {
+				loser = candidate
+				break
+			}
+		}
+		if loser == nil {
+			continue
+		}
+		if err := loser.state.CancelRequest(request.Block); err != nil {
+			if errors.Is(err, peer.ErrTombstoneLimit) {
+				// Forgetting a terminal obligation is safe only after the
+				// connection is closed, and this is not a corruption strike.
+				_ = t.disconnectPeer(loser, fmt.Errorf("endgame tombstone cap: %w", err))
+				continue
+			}
+			if !errors.Is(err, peer.ErrRequestMissing) {
+				return err
+			}
+			continue
+		}
+		delete(loser.active, request.Block)
+		if err := loser.worker.SendContext(ctx, peer.Message{ID: peer.CancelID, Payload: blockPayload(request.Block)}); err != nil {
+			_ = t.disconnectPeer(loser, err)
+		}
+	}
+	return nil
+}
+
 func (t *Transfer) finalizePiece(ctx context.Context, index int) error {
 	snapshot, err := t.scheduler.Snapshot(index)
 	if err != nil {
@@ -498,7 +845,10 @@ func (t *Transfer) finalizePiece(ctx context.Context, index int) error {
 		return err
 	}
 	delete(t.stages, index)
-	_, err = t.scheduler.VerifyPiece(index, true)
+	result, err := t.scheduler.VerifyPiece(index, true)
+	if err == nil && t.onPieceVerified != nil {
+		t.onPieceVerified(PieceVerified{PieceIndex: index, PieceBytes: snapshot.Piece.Range.End - snapshot.Piece.Range.Begin, SelectedBytes: result.SelectedBytes})
+	}
 	return err
 }
 
@@ -508,6 +858,7 @@ func (t *Transfer) disconnectPeer(p *transferPeer, cause error) error {
 	}
 	p.done = true
 	_ = p.worker.Close()
+	t.release(p)
 	if !p.removed {
 		_ = t.scheduler.RemovePeer(p.input.ID)
 		p.removed = true
@@ -560,9 +911,36 @@ func countLive(peers []*transferPeer) int {
 	return n
 }
 
+type peerWaitResult struct {
+	Event           peer.PeerEvent
+	Index           int
+	Candidate       *ConnectedPeer
+	CandidateClosed bool
+	ReplacementTick bool
+	OK              bool
+}
+
 func waitPeerEvent(ctx context.Context, peers []*transferPeer) (peer.PeerEvent, int, bool) {
-	cases := make([]reflect.SelectCase, 1, len(peers)+1)
+	result := waitPeerEventWithAdmission(ctx, peers, nil, nil)
+	return result.Event, result.Index, result.OK
+}
+
+// waitPeerEventWithAdmission keeps candidate admission in the same
+// coordinator select as peer events. A slow AcquirePeer call is isolated in
+// its own bounded worker, while useful existing connections remain serviced.
+func waitPeerEventWithAdmission(ctx context.Context, peers []*transferPeer, candidates <-chan acquireResult, replacement <-chan time.Time) peerWaitResult {
+	cases := make([]reflect.SelectCase, 1, len(peers)+3)
 	cases[0] = reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(ctx.Done())}
+	candidateCase := -1
+	if candidates != nil {
+		candidateCase = len(cases)
+		cases = append(cases, reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(candidates)})
+	}
+	replacementCase := -1
+	if replacement != nil {
+		replacementCase = len(cases)
+		cases = append(cases, reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(replacement)})
+	}
 	indices := make([]int, 0, len(peers))
 	for index, p := range peers {
 		if p == nil || p.done {
@@ -571,14 +949,37 @@ func waitPeerEvent(ctx context.Context, peers []*transferPeer) (peer.PeerEvent, 
 		cases = append(cases, reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(p.worker.Events())})
 		indices = append(indices, index)
 	}
-	if len(indices) == 0 {
-		return peer.PeerEvent{}, 0, false
+	if len(indices) == 0 && candidateCase < 0 && replacementCase < 0 {
+		return peerWaitResult{}
 	}
 	chosen, value, ok := reflect.Select(cases)
-	if chosen == 0 || !ok {
-		return peer.PeerEvent{}, 0, false
+	if chosen == 0 {
+		return peerWaitResult{}
 	}
-	return value.Interface().(peer.PeerEvent), indices[chosen-1], true
+	if chosen == candidateCase {
+		if !ok {
+			return peerWaitResult{CandidateClosed: true}
+		}
+		result := value.Interface().(acquireResult)
+		return peerWaitResult{Candidate: &result.peer, OK: true}
+	}
+	if chosen == replacementCase {
+		if !ok {
+			return peerWaitResult{}
+		}
+		return peerWaitResult{ReplacementTick: true, OK: true}
+	}
+	if !ok {
+		return peerWaitResult{}
+	}
+	workerOffset := 1
+	if candidateCase >= 0 {
+		workerOffset = 2
+	}
+	if replacementCase >= 0 {
+		workerOffset++
+	}
+	return peerWaitResult{Event: value.Interface().(peer.PeerEvent), Index: indices[chosen-workerOffset], OK: true}
 }
 
 func messageBlock(message peer.Message) (peer.Block, bool) {
