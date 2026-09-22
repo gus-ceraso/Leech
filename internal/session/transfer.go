@@ -516,6 +516,10 @@ func (t *Transfer) acquireLoop(ctx context.Context, results chan<- acquireResult
 			select {
 			case results <- acquireResult{peer: input}:
 			case <-ctx.Done():
+				if input.Conn != nil {
+					_ = input.Conn.Close()
+				}
+				t.releaseInput(input)
 				return
 			}
 			delay = peerAcquireBase

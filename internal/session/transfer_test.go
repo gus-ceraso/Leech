@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -447,6 +448,30 @@ func TestTransferAdmitsPeerAfterAllCurrentPeersDisconnect(t *testing.T) {
 	if got, err := os.ReadFile(filepath.Join(root, "fixture")); err != nil || string(got) != string(data) {
 		t.Fatalf("output = %q, %v", got, err)
 	}
+}
+
+func TestTransferAcquireCancellationReleasesLocalCandidate(t *testing.T) {
+	local, remote := net.Pipe()
+	defer remote.Close()
+	released := make(chan struct{}, 1)
+	transfer := &Transfer{
+		acquirePeer: func(context.Context) (ConnectedPeer, error) {
+			return ConnectedPeer{Conn: local}, nil
+		},
+		releasePeer: func(ConnectedPeer) { released <- struct{}{} },
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	results := make(chan acquireResult)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go transfer.acquireLoop(ctx, results, &wg)
+	select {
+	case <-released:
+	case <-time.After(time.Second):
+		t.Fatal("canceled acquisition did not release candidate")
+	}
+	wg.Wait()
 }
 
 func TestTransferEndgameDuplicateWinnerDoesNotDoubleCommit(t *testing.T) {
