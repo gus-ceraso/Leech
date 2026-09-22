@@ -105,6 +105,36 @@ func TestRejectNonCanonicalOrUnboundedValues(t *testing.T) {
 	if _, err := DecodeWithLimits([]byte(deep), bound); !errors.Is(err, ErrLimit) {
 		t.Fatalf("depth limit error = %v, want ErrLimit", err)
 	}
+
+	// Dictionary keys are counted by MaxDictionaryEntries, not MaxValues. The
+	// root dictionary and its integer value fit this two-value budget.
+	bound = DefaultLimits()
+	bound.MaxValues = 2
+	bound.MaxDictionaryEntries = 1
+	if _, err := DecodeWithLimits([]byte("d1:ai1ee"), bound); err != nil {
+		t.Fatalf("dictionary key consumed value budget: %v", err)
+	}
+	if _, err := DecodeWithLimits([]byte("d1:ai1e1:bi2ee"), bound); !errors.Is(err, ErrLimit) {
+		t.Fatalf("dictionary entry limit error = %v, want ErrLimit", err)
+	}
+
+	defaults := DefaultLimits()
+	for name, larger := range map[string]Limits{
+		"bytes":              func() Limits { v := defaults; v.MaxBytes++; return v }(),
+		"values":             func() Limits { v := defaults; v.MaxValues++; return v }(),
+		"dictionary entries": func() Limits { v := defaults; v.MaxDictionaryEntries++; return v }(),
+		"container entries":  func() Limits { v := defaults; v.MaxContainerEntries++; return v }(),
+		"depth":              func() Limits { v := defaults; v.MaxDepth++; return v }(),
+	} {
+		t.Run("reject oversized "+name, func(t *testing.T) {
+			if _, err := DecodeWithLimits([]byte("i0e"), larger); !errors.Is(err, ErrLimit) {
+				t.Fatalf("DecodeWithLimits error = %v, want ErrLimit", err)
+			}
+			if _, err := EncodeWithLimits(Value{Type: Integer, Int: 0}, larger); !errors.Is(err, ErrLimit) {
+				t.Fatalf("EncodeWithLimits error = %v, want ErrLimit", err)
+			}
+		})
+	}
 }
 
 func TestEncodeSortsAndRejectsDuplicateKeys(t *testing.T) {

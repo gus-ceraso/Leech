@@ -70,7 +70,9 @@ var (
 )
 
 // Limits controls resource bounds for one decode or encode operation. A zero
-// field is replaced by the corresponding DefaultLimits value.
+// field is replaced by the corresponding DefaultLimits value. Values above
+// DefaultLimits are rejected because the DESIGN §16 bounds are fixed supported
+// domain limits; callers can use smaller values for local tests or profiles.
 type Limits struct {
 	MaxBytes             int
 	MaxValues            int
@@ -166,12 +168,21 @@ func validateLimits(l Limits) error {
 		l.MaxContainerEntries < 0 || l.MaxDepth < 0 {
 		return ErrLimit
 	}
+	d := DefaultLimits()
+	if l.MaxBytes > d.MaxBytes || l.MaxValues > d.MaxValues ||
+		l.MaxDictionaryEntries > d.MaxDictionaryEntries ||
+		l.MaxContainerEntries > d.MaxContainerEntries || l.MaxDepth > d.MaxDepth {
+		return ErrLimit
+	}
 	return nil
 }
 
 type parser struct {
-	input   []byte
-	bound   Limits
+	input []byte
+	bound Limits
+	// values counts bencoded nodes other than dictionary keys. Keys are
+	// accounted for separately by entries, which prevents one dictionary
+	// entry from consuming the value budget twice.
 	values  int
 	entries int
 }
