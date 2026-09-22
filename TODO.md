@@ -330,7 +330,9 @@ starting transfer discovery when selection is already complete.
   its duplicate-key sentinel is `nil`. Return this to the I1 worker for a small
   fix and regression test before closing R1. R1 also found that I3 accepts an
   explicitly present empty padding `path` list; BEP 47 permits omission, not an
-  empty list. Return this to the I3 worker with a focused fixture.
+  empty list. I3 also accepts invalid UTF-8 in announce URLs because Go's URL
+  parser percent-encodes the raw invalid byte. Return both to the I3 worker with
+  focused fixtures.
 
 ## Group 2: Peer protocol and the first download
 
