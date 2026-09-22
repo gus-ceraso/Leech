@@ -333,8 +333,8 @@ starting transfer discovery when selection is already complete.
     metainfo announce URLs (`8fdb1d0`).
   - [x] I4: bound selection work for up to 100,000 files and patterns without
     narrowing the supported selection domain (`6eaef77`).
-  - [ ] S3: scan resume mappings one at a time to avoid cloning millions of
-    piece descriptors and range slices.
+  - [x] S3: scan resume mappings one at a time to avoid cloning millions of
+    piece descriptors and range slices (`c272bb2`).
 
 ## Group 2: Peer protocol and the first download
 
