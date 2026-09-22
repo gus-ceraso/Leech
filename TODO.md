@@ -492,6 +492,17 @@ idle connections, and endgame cannot double-commit a block or leak request slots
   obligations, exact-endpoint races, coordinator ownership, and corruption
   attribution. Run the first-download and concurrent-state regressions.
 
+  R2 findings to return to original owners:
+
+  - [ ] P1: report worker event-queue overflow to the coordinator, and make
+    concurrent `Start`/`Close` join-safe.
+  - [ ] P2: enforce initial availability message ordering, so late bitfields
+    cannot restore availability after `Have None`.
+  - [ ] D3: treat closed worker channels and Fast tombstone-cap choke as
+    peer-local disconnects; release every initial peer on startup failure;
+    preserve explicit `reqq=0`; expose received-payload accounting and a
+    pre-peer-shutdown callback for ordered tracker quiescence.
+
 ## Group 3: Trackers and metadata discovery
 
 ### T1. HTTP(S) tracker transactions
