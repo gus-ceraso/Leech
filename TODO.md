@@ -248,18 +248,18 @@ drive storage and scheduling without each component interpreting paths again.
 **Depends on:** A0. **Owns:** `internal/storage/output.go` and path checks.
 **References:** DESIGN §§4.2, 4.7, 8, 17–18.
 
-- [ ] Resolve the existing destination once, allowing its root to be a symlink.
+- [x] Resolve the existing destination once, allowing its root to be a symlink.
   Refuse descendant symlinks, unsafe/unrepresentable names, path collisions, and
   incompatible existing entries. Check the complete selected output plan before
   destructive preparation. Keep hostile concurrent filesystem races out of scope.
-- [ ] Expose separate validation and preparation operations so listing and early
+- [x] Expose separate validation and preparation operations so listing and early
   validation never mutate output. Default preparation truncates only selected
   regular files; resume preserves their contents. Never open unselected paths
   for writing or create torrent-provided symlinks/padding files.
-- [ ] Create selected zero-length files; otherwise allow verified writes to grow
+- [x] Create selected zero-length files; otherwise allow verified writes to grow
   files naturally. Confine all writes below the resolved root and close every
   handle. Do not add preallocation or `fsync` requirements.
-- [ ] Test traversal, separators, root/descendant symlinks, file/directory
+- [x] Test traversal, separators, root/descendant symlinks, file/directory
   conflicts, target-filesystem representability, sparse growth, and protection
   of existing unselected/unrelated files. Provide narrowly scoped I/O failure
   injection for subsequent storage tasks.
