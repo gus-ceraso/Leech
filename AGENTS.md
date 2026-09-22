@@ -66,5 +66,6 @@ Leech is a KISS, robust, download-only BitTorrent v1 client written in Go and ex
 ## Validation
 
 - Fuzz all untrusted parsers and state-machine boundaries with crisp safety and protocol invariants, including Fast, BEP 10 directionality, tracker event ordering, transport racing, deduplication, strikes, and shutdown.
+- Keep accelerated file selection differential-tested against Go's `path.Match`: a bracket class can consume `/`, while `*` and `?` cannot.
 - Run race-detector tests for concurrent components and deterministic simulated-network tests for uTP timing, loss, reordering, duplication, and wraparound. Tooling may enable cgo or require a C compiler when the Go race detector requires it; this does not relax the pure-Go production constraint.
 - Do not perform automated or manual interoperability tests against existing BitTorrent clients or live trackers. Use specification-derived fixtures plus local deterministic peers and trackers for integration coverage.
