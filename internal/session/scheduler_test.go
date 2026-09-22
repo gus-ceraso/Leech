@@ -420,6 +420,56 @@ func FuzzSchedulerEvents(f *testing.F) {
 	})
 }
 
+func FuzzSchedulerEndgameEvents(f *testing.F) {
+	f.Add([]byte{0, 1, 2, 3, 4, 5})
+	f.Add([]byte{255, 0, 17, 8})
+	plan := schedulerPlanForFuzz()
+	f.Fuzz(func(t *testing.T, events []byte) {
+		s, err := NewScheduler(plan, Config{MaxPerPeer: 2, MaxGlobal: 4, MaxQueue: 4, MaxStagedPieces: 1, MaxStagedBytes: 32768, Shuffle: keepTieOrder})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, item := range []struct {
+			id string
+			ep peer.Endpoint
+		}{{"one", endpoint(1)}, {"two", endpoint(2)}} {
+			if err := s.AddPeer(item.id, item.ep); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.SetAvailability(item.id, []int{0}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		offer, ok, err := s.ReservePiece("one")
+		if err != nil || !ok {
+			t.Fatal(err)
+		}
+		if err := s.AdmitPiece(offer); err != nil {
+			t.Fatal(err)
+		}
+		for _, event := range events {
+			one, _ := s.NextRequests("one", int(event%3))
+			two, _ := s.NextRequests("two", int(event>>2)%3)
+			if event&1 == 0 && len(one) > 0 {
+				_, _ = s.AcceptBlock("one", one[0].Block)
+			} else if len(one) > 0 {
+				_ = s.RejectBlock("one", one[0].Block)
+			}
+			if event&2 == 0 && len(two) > 0 {
+				_, _ = s.AcceptBlock("two", two[0].Block)
+			} else if len(two) > 0 {
+				_ = s.RejectBlock("two", two[0].Block)
+			}
+			if event&4 != 0 {
+				_ = s.SetPieceAvailability("one", 0, event&8 != 0)
+			}
+			if s.active < 0 || s.active > 4 || s.pieces[0].blocks[0].active && len(s.pieces[0].blocks[0].assignments) == 0 {
+				t.Fatalf("invalid endgame state: %#v", s)
+			}
+		}
+	})
+}
+
 func schedulerPlanForFuzz() *torrent.SelectionPlan {
 	plan, err := torrent.Select(torrent.Metainfo{TotalLength: 32768, Files: []torrent.File{regularFile(0, "a", 0, 32768)}, Pieces: []torrent.Piece{piece(0, 0, 32768)}}, nil, nil)
 	if err != nil {

@@ -552,6 +552,15 @@ func (t *Transfer) admitCandidate(ctx context.Context, peers *[]*transferPeer, i
 		t.releaseInput(*input)
 		return nil
 	}
+	if !validPeerEndpoint(input.Endpoint) {
+		endpoint, ok := endpointFromConn(input.Conn)
+		if !ok {
+			_ = input.Conn.Close()
+			t.releaseInput(*input)
+			return nil
+		}
+		input.Endpoint = endpoint
+	}
 	stale := t.findUnproductive(*peers)
 	if countLive(*peers) >= limits.ActivePeers {
 		if stale == nil {
@@ -899,6 +908,10 @@ func endpointFromConn(conn net.Conn) (peer.Endpoint, bool) {
 		return peer.Endpoint{}, false
 	}
 	return peer.Endpoint{Addr: ip, Port: uint16(addr.Port)}, true
+}
+
+func validPeerEndpoint(endpoint peer.Endpoint) bool {
+	return endpoint.Port != 0 && endpoint.Addr.IsValid() && !endpoint.Addr.IsUnspecified() && !endpoint.Addr.IsMulticast()
 }
 
 func countLive(peers []*transferPeer) int {
