@@ -301,19 +301,19 @@ path; deleting staged data never precedes successful output close.
 **Depends on:** I4, S1. **Owns:** `internal/storage/resume.go` and tests. It may
 run alongside S2. **References:** DESIGN §§4.7, 9, 16.
 
-- [ ] Reconstruct and hash complete pieces from selected existing regular files
+- [x] Reconstruct and hash complete pieces from selected existing regular files
   and synthetic padding, using bounded buffers and no cache workspace/index.
   Mark missing, short, or mismatching content as needing download.
-- [ ] Require redownload of an entire piece when skipped non-padding ranges
+- [x] Require redownload of an entire piece when skipped non-padding ranges
   prevent reconstruction. Do not infer validity from file length, previous
   progress, or only the selected part of a piece.
-- [ ] Hash only the expected prefix of an overlong selected file; truncate its
+- [x] Hash only the expected prefix of an overlong selected file; truncate its
   excess only after that file's selected content validates successfully. Return
   any necessary pending truncation to the transfer path for later completion.
-- [ ] Return verified selected ranges and whole-torrent retained-byte accounting,
+- [x] Return verified selected ranges and whole-torrent retained-byte accounting,
   plus an explicit no-transfer-needed result. Preserve unselected output and
   support selected zero-length files and canceled scans.
-- [ ] Test missing/short/overlong files, piece boundaries across files, padding,
+- [x] Test missing/short/overlong files, piece boundaries across files, padding,
   partial selection, mismatches, read/truncate failures, and a fully valid resume.
 
 **Acceptance:** scan results derive only from SHA-1 verification. L2 can run the
