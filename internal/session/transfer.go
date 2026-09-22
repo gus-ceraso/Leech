@@ -54,6 +54,9 @@ type ConnectedPeer struct {
 	Conn      net.Conn
 	Handshake peer.Handshake
 	ReqQ      uint32
+	// ReqQSet preserves an explicitly advertised zero reqq. When false, a
+	// missing reqq uses the local bounded default.
+	ReqQSet bool
 }
 
 // TransferConfig wires the bounded pure-state scheduler to local output and a
@@ -86,28 +89,38 @@ type TransferConfig struct {
 	ResumeComplete []int
 	// OnPieceVerified must return promptly; it is called after output commit.
 	OnPieceVerified func(PieceVerified)
+	// OnPayloadReceived is called synchronously for every well-framed Piece
+	// body, before its terminal is accepted by PeerState or the scheduler. The
+	// count is the file payload length, excluding the piece index and offset.
+	OnPayloadReceived func(int64) error
+	// BeforePeerShutdown runs once after scheduling stops and before workers
+	// and the staging workspace are cleaned up. A prior Run error wins.
+	BeforePeerShutdown func() error
 	// Now is a deterministic clock seam for peer replacement tests.
 	Now func() time.Time
 }
 
 // Transfer owns one transfer phase.  It starts no goroutines until Run.
 type Transfer struct {
-	selection       *torrent.SelectionPlan
-	output          *storage.Plan
-	stager          *storage.Stager
-	scheduler       *Scheduler
-	local           peer.Handshake
-	peers           []ConnectedPeer
-	mode            storage.PrepareMode
-	stages          map[int]*storage.PieceStage
-	pieceCount      uint32
-	pieceLength     uint32
-	lastPieceLength uint32
-	acquirePeer     PeerAcquire
-	releasePeer     func(ConnectedPeer)
-	onPieceVerified func(PieceVerified)
-	now             func() time.Time
-	initialReleased bool
+	selection              *torrent.SelectionPlan
+	output                 *storage.Plan
+	stager                 *storage.Stager
+	scheduler              *Scheduler
+	local                  peer.Handshake
+	peers                  []ConnectedPeer
+	mode                   storage.PrepareMode
+	stages                 map[int]*storage.PieceStage
+	pieceCount             uint32
+	pieceLength            uint32
+	lastPieceLength        uint32
+	acquirePeer            PeerAcquire
+	releasePeer            func(ConnectedPeer)
+	onPieceVerified        func(PieceVerified)
+	onPayloadReceived      func(int64) error
+	beforePeerShutdown     func() error
+	shutdownCallbackCalled bool
+	now                    func() time.Time
+	initialReleased        bool
 }
 
 type transferPeer struct {
@@ -209,20 +222,22 @@ func NewTransfer(config TransferConfig) (*Transfer, error) {
 		}
 	}
 	return &Transfer{
-		selection:       config.Selection,
-		output:          config.Output,
-		stager:          stager,
-		scheduler:       scheduler,
-		local:           config.LocalHandshake,
-		peers:           peers,
-		mode:            config.PrepareMode,
-		pieceCount:      config.PieceCount,
-		pieceLength:     config.PieceLength,
-		lastPieceLength: config.LastPieceLength,
-		acquirePeer:     config.AcquirePeer,
-		releasePeer:     config.ReleasePeer,
-		onPieceVerified: config.OnPieceVerified,
-		now:             config.Now,
+		selection:          config.Selection,
+		output:             config.Output,
+		stager:             stager,
+		scheduler:          scheduler,
+		local:              config.LocalHandshake,
+		peers:              peers,
+		mode:               config.PrepareMode,
+		pieceCount:         config.PieceCount,
+		pieceLength:        config.PieceLength,
+		lastPieceLength:    config.LastPieceLength,
+		acquirePeer:        config.AcquirePeer,
+		releasePeer:        config.ReleasePeer,
+		onPieceVerified:    config.OnPieceVerified,
+		onPayloadReceived:  config.OnPayloadReceived,
+		beforePeerShutdown: config.BeforePeerShutdown,
+		now:                config.Now,
 	}, nil
 }
 
@@ -269,15 +284,20 @@ func (t *Transfer) Run(ctx context.Context) error {
 	for i := range t.peers {
 		p, err := t.startPeer(ctx, t.peers[i])
 		if err != nil {
+			startupErr := t.callBeforePeerShutdown(err)
 			_ = t.peers[i].Conn.Close()
 			t.releaseInput(t.peers[i])
+			for _, pending := range t.peers[i+1:] {
+				_ = pending.Conn.Close()
+				t.releaseInput(pending)
+			}
 			for _, started := range peers {
 				if started != nil {
 					_ = started.worker.Close()
 					t.release(started)
 				}
 			}
-			return t.stager.Cleanup(err)
+			return t.stager.Cleanup(startupErr)
 		}
 		peers[i] = p
 	}
@@ -331,6 +351,17 @@ func (t *Transfer) Run(ctx context.Context) error {
 			}
 			continue
 		}
+		if result.PeerClosed {
+			p := peers[result.Index]
+			cause := p.worker.Err()
+			if cause == nil {
+				cause = peer.ErrDisconnected
+			}
+			if err := t.disconnectPeer(p, cause); err != nil && countLive(peers) == 0 && acquired == nil {
+				primary = err
+			}
+			continue
+		}
 		if result.ReplacementTick {
 			if err := t.rotateUnproductive(ctx, &peers); err != nil {
 				primary = err
@@ -356,6 +387,14 @@ func (t *Transfer) Run(ctx context.Context) error {
 		}
 	}
 
+	// Stop admission before the shutdown callback so no candidate can race the
+	// callback with a newly acquired connection. The defer remains as a guard
+	// for every earlier return path.
+	stopAcquire()
+	acquireWG.Wait()
+	t.drainAcquired(acquired)
+	primary = t.callBeforePeerShutdown(primary)
+
 	// Closing workers is the cancellation/unblock mechanism for their raw
 	// reads. Every worker joins before the private staging workspace is gone.
 	for _, p := range peers {
@@ -369,6 +408,19 @@ func (t *Transfer) Run(ctx context.Context) error {
 		}
 	}
 	return t.stager.Cleanup(primary)
+}
+
+func (t *Transfer) callBeforePeerShutdown(primary error) error {
+	if t == nil || t.shutdownCallbackCalled {
+		return primary
+	}
+	t.shutdownCallbackCalled = true
+	if t.beforePeerShutdown != nil {
+		if err := t.beforePeerShutdown(); err != nil && primary == nil {
+			return err
+		}
+	}
+	return primary
 }
 
 // Progress exposes the coordinator's verified selected-byte counters. The
@@ -389,7 +441,7 @@ func (t *Transfer) startPeer(ctx context.Context, input ConnectedPeer) (*transfe
 		LastPieceLength: t.lastPieceLength,
 		Fast:            fast,
 		ReqQ:            input.ReqQ,
-		ReqQSet:         input.ReqQ != 0,
+		ReqQSet:         input.ReqQSet,
 	})
 	if err != nil {
 		return nil, err
@@ -692,8 +744,23 @@ func (t *Transfer) handleEventWithPeers(ctx context.Context, peers []*transferPe
 	if event.Message.KeepAlive {
 		return nil
 	}
+	// ConnectionWorker has already checked the Piece frame and its payload
+	// bounds. Count file bytes before PeerState consumes the terminal so
+	// corrupt, duplicate, and tombstoned late payloads are included even when
+	// the scheduler later rejects the block.
+	if event.Message.ID == peer.PieceID && len(event.Message.Payload) >= 9 && t.onPayloadReceived != nil {
+		if err := t.onPayloadReceived(int64(len(event.Message.Payload) - 8)); err != nil {
+			return err
+		}
+	}
 	effect, err := p.state.ApplyMessage(event.Message)
 	if err != nil {
+		if errors.Is(err, peer.ErrTombstoneLimit) {
+			// A bounded tombstone set cannot forget an older terminal
+			// obligation. Close this peer without treating the condition as
+			// corruption; the scheduler reassigns its live work.
+			return t.disconnectPeer(p, err)
+		}
 		if peer.IsProtocolViolation(err) {
 			t.scheduler.SevereViolation(p.input.Endpoint)
 			_ = p.worker.Close()
@@ -933,6 +1000,7 @@ type peerWaitResult struct {
 	Index           int
 	Candidate       *ConnectedPeer
 	CandidateClosed bool
+	PeerClosed      bool
 	ReplacementTick bool
 	OK              bool
 }
@@ -987,7 +1055,14 @@ func waitPeerEventWithAdmission(ctx context.Context, peers []*transferPeer, cand
 		return peerWaitResult{ReplacementTick: true, OK: true}
 	}
 	if !ok {
-		return peerWaitResult{}
+		workerOffset := 1
+		if candidateCase >= 0 {
+			workerOffset = 2
+		}
+		if replacementCase >= 0 {
+			workerOffset++
+		}
+		return peerWaitResult{Index: indices[chosen-workerOffset], PeerClosed: true, OK: true}
 	}
 	workerOffset := 1
 	if candidateCase >= 0 {

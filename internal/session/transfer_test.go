@@ -10,10 +10,13 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/gus-ceraso/Leech/internal/limits"
 	"github.com/gus-ceraso/Leech/internal/peer"
 	"github.com/gus-ceraso/Leech/internal/storage"
 	"github.com/gus-ceraso/Leech/internal/torrent"
@@ -111,7 +114,9 @@ func TestTransferLocalTCPSingleFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	transfer, err := NewTransfer(TransferConfig{
+	var callbackOrder []string
+	var transfer *Transfer
+	transfer, err = NewTransfer(TransferConfig{
 		Selection:       selection,
 		Output:          plan,
 		Stager:          stager,
@@ -120,6 +125,24 @@ func TestTransferLocalTCPSingleFile(t *testing.T) {
 		PieceCount:      1,
 		PieceLength:     uint32(len(data)),
 		LastPieceLength: uint32(len(data)),
+		OnPayloadReceived: func(n int64) error {
+			if n != int64(len(data)) {
+				return fmt.Errorf("payload bytes = %d, want %d", n, len(data))
+			}
+			if transfer.Progress().Verified != 0 {
+				return fmt.Errorf("payload callback ran after verification")
+			}
+			callbackOrder = append(callbackOrder, "payload")
+			return nil
+		},
+		OnPieceVerified: func(PieceVerified) { callbackOrder = append(callbackOrder, "verified") },
+		BeforePeerShutdown: func() error {
+			if stager.Workspace() == "" {
+				return fmt.Errorf("shutdown callback ran after staging cleanup")
+			}
+			callbackOrder = append(callbackOrder, "shutdown")
+			return nil
+		},
 	})
 	if err != nil {
 		conn.Close()
@@ -140,6 +163,315 @@ func TestTransferLocalTCPSingleFile(t *testing.T) {
 	if string(got) != string(data) {
 		t.Fatalf("output = %q, want %q", got, data)
 	}
+	if want := []string{"payload", "verified", "shutdown"}; !reflect.DeepEqual(callbackOrder, want) {
+		t.Fatalf("callback order = %v, want %v", callbackOrder, want)
+	}
+}
+
+func TestTransferReqQPresencePreservesExplicitZero(t *testing.T) {
+	data := []byte("q")
+	selection, err := torrent.Select(singleFileMeta(data), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	left, right := net.Pipe()
+	defer right.Close()
+	transfer, err := NewTransfer(TransferConfig{
+		Selection: selection, Output: &storage.Plan{},
+		Peers:      []ConnectedPeer{{ID: "zero-reqq", Endpoint: endpoint(41), Conn: left, ReqQSet: true}},
+		PieceCount: 1, PieceLength: uint32(len(data)), LastPieceLength: uint32(len(data)),
+	})
+	if err != nil {
+		left.Close()
+		t.Fatal(err)
+	}
+	p, err := transfer.startPeer(context.Background(), transfer.peers[0])
+	if err != nil {
+		left.Close()
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = p.worker.Close()
+		_ = transfer.scheduler.RemovePeer(p.input.ID)
+	}()
+	if got := p.state.ReqQ(); got != 0 {
+		t.Fatalf("explicit zero reqq = %d, want 0", got)
+	}
+	if err := transfer.scheduler.SetAvailability(p.input.ID, []int{0}); err != nil {
+		t.Fatal(err)
+	}
+	offer, ok, err := transfer.scheduler.ReservePiece(p.input.ID)
+	if err != nil || !ok {
+		t.Fatalf("zero reqq reserve = %#v, %v", offer, err)
+	}
+	if err := transfer.scheduler.AdmitPiece(offer); err != nil {
+		t.Fatal(err)
+	}
+	requests, err := transfer.scheduler.NextRequests(p.input.ID, p.state.ReqQ())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(requests) != 0 {
+		t.Fatalf("zero reqq requests = %#v, want none", requests)
+	}
+
+	missingLeft, missingRight := net.Pipe()
+	defer missingRight.Close()
+	missing, err := NewTransfer(TransferConfig{
+		Selection: selection, Output: &storage.Plan{},
+		Peers:      []ConnectedPeer{{ID: "missing-reqq", Endpoint: endpoint(42), Conn: missingLeft}},
+		PieceCount: 1, PieceLength: uint32(len(data)), LastPieceLength: uint32(len(data)),
+	})
+	if err != nil {
+		missingLeft.Close()
+		t.Fatal(err)
+	}
+	missingPeer, err := missing.startPeer(context.Background(), missing.peers[0])
+	if err != nil {
+		missingLeft.Close()
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = missingPeer.worker.Close()
+		_ = missing.scheduler.RemovePeer(missingPeer.input.ID)
+	}()
+	if got := missingPeer.state.ReqQ(); got != limits.PeerRequests {
+		t.Fatalf("missing reqq = %d, want default %d", got, limits.PeerRequests)
+	}
+}
+
+func TestTransferStartupFailureReleasesAllInitialPeers(t *testing.T) {
+	data := []byte("startup")
+	selection, err := torrent.Select(singleFileMeta(data), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	plan, err := storage.Validate(root, singleFileMeta(data), selection.SelectedIndices())
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, firstRemote := net.Pipe()
+	defer firstRemote.Close()
+	pending, pendingRemote := net.Pipe()
+	defer pendingRemote.Close()
+	released := make(map[string]int)
+	var releaseMu sync.Mutex
+	transfer, err := NewTransfer(TransferConfig{
+		Selection: selection, Output: plan,
+		Stager:         storage.NewStager(storage.StagerConfig{CacheRoot: filepath.Join(t.TempDir(), "cache"), MaxPieces: 1, MaxBytes: int64(len(data))}),
+		LocalHandshake: peer.Handshake{Reserved: [8]byte{7: peer.FastExtensionBit}},
+		Peers: []ConnectedPeer{
+			{ID: "first", Endpoint: endpoint(51), Conn: first, Handshake: peer.Handshake{}},
+			{ID: "failing", Endpoint: endpoint(52), Conn: &transferWriteErrorConn{}, Handshake: peer.Handshake{Reserved: [8]byte{7: peer.FastExtensionBit}}},
+			{ID: "pending", Endpoint: endpoint(53), Conn: pending, Handshake: peer.Handshake{}},
+		},
+		ReleasePeer: func(input ConnectedPeer) {
+			releaseMu.Lock()
+			released[input.ID]++
+			releaseMu.Unlock()
+		},
+		PieceCount: 1, PieceLength: uint32(len(data)), LastPieceLength: uint32(len(data)),
+	})
+	if err != nil {
+		first.Close()
+		pending.Close()
+		t.Fatal(err)
+	}
+	err = transfer.Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "transfer write failure") {
+		t.Fatalf("Run = %v, want startup write failure", err)
+	}
+	releaseMu.Lock()
+	defer releaseMu.Unlock()
+	for _, id := range []string{"first", "failing", "pending"} {
+		if released[id] != 1 {
+			t.Errorf("release count for %q = %d, want 1", id, released[id])
+		}
+	}
+}
+
+func TestWaitPeerEventReportsClosedWorkerAsPeerLocal(t *testing.T) {
+	local, remote := net.Pipe()
+	defer remote.Close()
+	worker := peer.NewConnectionWorker(local, peer.ReadOptions{})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	worker.Start(ctx)
+	if err := worker.Close(); err != nil {
+		t.Fatalf("worker close: %v", err)
+	}
+	result := waitPeerEventWithAdmission(ctx, []*transferPeer{{worker: worker}}, nil, nil)
+	if !result.OK || !result.PeerClosed || result.Index != 0 {
+		t.Fatalf("closed worker result = %#v, want peer-local closure", result)
+	}
+}
+
+func TestTransferTombstoneLimitClosesPeerWithoutStrike(t *testing.T) {
+	data := make([]byte, 1024)
+	selection, err := torrent.Select(singleFileMeta(data), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	local, remote := net.Pipe()
+	defer remote.Close()
+	endpoint := endpoint(61)
+	transfer, err := NewTransfer(TransferConfig{
+		Selection: selection, Output: &storage.Plan{},
+		Peers:      []ConnectedPeer{{ID: "tombstones", Endpoint: endpoint, Conn: local}},
+		PieceCount: 1, PieceLength: uint32(len(data)), LastPieceLength: uint32(len(data)),
+	})
+	if err != nil {
+		local.Close()
+		t.Fatal(err)
+	}
+	p, err := transfer.startPeer(context.Background(), transfer.peers[0])
+	if err != nil {
+		local.Close()
+		t.Fatal(err)
+	}
+	for i := 0; i < limits.RequestTombstones; i++ {
+		block := peer.Block{Index: 0, Begin: uint32(i), Length: 1}
+		if err := p.state.Requests().Add(block); err != nil {
+			t.Fatalf("add tombstone request %d: %v", i, err)
+		}
+		if err := p.state.Requests().Timeout(block); err != nil {
+			t.Fatalf("timeout tombstone request %d: %v", i, err)
+		}
+	}
+	outstanding := peer.Block{Index: 0, Begin: 512, Length: 1}
+	if err := p.state.Requests().Add(outstanding); err != nil {
+		t.Fatal(err)
+	}
+	err = transfer.handleEvent(context.Background(), p, peer.PeerEvent{Message: peer.Message{ID: peer.ChokeID}})
+	if !errors.Is(err, peer.ErrTombstoneLimit) {
+		t.Fatalf("choke error = %v, want tombstone limit", err)
+	}
+	if !p.done {
+		t.Fatal("tombstone-limit peer remains live")
+	}
+	if transfer.scheduler.IsBlacklisted(endpoint) {
+		t.Fatal("tombstone-limit peer was corruption-blacklisted")
+	}
+}
+
+func TestTransferPayloadCallbackCountsLatePiece(t *testing.T) {
+	data := make([]byte, 32)
+	selection, err := torrent.Select(singleFileMeta(data), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	local, remote := net.Pipe()
+	defer remote.Close()
+	var got int64
+	transfer, err := NewTransfer(TransferConfig{
+		Selection: selection, Output: &storage.Plan{},
+		Peers:      []ConnectedPeer{{ID: "late-piece", Endpoint: endpoint(62), Conn: local}},
+		PieceCount: 1, PieceLength: uint32(len(data)), LastPieceLength: uint32(len(data)),
+		OnPayloadReceived: func(n int64) error {
+			got += n
+			return nil
+		},
+	})
+	if err != nil {
+		local.Close()
+		t.Fatal(err)
+	}
+	p, err := transfer.startPeer(context.Background(), transfer.peers[0])
+	if err != nil {
+		local.Close()
+		t.Fatal(err)
+	}
+	block := peer.Block{Index: 0, Begin: 0, Length: uint32(len(data))}
+	if err := p.state.Requests().Add(block); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.state.Requests().Timeout(block); err != nil {
+		t.Fatal(err)
+	}
+	payload := make([]byte, 8+len(data))
+	binary.BigEndian.PutUint32(payload[:4], block.Index)
+	binary.BigEndian.PutUint32(payload[4:8], block.Begin)
+	copy(payload[8:], data)
+	if err := transfer.handleEvent(context.Background(), p, peer.PeerEvent{Message: peer.Message{ID: peer.PieceID, Payload: payload}}); err != nil {
+		t.Fatal(err)
+	}
+	if got != int64(len(data)) {
+		t.Fatalf("late payload bytes = %d, want %d", got, len(data))
+	}
+	_ = p.worker.Close()
+}
+
+func TestTransferPayloadCallbackErrorStopsBeforeAcceptance(t *testing.T) {
+	data := make([]byte, 32)
+	selection, err := torrent.Select(singleFileMeta(data), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	local, remote := net.Pipe()
+	defer remote.Close()
+	wantErr := errors.New("payload accounting failed")
+	var transfer *Transfer
+	transfer, err = NewTransfer(TransferConfig{
+		Selection: selection, Output: &storage.Plan{},
+		Peers:      []ConnectedPeer{{ID: "payload-error", Endpoint: endpoint(63), Conn: local}},
+		PieceCount: 1, PieceLength: uint32(len(data)), LastPieceLength: uint32(len(data)),
+		OnPayloadReceived: func(n int64) error {
+			if n != int64(len(data)) {
+				t.Fatalf("payload bytes = %d, want %d", n, len(data))
+			}
+			if transfer.scheduler.ActiveRequests() != 1 {
+				t.Fatalf("active requests in callback = %d, want 1", transfer.scheduler.ActiveRequests())
+			}
+			return wantErr
+		},
+	})
+	if err != nil {
+		local.Close()
+		t.Fatal(err)
+	}
+	p, err := transfer.startPeer(context.Background(), transfer.peers[0])
+	if err != nil {
+		local.Close()
+		t.Fatal(err)
+	}
+	block := peer.Block{Index: 0, Begin: 0, Length: uint32(len(data))}
+	if _, err := p.state.ApplyMessage(peer.Message{ID: peer.BitfieldID, Payload: []byte{0x80}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.state.ApplyMessage(peer.Message{ID: peer.UnchokeID}); err != nil {
+		t.Fatal(err)
+	}
+	if err := transfer.scheduler.SetAvailability(p.input.ID, []int{0}); err != nil {
+		t.Fatal(err)
+	}
+	offer, ok, err := transfer.scheduler.ReservePiece(p.input.ID)
+	if err != nil || !ok {
+		t.Fatalf("reserve = %#v, %v", offer, err)
+	}
+	if err := transfer.scheduler.AdmitPiece(offer); err != nil {
+		t.Fatal(err)
+	}
+	requests, err := transfer.scheduler.NextRequests(p.input.ID, 1)
+	if err != nil || len(requests) != 1 {
+		t.Fatalf("next requests = %#v, %v", requests, err)
+	}
+	block = requests[0].Block
+	if err := p.state.AddRequest(block); err != nil {
+		t.Fatal(err)
+	}
+	p.active[block] = struct{}{}
+	payload := make([]byte, 8+len(data))
+	binary.BigEndian.PutUint32(payload[:4], block.Index)
+	binary.BigEndian.PutUint32(payload[4:8], block.Begin)
+	copy(payload[8:], data)
+	if err := transfer.handleEvent(context.Background(), p, peer.PeerEvent{Message: peer.Message{ID: peer.PieceID, Payload: payload}}); !errors.Is(err, wantErr) {
+		t.Fatalf("payload callback error = %v, want %v", err, wantErr)
+	}
+	if got := transfer.scheduler.ActiveRequests(); got != 1 {
+		t.Fatalf("active requests after callback error = %d, want 1", got)
+	}
+	_ = p.worker.Close()
 }
 
 func TestTransferResumeCompleteSkipsNetworkAndStaging(t *testing.T) {
@@ -212,6 +544,7 @@ func TestTransferCorruptPieceRetriesWithoutOutput(t *testing.T) {
 		t.Fatal(err)
 	}
 	conn, remoteDone := startFixturePeer(t, [20]byte{1, 3, 5}, []fixturePiece{{index: 0, data: data}}, true, false)
+	var payloadBytes []int64
 	transfer, err := NewTransfer(TransferConfig{
 		Selection:      selection,
 		Output:         plan,
@@ -219,6 +552,10 @@ func TestTransferCorruptPieceRetriesWithoutOutput(t *testing.T) {
 		LocalHandshake: peer.Handshake{InfoHash: [20]byte{1, 3, 5}, PeerID: [20]byte{4, 5, 6}},
 		Peers:          []ConnectedPeer{{ID: "retry-peer", Conn: conn, Handshake: peer.Handshake{InfoHash: [20]byte{1, 3, 5}, PeerID: [20]byte{3, 2, 1}}}},
 		PieceCount:     1, PieceLength: uint32(len(data)), LastPieceLength: uint32(len(data)),
+		OnPayloadReceived: func(n int64) error {
+			payloadBytes = append(payloadBytes, n)
+			return nil
+		},
 	})
 	if err != nil {
 		conn.Close()
@@ -241,6 +578,9 @@ func TestTransferCorruptPieceRetriesWithoutOutput(t *testing.T) {
 	}
 	if got := transfer.scheduler.StrikeCount(transfer.peers[0].Endpoint); got != 1 {
 		t.Fatalf("strike count = %d, want 1", got)
+	}
+	if want := []int64{int64(len(data)), int64(len(data))}; !reflect.DeepEqual(payloadBytes, want) {
+		t.Fatalf("payload accounting = %v, want %v", payloadBytes, want)
 	}
 }
 
@@ -908,6 +1248,19 @@ func TestTransferOrdinaryChokeReassignsAfterLateTerminal(t *testing.T) {
 		t.Fatalf("output = %q, %v", got, err)
 	}
 }
+
+type transferWriteErrorConn struct{}
+
+func (*transferWriteErrorConn) Read([]byte) (int, error) { return 0, io.EOF }
+func (*transferWriteErrorConn) Write([]byte) (int, error) {
+	return 0, errors.New("transfer write failure")
+}
+func (*transferWriteErrorConn) Close() error                     { return nil }
+func (*transferWriteErrorConn) LocalAddr() net.Addr              { return &net.TCPAddr{} }
+func (*transferWriteErrorConn) RemoteAddr() net.Addr             { return &net.TCPAddr{} }
+func (*transferWriteErrorConn) SetDeadline(time.Time) error      { return nil }
+func (*transferWriteErrorConn) SetReadDeadline(time.Time) error  { return nil }
+func (*transferWriteErrorConn) SetWriteDeadline(time.Time) error { return nil }
 
 type fixturePiece struct {
 	index int

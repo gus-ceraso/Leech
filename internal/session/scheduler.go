@@ -383,8 +383,8 @@ func (s *Scheduler) AddPeerWithLimit(id string, endpoint peer.Endpoint, limit in
 	if _, exists := s.peers[id]; exists {
 		return ErrDuplicatePeer
 	}
-	if limit < 1 {
-		return fmt.Errorf("%w: request cap must be positive", ErrSchedulerConfig)
+	if limit < 0 {
+		return fmt.Errorf("%w: request cap must not be negative", ErrSchedulerConfig)
 	}
 	if limit > s.cfg.MaxPerPeer {
 		limit = s.cfg.MaxPerPeer
