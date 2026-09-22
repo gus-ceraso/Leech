@@ -574,16 +574,16 @@ beyond their bounded shutdown budget.
 **Depends on:** I1, P1. **Owns:** `internal/peer/extensions.go`, `metadata.go`,
 and codec/state tests. **References:** DESIGN §§7.4, 12.3; BEPs 9, 10.
 
-- [ ] Maintain per-connection extension maps: local IDs dispatch received
+- [x] Maintain per-connection extension maps: local IDs dispatch received
   messages; remote IDs encode outgoing messages. Apply repeated handshakes as
   additive enable/disable updates and ignore bounded unknown extensions.
-- [ ] Encode metadata requests/rejects only. Parse received metadata data with
+- [x] Encode metadata requests/rejects only. Parse received metadata data with
   a bounded bencoded header and exact block bytes; validate message fields,
   indices, block lengths, advertised size, and repeated `total_size`.
-- [ ] Reject an incoming metadata request exactly once when the peer currently
+- [x] Reject an incoming metadata request exactly once when the peer currently
   provides a usable remote `ut_metadata` ID; otherwise ignore it. Expose no
   metadata-data encoder and perform no storage read for a request.
-- [ ] Test differing local/remote IDs, ID changes and disablement, repeated
+- [x] Test differing local/remote IDs, ID changes and disablement, repeated
   handshakes, unknown extensions, malformed blocks, and rejection counts.
   Fuzz extension and metadata transitions, not just decoding.
 
