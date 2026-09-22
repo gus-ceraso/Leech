@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -12,6 +13,9 @@ import (
 	"time"
 
 	"github.com/gus-ceraso/Leech/internal/bencode"
+	"github.com/gus-ceraso/Leech/internal/peer"
+	"github.com/gus-ceraso/Leech/internal/session"
+	"github.com/gus-ceraso/Leech/internal/tracker"
 )
 
 func testTorrentValue(kind bencode.Kind, bytesValue string) bencode.Value {
@@ -112,7 +116,12 @@ func TestRunRejectsRemoteListingWithoutStartingWorkers(t *testing.T) {
 	var output bytes.Buffer
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
-	err := RunContext(ctx, Options{Source: "magnet:?xt=urn:btih:0123456789012345678901234567890123456789", ListFiles: true}, &output, io.Discard)
+	err := RunWithSession(ctx, Options{Source: "magnet:?xt=urn:btih:0123456789012345678901234567890123456789", ListFiles: true}, &output, io.Discard, session.RunConfig{
+		HTTP:     noNetworkHTTP{},
+		TCPDial:  noNetworkDial,
+		UTPDial:  noNetworkDial,
+		Resolver: noNetworkResolver{},
+	})
 	if !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
 		t.Fatalf("error = %v, want context cancellation", err)
 	}
@@ -120,3 +129,21 @@ func TestRunRejectsRemoteListingWithoutStartingWorkers(t *testing.T) {
 		t.Fatalf("remote listing wrote output: %q", output.String())
 	}
 }
+
+type noNetworkHTTP struct{}
+
+func (noNetworkHTTP) Announce(ctx context.Context, _ string, _ tracker.AnnounceRequest) (tracker.HTTPAnnounceResult, error) {
+	return tracker.HTTPAnnounceResult{}, ctx.Err()
+}
+
+type noNetworkResolver struct{}
+
+func (noNetworkResolver) LookupIPAddr(context.Context, string) ([]net.IPAddr, error) {
+	return nil, errors.New("resolver disabled in test")
+}
+
+func noNetworkDial(context.Context, string, string) (net.Conn, error) {
+	return nil, errors.New("dial disabled in test")
+}
+
+var _ peer.Resolver = noNetworkResolver{}
