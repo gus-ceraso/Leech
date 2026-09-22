@@ -80,6 +80,8 @@ func TestGlobUnionPreservesPathMatchSemantics(t *testing.T) {
 		"a/z",
 		"b",
 		"c",
+		"0",
+		"z",
 		"unicode/éclair",
 	}
 	files := make([]File, len(paths))
@@ -96,6 +98,8 @@ func TestGlobUnionPreservesPathMatchSemantics(t *testing.T) {
 		"a/[^b]",
 		"a[^x]b",
 		"[c-0]",
+		"[a-0a]",
+		"[z-a0]",
 		"unicode/?clair",
 		"unicode/é*",
 		"missing/[a-z]",
@@ -269,7 +273,7 @@ func FuzzSelectPattern(f *testing.F) {
 }
 
 func FuzzGlobRegexMatchesPathMatch(f *testing.F) {
-	for _, seed := range []string{"*", "a/?", "a/[b-d]", "a/[^x]b", "unicode/é*", "[a-bd]"} {
+	for _, seed := range []string{"*", "a/?", "a/[b-d]", "a/[^x]b", "unicode/é*", "[a-bd]", "[a-0a]", "[z-a0]"} {
 		f.Add(seed)
 	}
 	candidates := []string{"", "a", "a/b", "a/c", "a/c/d", "a/bb", "a/bx", "unicode/éclair", "x/y"}

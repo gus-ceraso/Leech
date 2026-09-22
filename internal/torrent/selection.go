@@ -369,17 +369,16 @@ func globClassToRegexp(pattern string, start int) (string, int, error) {
 		rangeEnd  bool
 	}
 	ranges := make([]classRange, 0, 4)
-	count := 0
-	invalidRange := false
+	parsed := 0
 	for {
 		if position >= len(pattern) {
 			return "", 0, fmt.Errorf("unterminated character class")
 		}
-		if pattern[position] == ']' && count > 0 {
-			if invalidRange {
+		if pattern[position] == ']' && parsed > 0 {
+			if len(ranges) == 0 {
 				// path.Match accepts descending ranges but they match no
-				// character. Metadata paths cannot contain NUL, so this is a
-				// compact RE2 representation of an empty class.
+				// character. Metadata paths cannot contain NUL, so this
+				// represents an empty class in RE2.
 				return `[\x00]`, position + 1, nil
 			}
 			var class strings.Builder
@@ -412,12 +411,11 @@ func globClassToRegexp(pattern string, start int) (string, int, error) {
 			position += highWidth
 			item.high = high
 			item.rangeEnd = true
-			if low > high {
-				invalidRange = true
-			}
 		}
-		ranges = append(ranges, item)
-		count++
+		parsed++
+		if !item.rangeEnd || item.low <= item.high {
+			ranges = append(ranges, item)
+		}
 	}
 }
 
