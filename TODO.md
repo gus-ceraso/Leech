@@ -543,25 +543,25 @@ without real-time retry sleeps; no malformed datagram activates a tracker.
 announce snapshot helpers, and lifecycle tests.
 **References:** DESIGN §§6, 10, 15–16; BEP 31.
 
-- [ ] Generate one opaque cryptographically random 20-byte peer ID, tracker key,
+- [x] Generate one opaque cryptographically random 20-byte peer ID, tracker key,
   and dynamic-range announced port per run. Reuse them across phases, trackers,
   and families; never probe, reserve, bind, or listen on the announced port.
-- [ ] Run each unique tracker independently, including the mandatory default.
+- [x] Run each unique tracker independently, including the mandatory default.
   Start every phase with `started`; track transmitted-started separately from
   activation. Isolate tracker failures, honor capped exponential backoff/jitter,
   and disable permanent failures or invalid intervals/retry delays for the run.
-- [ ] Never shorten a not-before time. Allow HTTP peer-depletion rerequests;
+- [x] Never shorten a not-before time. Allow HTTP peer-depletion rerequests;
   enforce UDP intervals except for defined events. Retry indefinitely by default
   and remain interruptible during every wait/transaction.
-- [ ] Consume coordinator snapshots: `uploaded=0`, received file payload for
+- [x] Consume coordinator snapshots: `uploaded=0`, received file payload for
   `downloaded` including duplicates/corruption, metadata-phase `left=1`, then
   whole-torrent retained-byte `left` excluding synthetic padding. Do not mistake
   selected-byte completion for full-torrent completion.
-- [ ] Stop and join regular loops before separate bounded final-event operations.
+- [x] Stop and join regular loops before separate bounded final-event operations.
   Full completion sends `completed` then `stopped`; other exits send `stopped`
   only. Attempt stopped for every eligible transmitted-started tracker even
   without a response. Final failures are secondary; no regular announce follows.
-- [ ] Test/fuzz phase/event ordering, empty candidate pools, failed activation,
+- [x] Test/fuzz phase/event ordering, empty candidate pools, failed activation,
   no-response started, interval/delay limits, cancellation, disabled trackers,
   partial/full completion, and no normal announce after finalization. Run race
   tests around loop termination and final operations.
