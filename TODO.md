@@ -357,20 +357,20 @@ the coordinator without allocating beyond the supported bounds.
 **Depends on:** P1. **Owns:** `internal/peer/state.go`, `requests.go`, and bounded
 connection I/O workers. **References:** DESIGN §12; BEPs 3, 6.
 
-- [ ] Represent ordinary availability and Allowed Fast separately. Incoming
+- [x] Represent ordinary availability and Allowed Fast separately. Incoming
   `Have None` clears only availability; choked requests require both availability
   and Allowed Fast. Parse Suggest Piece without needing a scheduling policy.
-- [ ] Bound requests and clamp `reqq`; require exact piece/begin/length response
+- [x] Bound requests and clamp `reqq`; require exact piece/begin/length response
   matching. Fast choke retains outstanding terminal obligations. Cancel and
   local timeout create bounded tombstones, not forgotten requests.
-- [ ] Consume one exact late piece/reject per tombstone. Close without a strike
+- [x] Consume one exact late piece/reject per tombstone. Close without a strike
   before the cap would require forgetting one. Release non-Fast requests on
   choke while retaining bounded protection for allowed late piece races.
-- [ ] Reject each admissible incoming Fast payload request exactly once; ignore
+- [x] Reject each admissible incoming Fast payload request exactly once; ignore
   non-Fast requests. Handle abusive repetition as specified. Incoming requests
   must have no path to storage reads. Update interested/not-interested from
   useful advertised availability and keep otherwise useful idle peers alive.
-- [ ] Keep protocol state under coordinator ownership and connection I/O in
+- [x] Keep protocol state under coordinator ownership and connection I/O in
   bounded workers. Test choke/cancel/reject/timeout permutations, unknown frames,
   stale availability, terminal-response duplication, and blocked-queue shutdown;
   fuzz transitions and run race tests for the I/O boundary.
