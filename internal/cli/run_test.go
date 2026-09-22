@@ -112,7 +112,7 @@ func TestRunLocalListingDoesNotTouchOutputOnInvalidMetadata(t *testing.T) {
 	}
 }
 
-func TestRunRejectsRemoteListingWithoutStartingWorkers(t *testing.T) {
+func TestRunRemoteListingCancelsWithoutNetwork(t *testing.T) {
 	var output bytes.Buffer
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()

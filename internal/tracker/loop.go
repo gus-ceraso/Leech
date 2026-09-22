@@ -311,6 +311,38 @@ func (s *TrackerSet) Close(ctx context.Context) error {
 	return errors.Join(errs...)
 }
 
+// CloseResources closes resources owned by the set after the caller has
+// finalized any active phase. It deliberately does not replay final-event
+// errors, so a session can promote an owned resource failure while retaining
+// completed/stopped announce failures as secondary diagnostics.
+func (s *TrackerSet) CloseResources() error {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	if s.closed {
+		owned := s.ownedUDP
+		s.mu.Unlock()
+		if owned != nil {
+			return owned.Close()
+		}
+		return nil
+	}
+	s.closed = true
+	run := s.current
+	owned := s.ownedUDP
+	s.mu.Unlock()
+	if run != nil {
+		// This is a defensive unblock for a caller that did not own a phase
+		// handle. The documented session path finalizes first.
+		run.Wait()
+	}
+	if owned != nil {
+		return owned.Close()
+	}
+	return nil
+}
+
 // Wait joins regular loops after their context has been canceled. It does not
 // send final events; callers that own shutdown should use Finalize.
 func (r *PhaseRun) Wait() {

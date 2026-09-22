@@ -48,3 +48,16 @@ func TestRunKnownResumeCompletesBeforeTrackerActivity(t *testing.T) {
 		t.Fatalf("resume output = %q, %v", got, err)
 	}
 }
+
+func TestRetainedAccountingExcludesUnselectedMixedPieceBytes(t *testing.T) {
+	mapping := torrent.PiecePlan{
+		Data: []torrent.FileRange{
+			{Index: 0, Range: torrent.ByteRange{Begin: 0, End: 3}},
+			{Index: 1, Range: torrent.ByteRange{Begin: 3, End: 6}},
+		},
+		Selected: []torrent.FileRange{{Index: 0, Range: torrent.ByteRange{Begin: 0, End: 3}}},
+	}
+	if got := realPieceBytes(mapping); got != 3 {
+		t.Fatalf("retained mixed-piece bytes = %d, want 3", got)
+	}
+}

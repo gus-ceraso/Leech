@@ -102,7 +102,7 @@ func RunSource(ctx context.Context, raw string, config RunConfig) (RunResult, er
 // Run executes one complete source lifecycle.  It never starts transfer
 // discovery before selection and resume validation, and it returns only after
 // every owned network and storage worker has stopped.
-func Run(ctx context.Context, config RunConfig) (RunResult, error) {
+func Run(ctx context.Context, config RunConfig) (result RunResult, err error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -146,8 +146,12 @@ func Run(ctx context.Context, config RunConfig) (RunResult, error) {
 	run := &coordinator{config: config, identity: identity, backoff: peer.NewEndpointBackoff()}
 	run.ownSet = config.TrackerSet == nil
 	defer func() {
-		if err := run.closeSet(); err != nil && run.config.OnSecondary != nil {
-			run.config.OnSecondary(err)
+		if closeErr := run.closeSet(); closeErr != nil {
+			if err == nil {
+				err = closeErr
+			} else if run.config.OnSecondary != nil {
+				run.config.OnSecondary(closeErr)
+			}
 		}
 	}()
 	if config.TrackerSet != nil {
@@ -168,7 +172,6 @@ func Run(ctx context.Context, config RunConfig) (RunResult, error) {
 	}
 
 	var meta torrent.Metainfo
-	var err error
 	switch source.Kind {
 	case torrent.SourcePath:
 		meta, err = torrent.LoadMetainfo(source.Path)
@@ -330,7 +333,10 @@ func realTorrentBytes(meta torrent.Metainfo) int64 {
 
 func realPieceBytes(mapping torrent.PiecePlan) int64 {
 	var total int64
-	for _, span := range mapping.Data {
+	// Only selected ranges are retained in final output. A mixed piece may
+	// contain unwanted regular bytes in Data, but those bytes remain left after
+	// the staged piece is removed.
+	for _, span := range mapping.Selected {
 		total += span.Range.End - span.Range.Begin
 	}
 	return total
@@ -411,7 +417,7 @@ func (c *coordinator) closeSet() error {
 	if c == nil || c.set == nil || !c.ownSet {
 		return nil
 	}
-	return c.set.Close(context.Background())
+	return c.set.CloseResources()
 }
 
 func (c *coordinator) switchAccounting(meta torrent.Metainfo) error {
@@ -667,6 +673,14 @@ func (c *coordinator) startTransferPhase(ctx context.Context, source torrent.Sou
 		stopTimeout()
 	}
 	err = transferErr
+	if err == nil {
+		for _, pending := range resume.PendingTruncations {
+			if truncateErr := output.TruncateSelected(pending.Index, pending.Size); truncateErr != nil {
+				err = truncateErr
+				break
+			}
+		}
+	}
 	full := err == nil && fullSelection(meta, selection)
 	// Transfer.Run has joined every peer and finalizer worker.  Cancel and join
 	// regular tracker loops before entering the one-shot terminal sequence so a
@@ -677,11 +691,6 @@ func (c *coordinator) startTransferPhase(ctx context.Context, source torrent.Sou
 	}
 	if err != nil {
 		return err
-	}
-	for _, pending := range resume.PendingTruncations {
-		if truncateErr := output.TruncateSelected(pending.Index, pending.Size); truncateErr != nil {
-			return truncateErr
-		}
 	}
 	return nil
 }
