@@ -41,6 +41,9 @@ func TestSendQueueAndWindows(t *testing.T) {
 	if len(actions) != 1 || len(actions[0].Packet.Payload) != 4 || actions[0].Packet.SeqNr != 10 {
 		t.Fatalf("initial production = %+v", actions)
 	}
+	if n, err := s.Queue([]byte("z")); n != 0 || !errors.Is(err, ErrSendQueueFull) {
+		t.Fatalf("in-flight queue credit = n=%d err=%v", n, err)
+	}
 	if got := s.InFlightBytes(); got != 4 {
 		t.Fatalf("in-flight bytes = %d", got)
 	}
@@ -53,6 +56,49 @@ func TestSendQueueAndWindows(t *testing.T) {
 	}
 	if s.PendingBytes() != 0 || s.InFlightBytes() != 4 {
 		t.Fatalf("post-ACK state pending=%d in-flight=%d", s.PendingBytes(), s.InFlightBytes())
+	}
+}
+
+func TestSendIgnoresUnboundedStaleACKs(t *testing.T) {
+	s := testSendState(t, 8, 4)
+	if n, err := s.Queue([]byte("abcdefgh")); n != 8 || err != nil {
+		t.Fatalf("queue = n=%d err=%v", n, err)
+	}
+	now := time.Unix(15, 0)
+	if got := s.Produce(now); len(got) != 2 {
+		t.Fatalf("production = %d", len(got))
+	}
+	if result := s.Handle(Packet{Type: State, AckNr: 11, WindowSize: 64}, now.Add(time.Millisecond)); result.Err != nil {
+		t.Fatalf("initial ACK = %+v", result)
+	}
+	for index := 0; index < 100_000; index++ {
+		offset := uint16(index%32767) + 1
+		stale := s.lastAck.Add(^uint16(0) - (offset - 1))
+		if stale == s.lastAck {
+			continue
+		}
+		result := s.Handle(Packet{Type: State, AckNr: stale, WindowSize: 64}, now.Add(2*time.Millisecond))
+		if result.Err != nil || len(result.Actions) != 0 {
+			t.Fatalf("stale ACK %d result = %+v", stale, result)
+		}
+	}
+	if s.duplicateAcks != 0 || s.UnackedPackets() != 0 {
+		t.Fatalf("stale ACK state duplicates=%d unacked=%d", s.duplicateAcks, s.UnackedPackets())
+	}
+}
+
+func TestSendActionSharesImmutablePayloadRecord(t *testing.T) {
+	s := testSendState(t, 4, 4)
+	if n, err := s.Queue([]byte("data")); n != 4 || err != nil {
+		t.Fatalf("queue = n=%d err=%v", n, err)
+	}
+	actions := s.Produce(time.Unix(16, 0))
+	if len(actions) != 1 {
+		t.Fatalf("production = %d", len(actions))
+	}
+	record := s.unacked[actions[0].Packet.SeqNr]
+	if record == nil || &record.packet.Payload[0] != &actions[0].Packet.Payload[0] {
+		t.Fatal("action and retransmission record do not share payload storage")
 	}
 }
 

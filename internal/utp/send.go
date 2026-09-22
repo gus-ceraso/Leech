@@ -21,8 +21,10 @@ var (
 )
 
 // SendConfig controls bounded sender state. Zero values select production
-// bounds and the default congestion controller. MaxQueueBytes and MaxUnacked
-// may be lowered for deterministic tests, but never raised above DESIGN §16.
+// bounds and the default congestion controller. MaxQueueBytes names the
+// sender byte budget for compatibility with the initial API; it covers the
+// queue and retained unacknowledged payload together. It may be lowered for
+// deterministic tests, but never raised above DESIGN §16.
 type SendConfig struct {
 	MaxQueueBytes int
 	MaxUnacked    int
@@ -37,7 +39,10 @@ type SendConfig struct {
 
 // SendResult reports one receive-side transition. Actions contain only
 // retransmissions or newly available data; U4 supplies receive ACK fields when
-// it emits packets from ReceiveState.
+// it emits packets from ReceiveState. Payload slices in returned send actions
+// are immutable and owned by SendState until their packet is acknowledged;
+// U4 must serialize them without modifying or retaining them after the action
+// has been consumed.
 type SendResult struct {
 	Actions     []PacketAction
 	AckedBytes  int
@@ -57,9 +62,9 @@ type sendPacket struct {
 // Produce after writes, Handle for received packets, and Tick from its I/O
 // deadline loop.
 type SendState struct {
-	queue      []byte
-	maxQueue   int
-	maxUnacked int
+	queue       []byte
+	maxBuffered int
+	maxUnacked  int
 
 	nextSeq    Sequence
 	lastAck    Sequence
@@ -86,7 +91,7 @@ type SendState struct {
 
 	lastActivity  time.Time
 	timeoutCount  uint
-	duplicateAcks map[Sequence]uint8
+	duplicateAcks uint8
 	ackEvidence   map[Sequence]uint8
 }
 
@@ -130,19 +135,18 @@ func NewSendStateWithConfig(next Sequence, config SendConfig) (*SendState, error
 		localWindow = uint32(limits.UTPBufferBytes)
 	}
 	return &SendState{
-		maxQueue:      maxQueue,
-		maxUnacked:    maxUnacked,
-		nextSeq:       next,
-		lastAck:       next.Add(^uint16(0)),
-		unacked:       make(map[Sequence]*sendPacket),
-		remoteWindow:  remoteWindow,
-		connectionID:  config.ConnectionID,
-		windowSize:    localWindow,
-		ackNr:         config.AckNr,
-		tsDifference:  config.TimestampDifference,
-		congestion:    congestion,
-		duplicateAcks: make(map[Sequence]uint8),
-		ackEvidence:   make(map[Sequence]uint8),
+		maxBuffered:  maxQueue,
+		maxUnacked:   maxUnacked,
+		nextSeq:      next,
+		lastAck:      next.Add(^uint16(0)),
+		unacked:      make(map[Sequence]*sendPacket),
+		remoteWindow: remoteWindow,
+		connectionID: config.ConnectionID,
+		windowSize:   localWindow,
+		ackNr:        config.AckNr,
+		tsDifference: config.TimestampDifference,
+		congestion:   congestion,
+		ackEvidence:  make(map[Sequence]uint8),
 	}, nil
 }
 
@@ -165,7 +169,7 @@ func (s *SendState) Queue(payload []byte) (int, error) {
 	if len(payload) == 0 {
 		return 0, nil
 	}
-	available := s.maxQueue - len(s.queue)
+	available := s.maxBuffered - len(s.queue) - int(s.inFlight)
 	if available <= 0 {
 		return 0, ErrSendQueueFull
 	}
@@ -388,12 +392,30 @@ func (s *SendState) produce(now time.Time) []PacketAction {
 			break
 		}
 		payload := cloneBytes(s.queue[:payloadSize])
-		s.queue = s.queue[payloadSize:]
+		s.consumeQueue(payloadSize)
 		packet := s.header(Data, now)
 		packet.Payload = payload
 		actions = append(actions, s.record(packet, now))
 	}
 	return actions
+}
+
+// consumeQueue removes sent bytes in place and clears the consumed tail. A
+// front slice alone would keep the old backing array, and therefore the sent
+// payload bytes, reachable until the remaining queue is reallocated.
+func (s *SendState) consumeQueue(count int) {
+	if count <= 0 {
+		return
+	}
+	if count >= len(s.queue) {
+		clear(s.queue)
+		s.queue = nil
+		return
+	}
+	remaining := len(s.queue) - count
+	copy(s.queue, s.queue[count:])
+	clear(s.queue[remaining:])
+	s.queue = s.queue[:remaining]
 }
 
 // Handle processes an incoming peer packet, including cumulative and
@@ -468,10 +490,12 @@ func (s *SendState) applyACK(packet Packet, now time.Time, result *SendResult) e
 			}
 		}
 		s.lastAck = packet.AckNr
-		clear(s.duplicateAcks)
+		s.duplicateAcks = 0
 		s.timeoutCount = 0
 	} else if packet.AckNr == s.lastAck {
-		s.duplicateAcks[packet.AckNr]++
+		if s.duplicateAcks < math.MaxUint8 {
+			s.duplicateAcks++
+		}
 	}
 
 	// Selective ACK bits refer to ack_nr+2. Unknown bits outside our sent
@@ -497,7 +521,7 @@ func (s *SendState) applyACK(packet Packet, now time.Time, result *SendResult) e
 		s.ackOne(sequence, now, result)
 	}
 
-	if duplicate := s.duplicateAcks[packet.AckNr]; duplicate >= 3 {
+	if packet.AckNr == s.lastAck && s.duplicateAcks >= 3 {
 		candidate := packet.AckNr.Add(1)
 		if _, exists := s.unacked[candidate]; exists {
 			s.retransmitLost(candidate, now, result)
@@ -546,7 +570,7 @@ func (s *SendState) retransmitLost(sequence Sequence, now time.Time, result *Sen
 	record.packet.Timestamp = timestamp(now)
 	record.packet.TimestampDifference = s.tsDifference
 	s.lastActivity = now
-	result.Actions = append(result.Actions, PacketAction{Kind: ActionSend, Packet: clonePacket(record.packet)})
+	result.Actions = append(result.Actions, PacketAction{Kind: ActionSend, Packet: record.packet})
 	result.LostPackets++
 }
 
@@ -577,7 +601,7 @@ func (s *SendState) Tick(now time.Time) []PacketAction {
 	oldest.packet.Timestamp = timestamp(now)
 	oldest.packet.TimestampDifference = s.tsDifference
 	s.lastActivity = now
-	return []PacketAction{{Kind: ActionSend, Packet: clonePacket(oldest.packet)}}
+	return []PacketAction{{Kind: ActionSend, Packet: oldest.packet}}
 }
 
 func (s *SendState) oldest() *sendPacket {
@@ -610,8 +634,10 @@ func (s *SendState) header(kind PacketType, now time.Time) Packet {
 
 func (s *SendState) record(packet Packet, now time.Time) PacketAction {
 	sequence := packet.SeqNr
-	copyOf := clonePacket(packet)
-	record := &sendPacket{packet: copyOf, sentAt: now, transmissions: 1}
+	// Packet payloads are immutable after record returns. The action and the
+	// retransmission record intentionally share this one payload allocation;
+	// U4 must pass the action to MarshalBinary without mutating it.
+	record := &sendPacket{packet: packet, sentAt: now, transmissions: 1}
 	s.unacked[sequence] = record
 	s.order = append(s.order, sequence)
 	if !s.haveSent {
@@ -624,7 +650,7 @@ func (s *SendState) record(packet Packet, now time.Time) PacketAction {
 		s.inFlight += uint32(len(packet.Payload))
 	}
 	s.lastActivity = now
-	return PacketAction{Kind: ActionSend, Packet: clonePacket(packet)}
+	return PacketAction{Kind: ActionSend, Packet: packet}
 }
 
 func (s *SendState) failResult(err error) SendResult {
@@ -634,18 +660,6 @@ func (s *SendState) failResult(err error) SendResult {
 
 func timestamp(now time.Time) Timestamp {
 	return Timestamp(uint32(now.UnixNano() / int64(time.Microsecond)))
-}
-
-func clonePacket(packet Packet) Packet {
-	clone := packet
-	clone.Payload = cloneBytes(packet.Payload)
-	if len(packet.Extensions) != 0 {
-		clone.Extensions = make([]Extension, len(packet.Extensions))
-		for index, extension := range packet.Extensions {
-			clone.Extensions[index] = Extension{Type: extension.Type, Data: cloneBytes(extension.Data)}
-		}
-	}
-	return clone
 }
 
 func minUint(a, b uint) uint {
