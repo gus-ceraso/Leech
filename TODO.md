@@ -320,7 +320,7 @@ run alongside S2. **References:** DESIGN §§4.7, 9, 16.
 scan with no network workers and can exit without creating a workspace or
 starting transfer discovery when selection is already complete.
 
-- [ ] **R1 — Offline/storage review:** one reviewer checks I1–I4 and S1–S3
+- [x] **R1 — Offline/storage review:** one reviewer checks I1–I4 and S1–S3
   together. Focus on validation before mutation, original indices, exact hashes,
   selected-range confinement, bounded memory, and error/cleanup behavior. Verify
   offline listing and the storage regression tests; do not wait for networking
@@ -332,9 +332,8 @@ starting transfer discovery when selection is already complete.
   - [x] I3: reject an explicitly empty padding `path` list and invalid UTF-8
     metainfo announce URLs (`8fdb1d0`).
   - [x] I4: bound selection work for up to 100,000 files and patterns without
-    narrowing the supported selection domain. R1 recheck found that a descending
-    range erased valid members of the same class; fixed in `e08df8f`. Independent
-    R1 acceptance recheck is in progress.
+    narrowing the supported selection domain (`6eaef77`, corrected class
+    handling in `e08df8f`).
   - [x] S3: scan resume mappings one at a time to avoid cloning millions of
     piece descriptors and range slices (`c272bb2`).
 
