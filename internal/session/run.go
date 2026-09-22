@@ -198,7 +198,6 @@ func Run(ctx context.Context, config RunConfig) (result RunResult, err error) {
 			if err := run.switchAccounting(meta); err != nil {
 				return RunResult{}, err
 			}
-			run.reportFinalUpdates()
 		} else {
 			// An injected set still needs the ordinary metadata phase for a
 			// magnet/hash source; its caller owns set construction and callbacks.
@@ -208,7 +207,6 @@ func Run(ctx context.Context, config RunConfig) (result RunResult, err error) {
 				return RunResult{}, discoverErr
 			}
 			meta = metadata
-			run.reportFinalUpdates()
 		}
 	default:
 		return RunResult{}, fmt.Errorf("%w: unknown source kind", ErrRunConfig)
@@ -422,22 +420,6 @@ func (c *coordinator) closeSet() error {
 	return c.set.CloseResources()
 }
 
-func (c *coordinator) reportFinalUpdates() {
-	if c == nil || !c.ownSet || c.updates == nil || c.config.OnSecondary == nil {
-		return
-	}
-	for {
-		select {
-		case update := <-c.updates:
-			if (update.Request.Event == tracker.EventStopped || update.Request.Event == tracker.EventCompleted) && update.Err != nil {
-				c.config.OnSecondary(update.Err)
-			}
-		default:
-			return
-		}
-	}
-}
-
 func (c *coordinator) switchAccounting(meta torrent.Metainfo) error {
 	account, err := tracker.NewAccounting(realTorrentBytes(meta))
 	if err != nil {
@@ -625,6 +607,16 @@ func (c *coordinator) startTransferPhase(ctx context.Context, source torrent.Sou
 				progress := RunProgress{VerifiedSelectedBytes: verifiedSelected, SelectedBytes: runSelectedBytes(selection)}
 				c.config.OnProgress(progress)
 			}
+		},
+		OnPayloadReceived: func(n int64) error {
+			return c.account.AddReceived(n)
+		},
+		BeforePeerShutdown: func() error {
+			// Transfer invokes this after scheduling and admission stop, but
+			// before closing peer workers. Join regular tracker loops here so
+			// terminal events cannot race peer cleanup or begin another announce.
+			trackerRun.Wait()
+			return nil
 		},
 	})
 	if err != nil {
