@@ -35,7 +35,10 @@ type RunConfig struct {
 	Source    torrent.Source
 	SourceRaw string
 	OutputDir string
+	// Output is a compatibility spelling for OutputDir.
+	Output    string
 	Patterns  []string
+	Files     []string
 	ListFiles bool
 	Resume    bool
 	Streaming bool
@@ -104,7 +107,13 @@ func Run(ctx context.Context, config RunConfig) (RunResult, error) {
 		ctx = context.Background()
 	}
 	if config.OutputDir == "" {
-		config.OutputDir = "."
+		config.OutputDir = config.Output
+		if config.OutputDir == "" {
+			config.OutputDir = "."
+		}
+	}
+	if len(config.Patterns) == 0 {
+		config.Patterns = append([]string(nil), config.Files...)
 	}
 	source := config.Source
 	if source.Path == "" && source.Kind == torrent.SourcePath && config.SourceRaw != "" {
