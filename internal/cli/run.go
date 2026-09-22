@@ -1,42 +1,91 @@
 package cli
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 
+	"github.com/gus-ceraso/Leech/internal/session"
 	"github.com/gus-ceraso/Leech/internal/torrent"
 )
 
 var (
-	// ErrDownloadUnavailable marks the temporary command boundary before the
-	// transfer session is wired. Local listing remains fully implemented.
+	// ErrDownloadUnavailable is retained for callers that used the pre-session
+	// boundary. The executable now routes downloads through session.Run.
 	ErrDownloadUnavailable = errors.New("download session is not available")
-	// ErrRemoteListingUnavailable marks metadata-only discovery, which is added
-	// with the tracker and peer session.
+	// ErrRemoteListingUnavailable is retained as a compatibility spelling.
 	ErrRemoteListingUnavailable = errors.New("remote metadata listing is not available")
 )
 
-// Run handles the initial side-effect-free CLI runtime path. A local torrent
-// with --list-files is read, validated, and emitted to stdout. Other flows are
-// deliberately left for the session coordinator; in particular, this function
-// never validates --output or creates output and cache paths while listing.
+// Run executes one command with a background context and no diagnostics.
 func Run(opts Options, stdout io.Writer) error {
-	if !opts.ListFiles {
-		return ErrDownloadUnavailable
+	if opts.ListFiles {
+		source, err := torrent.ParseSource(opts.Source)
+		if err != nil {
+			return err
+		}
+		if source.Kind != torrent.SourcePath {
+			// Preserve the original library boundary for callers that use Run
+			// without a context. The executable uses RunContext for remote lists.
+			return ErrRemoteListingUnavailable
+		}
 	}
+	return RunContext(context.Background(), opts, stdout, io.Discard)
+}
+
+// RunContext executes one command. Standard output remains reserved for file
+// listings; all progress and diagnostics go to stderr through Reporter.
+func RunContext(ctx context.Context, opts Options, stdout, stderr io.Writer) error {
 	if stdout == nil {
-		return fmt.Errorf("cli: nil listing writer")
+		return fmt.Errorf("cli: nil output writer")
+	}
+	if stderr == nil {
+		stderr = io.Discard
 	}
 	source, err := torrent.ParseSource(opts.Source)
 	if err != nil {
+		NewReporter(opts.LogLevel, stderr).PrimaryFailure(err, false)
 		return err
 	}
-	if source.Kind != torrent.SourcePath {
-		return ErrRemoteListingUnavailable
+	reporter := NewReporter(opts.LogLevel, stderr)
+	result, err := session.Run(ctx, session.RunConfig{
+		Source: source, OutputDir: opts.Output, Patterns: opts.Files,
+		ListFiles: opts.ListFiles, Resume: opts.Resume, Streaming: opts.Stream,
+		Timeout: opts.Timeout,
+		OnPhase: func(phase string) { _ = reporter.Phase(phase) },
+		OnProgress: func(progress session.RunProgress) {
+			_ = reporter.Status(Status{Phase: "transfer", VerifiedSelectedBytes: uint64(maxInt64(0, progress.VerifiedSelectedBytes)),
+				SelectedBytes: uint64(maxInt64(0, progress.SelectedBytes))})
+		},
+		OnWarning:   func(message string) { _ = reporter.Warning("%s", message) },
+		OnSecondary: func(shutdownErr error) { _ = reporter.SecondaryFailure(shutdownErr) },
+	})
+	if err != nil {
+		_ = reporter.PrimaryFailure(err, !opts.ListFiles)
+		return err
 	}
-	return ListLocalFiles(source.Path, stdout)
+	if opts.ListFiles {
+		encoder := json.NewEncoder(stdout)
+		encoder.SetEscapeHTML(false)
+		for _, filePath := range result.Listed {
+			if err := encoder.Encode(filePath); err != nil {
+				return fmt.Errorf("cli: write file listing: %w", err)
+			}
+		}
+		return nil
+	}
+	_ = reporter.ReportResult(Result{NoTransferNeeded: result.NoTransferNeeded,
+		SelectionComplete: result.SelectionComplete, TorrentComplete: result.TorrentComplete})
+	return nil
+}
+
+func maxInt64(value, floor int64) int64 {
+	if value < floor {
+		return floor
+	}
+	return value
 }
 
 // RunLocalListing is an explicit spelling for callers that only need the

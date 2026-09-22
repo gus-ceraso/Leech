@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -23,8 +24,19 @@ func main() {
 		fmt.Fprint(os.Stdout, cli.HelpText)
 		return
 	}
-	if err := cli.Run(opts, os.Stdout); err != nil {
-		fmt.Fprintln(os.Stderr, "leech:", err)
+	ctx, cancel := context.WithCancel(context.Background())
+	adapter := cli.NewSignalAdapter(cancel)
+	err = cli.RunContext(ctx, opts, os.Stdout, os.Stderr)
+	var signalEvent cli.SignalEvent
+	select {
+	case signalEvent = <-adapter.Events():
+	default:
+	}
+	adapter.Close()
+	if signalEvent.Signal != nil {
+		os.Exit(signalEvent.ExitCode)
+	}
+	if err != nil {
 		os.Exit(1)
 	}
 }
