@@ -702,16 +702,16 @@ local BEP rather than an invented approximation.
 **Depends on:** U2, U3. **Owns:** `internal/utp/conn.go`, `dial.go`, and full
 transport tests. **References:** DESIGN §§11, 14–16; BEP 29.
 
-- [ ] Combine the state logic behind one outgoing connection using a connected
+- [x] Combine the state logic behind one outgoing connection using a connected
   UDP socket per attempt. Implement SYN setup, connection-ID rules, IPv4/IPv6,
   FIN/RESET, and protocol teardown. Expose no listener or inbound-SYN/server API.
 - [x] Implement `Read`, `Write`, addresses, deadlines, context-aware dialing, and
   idempotent `Close` with `net.Conn` concurrency semantics. Unblock all pending
   I/O on deadline, cancellation, reset, or close and join owned workers.
-- [ ] Exercise complete streams over the deterministic link with loss, delay,
+- [x] Exercise complete streams over the deterministic link with loss, delay,
   reordering, duplication, SACKs, window pressure, timeout, and wraparound. Add
   real loopback UDP tests for socket/address/deadline behavior.
-- [ ] Test P3-style cancellation while dialing/handshaking and a peer handshake
+- [x] Test P3-style cancellation while dialing/handshaking and a peer handshake
   over the stream. Verify concurrent read/write/deadline/close behavior under
   the race detector and fuzz transport transitions.
 
@@ -727,11 +727,10 @@ copies of this implementation successfully talking to each other.
 
   Initial R4 review fixes are integrated: outgoing ACK/window/delay fields and
   STATE ACK headers, handshake RESET rejection, post-FIN delivery, and bounded
-  congestion gain arithmetic. R4 recheck found a blocked large `Conn.Write`
-  misses the ACK capacity wakeup, extreme RTT/RTO arithmetic can overflow,
-  and full `Conn` stream simulation remains unproven. Return connection and
-  fixture fixes to U4; return RTO saturation to U3. Recheck both before
-  marking R4 complete.
+  congestion gain arithmetic. R4 recheck found a blocked large `Conn.Write`,
+  extreme RTT/RTO overflow, and missing full `Conn` stream simulation. U4 fixed
+  the wakeup and added independent stream/race fixtures in `ee2fef7`. U3 is
+  fixing RTO saturation; recheck both before marking R4 complete.
 
 ## Group 5: Complete CLI and lifecycle
 
