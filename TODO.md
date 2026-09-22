@@ -740,8 +740,10 @@ copies of this implementation successfully talking to each other.
   STATE ACK headers, handshake RESET rejection, post-FIN delivery, and bounded
   congestion gain arithmetic. R4 recheck found a blocked large `Conn.Write`,
   extreme RTT/RTO overflow, and missing full `Conn` stream simulation. U4 fixed
-  the wakeup and added independent stream/race fixtures in `ee2fef7`. U3 is
-  fixing RTO saturation; recheck both before marking R4 complete.
+  the wakeup and added independent stream/race fixtures in `ee2fef7`. U3 fixed
+  RTO saturation in `497c2ce`. R4's production recheck passed; its final
+  sign-off awaits a test assertion that observes the exact timed-out packet's
+  retransmission before acknowledging it.
 
 ## Group 5: Complete CLI and lifecycle
 
