@@ -639,15 +639,15 @@ and malformed packet input cannot drive unbounded parsing or allocation.
 **Depends on:** U1. **Owns:** `internal/utp/receive.go` and receive-state tests.
 **References:** DESIGN §§14, 16; BEP 29.
 
-- [ ] Reassemble an ordered byte stream, handling duplicates, missing packets,
+- [x] Reassemble an ordered byte stream, handling duplicates, missing packets,
   out-of-order data, sequence wraparound, and consumption by partial reads.
-- [ ] Generate ACK/selective-ACK state and advertise receive capacity from bounded
+- [x] Generate ACK/selective-ACK state and advertise receive capacity from bounded
   storage. Enforce both packet-count and byte limits without treating a valid
   peer's window pressure as permission to allocate more.
-- [ ] Track receive-side FIN/RESET state for U4; preserve bytes preceding FIN and
+- [x] Track receive-side FIN/RESET state for U4; preserve bytes preceding FIN and
   define when reads return EOF or an error. Reject invalid connection/state input
   according to the transport contract.
-- [ ] Test/fuzz loss/reordering/duplication, gaps across wraparound, receive-window
+- [x] Test/fuzz loss/reordering/duplication, gaps across wraparound, receive-window
   exhaustion/reopening, FIN before missing data, reset, and cancellation actions.
 
 **Acceptance:** the received stream has neither gaps nor duplicate bytes; ACKs
