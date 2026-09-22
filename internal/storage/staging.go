@@ -34,6 +34,24 @@ var (
 	ErrStagingFatal = errors.New("storage: staging failed")
 )
 
+// stagingFile is the narrow file contract used by a piece. The package-level
+// seams are intentionally unexported: production uses *os.File, while local
+// tests can deterministically exercise short and failed I/O paths.
+type stagingFile interface {
+	WriteAt([]byte, int64) (int, error)
+	ReadAt([]byte, int64) (int, error)
+	Truncate(int64) error
+	Close() error
+}
+
+var (
+	openStagingFile = func(path string, flag int, mode os.FileMode) (stagingFile, error) {
+		return os.OpenFile(path, flag, mode)
+	}
+	removeStagedFile  = os.Remove
+	removeStagingRoot = os.Remove
+)
+
 // StagerConfig contains the local cache limits. A zero field selects the
 // supported default. CacheRoot is used as the parent of this run's random
 // private directory; an empty value uses os.UserCacheDir()/leech.
@@ -232,13 +250,13 @@ func (s *Stager) AdmitPiece(piece torrent.Piece) (*PieceStage, error) {
 		return nil, s.rememberFatalLocked(fmt.Errorf("storage: random piece name: %w", err))
 	}
 	path := filepath.Join(s.root, name+".piece")
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
+	f, err := openStagingFile(path, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, s.rememberFatalLocked(fmt.Errorf("storage: create staged piece: %w", err))
 	}
 	if err := f.Truncate(length); err != nil {
 		closeErr := f.Close()
-		removeErr := os.Remove(path)
+		removeErr := removeStagedFile(path)
 		return nil, s.rememberFatalLocked(errors.Join(fmt.Errorf("storage: size staged piece: %w", err), closeErr, removeErr))
 	}
 	stage := &PieceStage{owner: s, piece: piece, length: length, path: path, file: f}
@@ -302,7 +320,7 @@ type PieceStage struct {
 	piece  torrent.Piece
 	length int64
 	path   string
-	file   *os.File
+	file   stagingFile
 	closed bool
 }
 
@@ -481,7 +499,7 @@ func (s *Stager) removePiece(p *PieceStage, removeFile bool) error {
 	}
 	var removeErr error
 	if removeFile {
-		removeErr = os.Remove(p.path)
+		removeErr = removeStagedFile(p.path)
 		if errors.Is(removeErr, os.ErrNotExist) {
 			removeErr = nil
 		}
@@ -531,7 +549,7 @@ func (s *Stager) Close() error {
 		cleanupErr = errors.Join(cleanupErr, s.removePieceForClose(piece))
 	}
 	if root != "" {
-		if err := os.Remove(root); err != nil && !errors.Is(err, os.ErrNotExist) {
+		if err := removeStagingRoot(root); err != nil && !errors.Is(err, os.ErrNotExist) {
 			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("storage: remove workspace: %w", err))
 		}
 	}
@@ -559,7 +577,7 @@ func (s *Stager) removePieceForClose(p *PieceStage) error {
 		err = errors.Join(err, p.file.Close())
 		p.closed = true
 	}
-	removeErr := os.Remove(p.path)
+	removeErr := removeStagedFile(p.path)
 	if errors.Is(removeErr, os.ErrNotExist) {
 		removeErr = nil
 	}
