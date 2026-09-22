@@ -326,6 +326,10 @@ starting transfer discovery when selection is already complete.
   offline listing and the storage regression tests; do not wait for networking
   to review this group.
 
+  R1 found that I1's canonical encoder accepts two empty dictionary keys because
+  its duplicate-key sentinel is `nil`. Return this to the I1 worker for a small
+  fix and regression test before closing R1.
+
 ## Group 2: Peer protocol and the first download
 
 ### P1. Peer framing and the no-upload API
