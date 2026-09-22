@@ -103,6 +103,13 @@ func TestUnknownMetadataMessageCanBeIgnored(t *testing.T) {
 	}
 }
 
+func TestOverLimitMetadataSizeIsUnsupported(t *testing.T) {
+	body := metadataBody(t, MetadataData, 0, int64(64<<20)+1, nil)
+	if _, err := ParseMetadataData(body, 0); err == nil || !errors.Is(err, ErrUnsupported) || IsProtocolViolation(err) {
+		t.Fatalf("over-limit total_size = %v, want peer-local unsupported", err)
+	}
+}
+
 func FuzzMetadataMessages(f *testing.F) {
 	f.Add([]byte("d8:msg_typei1e5:piecei0e10:total_sizei1ee"), []byte{0})
 	f.Add([]byte("d8:msg_typei0e5:piecei0ee"), []byte{})

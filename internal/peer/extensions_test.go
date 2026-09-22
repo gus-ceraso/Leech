@@ -16,6 +16,9 @@ func TestExtensionIDsAreDirectionalAndRepeatedHandshakesAreAdditive(t *testing.T
 	if _, ok := state.RemoteExtensionID(UtMetadataExtension); ok {
 		t.Fatal("remote extension unexpectedly enabled before handshake")
 	}
+	if _, err := state.EncodeMetadataRequest(0); !errors.Is(err, ErrUnsupported) {
+		t.Fatalf("request without remote mapping = %v", err)
+	}
 
 	body := extensionHandshakeBody(t, map[string]int64{"ut_metadata": 9, "ut_pex": 3}, 32769)
 	if err := state.ApplyHandshake(body); err != nil {
@@ -31,6 +34,11 @@ func TestExtensionIDsAreDirectionalAndRepeatedHandshakesAreAdditive(t *testing.T
 		t.Fatal(err)
 	} else if wire[4] != ExtendedID || wire[5] != 9 {
 		t.Fatalf("request used the wrong directional ID: %v", wire[:6])
+	}
+	if wire, err := state.EncodeMetadataRequest(4); err != nil {
+		t.Fatal(err)
+	} else if wire[5] != 9 {
+		t.Fatalf("state request used the wrong directional ID: %v", wire[:6])
 	}
 
 	// An omitted entry remains enabled; a zero entry disables only that name.
@@ -130,6 +138,10 @@ func TestParseExtensionHandshakeRejectsMalformedAndBoundsUnknown(t *testing.T) {
 	}
 	if len(parsed.Extensions) != 0 {
 		t.Fatalf("unknown extension was retained: %#v", parsed.Extensions)
+	}
+	tooLarge := extensionHandshakeBody(t, map[string]int64{}, int64(64<<20)+1)
+	if _, err := ParseExtensionHandshake(tooLarge); err == nil || !errors.Is(err, ErrUnsupported) || IsProtocolViolation(err) {
+		t.Fatalf("over-limit metadata_size = %v, want peer-local unsupported", err)
 	}
 }
 

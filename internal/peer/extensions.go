@@ -101,6 +101,33 @@ func (s *ExtensionState) RemoteMetadataSize() (int64, bool) {
 	return s.metadataSize, s.hasMetadataSize
 }
 
+// EncodeMetadataRequest uses the current remote mapping. Callers cannot
+// accidentally send a request using Leech's receive ID or a stale arbitrary
+// ID when the peer has disabled the extension.
+func (s *ExtensionState) EncodeMetadataRequest(piece uint32) ([]byte, error) {
+	if s == nil {
+		return nil, fmt.Errorf("%w: nil state", ErrExtensionState)
+	}
+	id, ok := s.RemoteExtensionID(UtMetadataExtension)
+	if !ok {
+		return nil, unsupportedError("encode metadata request", "peer has no usable ut_metadata ID")
+	}
+	return EncodeMetadataRequest(id, piece)
+}
+
+// EncodeMetadataReject uses the current remote mapping for the one reject
+// generated in response to an incoming request.
+func (s *ExtensionState) EncodeMetadataReject(piece uint32) ([]byte, error) {
+	if s == nil {
+		return nil, fmt.Errorf("%w: nil state", ErrExtensionState)
+	}
+	id, ok := s.RemoteExtensionID(UtMetadataExtension)
+	if !ok {
+		return nil, unsupportedError("encode metadata reject", "peer has no usable ut_metadata ID")
+	}
+	return EncodeMetadataReject(id, piece)
+}
+
 // EncodeHandshake builds Leech's BEP 10 handshake as a complete peer-wire
 // frame. It advertises only ut_metadata, which is needed for a peer to send
 // metadata to Leech. There is intentionally no metadata data encoder.

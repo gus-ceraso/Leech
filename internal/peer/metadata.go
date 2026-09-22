@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
 
 	"github.com/gus-ceraso/Leech/internal/bencode"
 	"github.com/gus-ceraso/Leech/internal/limits"
@@ -329,13 +330,13 @@ func writeBytes(conn interface{ Write([]byte) (int, error) }, wire []byte) error
 	for len(wire) != 0 {
 		n, err := conn.Write(wire)
 		if n < 0 || n > len(wire) {
-			return errors.New("short metadata write")
+			return io.ErrShortWrite
 		}
 		if err != nil {
 			return err
 		}
 		if n == 0 {
-			return errors.New("short metadata write")
+			return io.ErrShortWrite
 		}
 		wire = wire[n:]
 	}
