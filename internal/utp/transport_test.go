@@ -3,6 +3,7 @@ package utp
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"net"
 	"testing"
@@ -312,6 +313,176 @@ func TestConnCarriesBEP3PeerHandshake(t *testing.T) {
 	if err := <-serverErr; err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestConnOutgoingHeadersTrackReceiveState(t *testing.T) {
+	server, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	serverErr := make(chan error, 1)
+	go func() { serverErr <- serveHeaderTracking(server) }()
+	conn, err := DialContext(context.Background(), "utp4", server.LocalAddr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, err := conn.Write([]byte("client")); n != len("client") || err != nil {
+		t.Fatalf("Write = %d, %v", n, err)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestConnRetransmissionRefreshesReceiveHeaders(t *testing.T) {
+	server, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	serverErr := make(chan error, 1)
+	go func() { serverErr <- serveRetransmissionHeaders(server) }()
+	conn, err := DialContext(context.Background(), "utp4", server.LocalAddr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, err := conn.Write([]byte("retry")); n != len("retry") || err != nil {
+		t.Fatalf("Write = %d, %v", n, err)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func serveRetransmissionHeaders(server *net.UDPConn) error {
+	synWire, addr, err := readRawPacket(server)
+	if err != nil {
+		return err
+	}
+	syn, err := ParsePacket(synWire)
+	if err != nil || syn.Type != Syn {
+		return errors.New("retransmission fixture did not receive SYN")
+	}
+	if err := sendTo(server, Packet{Type: State, ConnectionID: syn.ConnectionID, Timestamp: timestamp(time.Now().Add(-time.Second)), SeqNr: 900, AckNr: syn.SeqNr, WindowSize: 4 << 20}, addr); err != nil {
+		return err
+	}
+	firstWire, addr, err := readRawPacket(server)
+	if err != nil {
+		return err
+	}
+	first, err := ParsePacket(firstWire)
+	if err != nil || first.Type != Data {
+		return errors.New("retransmission fixture did not receive first DATA")
+	}
+	// The peer data is deliberately ACK-stale, so the client retains the
+	// first DATA packet while its receive ACK advances to sequence 901.
+	if err := sendTo(server, Packet{Type: Data, ConnectionID: syn.ConnectionID, Timestamp: timestamp(time.Now().Add(-time.Second)), SeqNr: 901, AckNr: syn.SeqNr, WindowSize: 4 << 20, Payload: []byte("peer")}, addr); err != nil {
+		return err
+	}
+	if _, _, err := readRawPacket(server); err != nil {
+		return err
+	}
+	retryWire, _, err := readRawPacket(server)
+	if err != nil {
+		return err
+	}
+	retry, err := ParsePacket(retryWire)
+	if err != nil || retry.Type != Data {
+		return errors.New("retransmission fixture did not receive retransmitted DATA")
+	}
+	if retry.SeqNr != first.SeqNr || !bytes.Equal(retry.Payload, first.Payload) {
+		return errors.New("retransmitted DATA changed sequence or payload")
+	}
+	if retry.AckNr != 901 {
+		return errors.New("retransmitted DATA did not refresh receive ACK")
+	}
+	if retry.WindowSize != 4<<20-uint32(len("peer")) {
+		return errors.New("retransmitted DATA did not refresh receive window")
+	}
+	if retry.Timestamp == first.Timestamp {
+		return errors.New("retransmitted DATA timestamp was not refreshed")
+	}
+	if retry.TimestampDifference == 0 {
+		return errors.New("retransmitted DATA timestamp difference was not retained")
+	}
+	return nil
+}
+
+func serveHeaderTracking(server *net.UDPConn) error {
+	synWire, addr, err := readRawPacket(server)
+	if err != nil {
+		return err
+	}
+	syn, err := ParsePacket(synWire)
+	if err != nil || syn.Type != Syn {
+		return errors.New("header fixture did not receive SYN")
+	}
+	stateTimestamp := timestamp(time.Now().Add(-time.Second))
+	if err := sendTo(server, Packet{Type: State, ConnectionID: syn.ConnectionID, Timestamp: stateTimestamp, SeqNr: 800, AckNr: syn.SeqNr, WindowSize: 4 << 20}, addr); err != nil {
+		return err
+	}
+	dataWire, addr, err := readRawPacket(server)
+	if err != nil {
+		return err
+	}
+	data, err := ParsePacket(dataWire)
+	if err != nil || data.Type != Data {
+		return errors.New("header fixture did not receive DATA")
+	}
+	if got := binary.BigEndian.Uint16(dataWire[2:4]); got != syn.ConnectionID+1 {
+		return errors.New("DATA connection ID did not use SYN ID plus one")
+	}
+	if got := binary.BigEndian.Uint16(dataWire[18:20]); got != 800 {
+		return errors.New("DATA ACK did not track handshake STATE")
+	}
+	if got := binary.BigEndian.Uint32(dataWire[12:16]); got != 4<<20 {
+		return errors.New("DATA window did not track receive capacity")
+	}
+	if got := binary.BigEndian.Uint32(dataWire[8:12]); got == 0 {
+		return errors.New("DATA timestamp difference was not measured")
+	}
+	serverDataTimestamp := timestamp(time.Now().Add(-time.Second))
+	if err := sendTo(server, Packet{Type: Data, ConnectionID: syn.ConnectionID, Timestamp: serverDataTimestamp, SeqNr: 801, AckNr: data.SeqNr, WindowSize: 4 << 20, Payload: []byte("server")}, addr); err != nil {
+		return err
+	}
+	ackWire, _, err := readRawPacket(server)
+	if err != nil {
+		return err
+	}
+	ack, err := ParsePacket(ackWire)
+	if err != nil || ack.Type != State {
+		return errors.New("header fixture did not receive STATE ACK")
+	}
+	if got := binary.BigEndian.Uint16(ackWire[2:4]); got != syn.ConnectionID+1 {
+		return errors.New("STATE ACK connection ID mismatch")
+	}
+	if got := binary.BigEndian.Uint16(ackWire[16:18]); got != uint16(data.SeqNr+1) {
+		return errors.New("STATE ACK sequence did not track sender sequence")
+	}
+	if got := binary.BigEndian.Uint16(ackWire[18:20]); got != 801 {
+		return errors.New("STATE ACK did not track receive ACK")
+	}
+	if got := binary.BigEndian.Uint32(ackWire[8:12]); got == 0 {
+		return errors.New("STATE ACK timestamp difference was not measured")
+	}
+	return nil
+}
+
+func readRawPacket(conn *net.UDPConn) ([]byte, *net.UDPAddr, error) {
+	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	buf := make([]byte, 64<<10)
+	n, addr, err := conn.ReadFromUDP(buf)
+	if err != nil {
+		return nil, nil, err
+	}
+	return append([]byte(nil), buf[:n]...), addr, nil
 }
 
 func servePeerHandshake(server *net.UDPConn, infoHash, expectedClientID, serverID [20]byte) error {

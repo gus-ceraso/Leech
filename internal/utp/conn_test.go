@@ -119,6 +119,35 @@ func TestDialContextCancellationJoinsWorker(t *testing.T) {
 	}
 }
 
+func TestDialContextPreEstablishmentResetFailsImmediately(t *testing.T) {
+	server, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	serverErr := make(chan error, 1)
+	go func() {
+		packet, addr, err := readPacket(server)
+		if err == nil && packet.Type == Syn {
+			err = sendTo(server, Packet{Type: Reset, ConnectionID: packet.ConnectionID}, addr)
+		}
+		serverErr <- err
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	start := time.Now()
+	_, err = DialContext(ctx, "utp4", server.LocalAddr().String())
+	if !errors.Is(err, ErrReceiveReset) {
+		t.Fatalf("DialContext reset error = %v", err)
+	}
+	if time.Since(start) > time.Second {
+		t.Fatalf("pre-establishment reset took too long: %s", time.Since(start))
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestConnRemoteFINReturnsEOF(t *testing.T) {
 	server, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {

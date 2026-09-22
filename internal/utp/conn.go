@@ -122,8 +122,18 @@ func (c *Conn) Read(p []byte) (int, error) {
 	for {
 		c.mu.Lock()
 		if c.recv != nil {
+			windowBefore := c.recv.WindowSize()
 			n, err := c.recv.Read(p)
 			if n != 0 || err != nil {
+				if n != 0 && c.established && !c.closed {
+					now := time.Now()
+					c.syncSendStateLocked(now, nil)
+					if windowBefore == 0 && c.recv.WindowSize() > windowBefore {
+						if ackErr := c.writeActionLocked(c.receiveACKLocked(now)); ackErr != nil {
+							c.setTerminalLocked(ackErr)
+						}
+					}
+				}
 				c.mu.Unlock()
 				return n, err
 			}
@@ -396,6 +406,9 @@ func (c *Conn) handleDatagram(wire []byte) {
 	now := time.Now()
 	if !c.established {
 		if packet.Type != State {
+			if packet.Type == Reset {
+				c.setTerminalLocked(ErrReceiveReset)
+			}
 			return
 		}
 		if packet.AckNr != c.synSeq {
@@ -407,6 +420,7 @@ func (c *Conn) handleDatagram(wire []byte) {
 		// The peer's STATE both acknowledges our SYN and supplies its first
 		// sequence number. Do not accept data until this transition succeeds.
 		c.recv = NewReceiveState(packet.SeqNr.Add(1))
+		c.syncSendStateLocked(now, &packet)
 		result := c.send.Handle(packet, now)
 		if result.Err != nil {
 			c.setTerminalLocked(result.Err)
@@ -427,12 +441,17 @@ func (c *Conn) handleDatagram(wire []byte) {
 		return
 	}
 
+	received := c.recv.Receive(packet)
+	if c.recv.Err() != nil {
+		c.setTerminalLocked(c.recv.Err())
+		return
+	}
+	c.syncSendStateLocked(now, &packet)
 	result := c.send.Handle(packet, now)
 	if result.Err != nil {
 		c.setTerminalLocked(result.Err)
 		return
 	}
-	received := c.recv.Receive(packet)
 	for _, action := range result.Actions {
 		if action.Kind == ActionSend {
 			if err := c.writeActionLocked(action.Packet); err != nil {
@@ -443,9 +462,7 @@ func (c *Conn) handleDatagram(wire []byte) {
 	}
 	for _, action := range received.Actions {
 		if action.Kind == ActionSend {
-			ack := action.Packet
-			ack.ConnectionID = c.sendID
-			ack.Timestamp = timestamp(now)
+			ack := c.receiveACKLocked(now)
 			if err := c.writeActionLocked(ack); err != nil {
 				c.setTerminalLocked(err)
 				return
@@ -469,6 +486,13 @@ func (c *Conn) writeAction(packet Packet) error {
 }
 
 func (c *Conn) writeActionLocked(packet Packet) error {
+	if c.established && c.recv != nil && c.send != nil && packet.Type != Syn {
+		// Retransmissions retain their payload and sequence number in SendState,
+		// but their ACK/window fields describe the current receive state.
+		packet.AckNr = c.send.ackNr
+		packet.WindowSize = c.recv.WindowSize()
+		packet.TimestampDifference = c.send.tsDifference
+	}
 	if packet.ConnectionID == 0 && packet.Type != Syn {
 		packet.ConnectionID = c.sendID
 	}
@@ -485,15 +509,45 @@ func (c *Conn) writeResetLocked() {
 		return
 	}
 	packet := Packet{
-		Type:         Reset,
-		ConnectionID: c.sendID,
-		Timestamp:    timestamp(time.Now()),
-		AckNr:        c.recv.AckNumber(),
-		WindowSize:   c.recv.WindowSize(),
+		Type:                Reset,
+		ConnectionID:        c.sendID,
+		Timestamp:           timestamp(time.Now()),
+		TimestampDifference: c.send.tsDifference,
+		SeqNr:               c.send.nextSeq,
+		AckNr:               c.recv.AckNumber(),
+		WindowSize:          c.recv.WindowSize(),
 	}
 	if wire, err := packet.MarshalBinary(); err == nil {
 		_, _ = c.udp.Write(wire)
 	}
+}
+
+func (c *Conn) syncSendStateLocked(now time.Time, received *Packet) {
+	if c.send == nil || c.recv == nil {
+		return
+	}
+	c.send.SetAckNumber(c.recv.AckNumber())
+	c.send.SetWindowSize(c.recv.WindowSize())
+	if received != nil {
+		c.send.SetTimestampDifference(replyTimestamp(now, received.Timestamp))
+	}
+}
+
+func (c *Conn) receiveACKLocked(now time.Time) Packet {
+	ack := c.recv.AckPacket()
+	ack.ConnectionID = c.sendID
+	ack.SeqNr = c.send.nextSeq
+	ack.Timestamp = timestamp(now)
+	ack.TimestampDifference = c.send.tsDifference
+	return ack
+}
+
+func replyTimestamp(now time.Time, received Timestamp) Timestamp {
+	delta, ok := TimestampDistance(received, timestamp(now))
+	if !ok {
+		return 0
+	}
+	return Timestamp(delta)
 }
 
 func (c *Conn) setTerminalLocked(err error) {
