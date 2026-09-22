@@ -1,0 +1,199 @@
+package peer
+
+import (
+	"encoding/binary"
+	"errors"
+	"testing"
+)
+
+func TestRequestTableFastChokeKeepsTerminalObligation(t *testing.T) {
+	table := NewRequestTable(true)
+	block := Block{Index: 2, Begin: 0, Length: 1024}
+	if err := table.Add(block); err != nil {
+		t.Fatal(err)
+	}
+	if err := table.Choke(); err != nil {
+		t.Fatal(err)
+	}
+	if !table.Outstanding(block) || table.TombstoneCount() != 0 {
+		t.Fatalf("Fast choke changed request state: outstanding=%v tombstones=%d", table.Outstanding(block), table.TombstoneCount())
+	}
+	terminal, err := table.Terminal(block, false)
+	if err != nil || terminal != TerminalPiece {
+		t.Fatalf("piece terminal = %v, %v", terminal, err)
+	}
+	if _, err := table.Terminal(block, false); !errors.Is(err, ErrUnexpectedTerminal) {
+		t.Fatalf("duplicate terminal error = %v", err)
+	}
+}
+
+func TestRequestTableCancelAndTombstoneCap(t *testing.T) {
+	table, err := NewRequestTableWithCaps(false, 2, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := Block{Index: 0, Begin: 0, Length: 1}
+	b := Block{Index: 1, Begin: 0, Length: 1}
+	if err := table.Add(a); err != nil {
+		t.Fatal(err)
+	}
+	if err := table.Cancel(a); err != nil {
+		t.Fatal(err)
+	}
+	if terminal, err := table.Terminal(a, true); err != nil || terminal != TerminalLateReject {
+		t.Fatalf("late reject = %v, %v", terminal, err)
+	}
+	if err := table.Add(b); err != nil {
+		t.Fatal(err)
+	}
+	if err := table.Cancel(b); err != nil {
+		t.Fatal(err)
+	}
+	if err := table.Add(a); err != nil {
+		t.Fatal(err)
+	}
+	if err := table.Cancel(a); !errors.Is(err, ErrTombstoneLimit) {
+		t.Fatalf("full tombstone cap error = %v", err)
+	}
+	if !table.Outstanding(a) {
+		t.Fatal("request was forgotten when tombstone cap was full")
+	}
+}
+
+func TestPeerStateAvailabilityAndAllowedFastAreIndependent(t *testing.T) {
+	state, err := NewPeerStateWithConfig(PeerStateConfig{PieceCount: 4, PieceLength: 16 << 10, Fast: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed, interested, err := state.SetWanted(2, true); err != nil || changed || interested {
+		t.Fatalf("initial wanted state = %v, %v, %v", changed, interested, err)
+	}
+	have := Message{ID: HaveID, Payload: uint32Payload(2)}
+	effect, err := state.ApplyMessage(have)
+	if err != nil || !effect.InterestChanged || !effect.Interested {
+		t.Fatalf("Have effect = %#v, %v", effect, err)
+	}
+	if _, err := state.ApplyMessage(Message{ID: AllowedFastID, Payload: uint32Payload(2)}); err != nil {
+		t.Fatal(err)
+	}
+	if !state.AllowedFast(2) || !state.Availability(2) {
+		t.Fatal("availability and Allowed Fast were not retained")
+	}
+	effect, err = state.ApplyMessage(Message{ID: HaveNoneID})
+	if err != nil || !effect.InterestChanged || effect.Interested || state.Availability(2) || !state.AllowedFast(2) {
+		t.Fatalf("Have None state = %#v, avail=%v allowed=%v err=%v", effect, state.Availability(2), state.AllowedFast(2), err)
+	}
+	if state.CanRequest(2) {
+		t.Fatal("Allowed Fast alone made an unavailable piece requestable")
+	}
+	if _, err := state.ApplyMessage(have); err != nil {
+		t.Fatal(err)
+	}
+	if !state.CanRequest(2) {
+		t.Fatal("availability plus Allowed Fast did not permit choked request")
+	}
+}
+
+func TestPeerStateIncomingRequestsNeverProducePayload(t *testing.T) {
+	state, err := NewPeerState(3, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	block := Block{Index: 1, Begin: 0, Length: 1024}
+	payload := blockPayload(block.Index, block.Begin, block.Length)
+	effect, err := state.ApplyMessage(Message{ID: RequestID, Payload: payload})
+	if err != nil || effect.Response == nil || effect.Response.ID != RejectRequestID {
+		t.Fatalf("incoming Fast request effect = %#v, %v", effect, err)
+	}
+	if len(effect.Response.Payload) != 12 {
+		t.Fatal("reject response does not identify the request")
+	}
+	if _, err := state.ApplyMessage(Message{ID: RequestID, Payload: payload}); !errors.Is(err, ErrIncomingRequest) {
+		t.Fatalf("repeated incoming request error = %v", err)
+	}
+	nonFast, err := NewPeerState(3, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	effect, err = nonFast.ApplyMessage(Message{ID: RequestID, Payload: payload})
+	if err != nil || effect.Response != nil {
+		t.Fatalf("non-Fast incoming request = %#v, %v", effect, err)
+	}
+}
+
+func TestPeerStateLatePieceIsConsumedOnce(t *testing.T) {
+	state, err := NewPeerStateWithConfig(PeerStateConfig{PieceCount: 1, PieceLength: 1024})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := state.SetWanted(0, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := state.ApplyMessage(Message{ID: HaveID, Payload: uint32Payload(0)}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := state.ApplyMessage(Message{ID: UnchokeID}); err != nil {
+		t.Fatal(err)
+	}
+	block := Block{Index: 0, Begin: 0, Length: 512}
+	if err := state.AddRequest(block); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.TimeoutRequest(block); err != nil {
+		t.Fatal(err)
+	}
+	payload := make([]byte, 8+block.Length)
+	binary.BigEndian.PutUint32(payload[:4], block.Index)
+	binary.BigEndian.PutUint32(payload[4:8], block.Begin)
+	effect, err := state.ApplyMessage(Message{ID: PieceID, Payload: payload})
+	if err != nil || effect.Terminal != TerminalLatePiece {
+		t.Fatalf("late piece = %#v, %v", effect, err)
+	}
+	if _, err := state.ApplyMessage(Message{ID: PieceID, Payload: payload}); !errors.Is(err, ErrUnexpectedTerminal) {
+		t.Fatalf("duplicate late piece error = %v", err)
+	}
+}
+
+func uint32Payload(value uint32) []byte {
+	payload := make([]byte, 4)
+	binary.BigEndian.PutUint32(payload, value)
+	return payload
+}
+
+func FuzzRequestTableTransitions(f *testing.F) {
+	f.Add([]byte{0, 1, 2, 3}, true)
+	f.Add([]byte{255, 128, 7}, false)
+	f.Fuzz(func(t *testing.T, input []byte, fast bool) {
+		table, err := NewRequestTableWithCaps(fast, 4, 4)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i, value := range input {
+			block := Block{Index: uint32(value % 4), Begin: uint32(i * 32), Length: 1}
+			switch value % 5 {
+			case 0:
+				_ = table.Add(block)
+			case 1:
+				_ = table.Cancel(block)
+			case 2:
+				_ = table.Timeout(block)
+			case 3:
+				_, _ = table.Terminal(block, value&1 != 0)
+			default:
+				_ = table.Choke()
+			}
+		}
+	})
+}
+
+func FuzzPeerStateMessages(f *testing.F) {
+	f.Add(byte(HaveID), []byte{0, 0, 0, 0})
+	f.Add(byte(PieceID), []byte{0, 0, 0, 0, 0, 0, 0, 0, 1})
+	f.Fuzz(func(t *testing.T, id byte, payload []byte) {
+		state, err := NewPeerStateWithConfig(PeerStateConfig{PieceCount: 8, PieceLength: 16 << 10, Fast: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = state.ApplyMessage(Message{ID: id, Payload: payload})
+	})
+}
