@@ -189,12 +189,18 @@ func metainfoTrackers(root bencode.Value) ([]string, error) {
 				if value.Type != bencode.Bytes {
 					return nil, fmt.Errorf("%w: announce-list URL is not a string", ErrInvalidMetainfo)
 				}
+				if !utf8.Valid(value.Bytes) {
+					return nil, fmt.Errorf("%w: announce-list URL is not valid UTF-8", ErrInvalidMetainfo)
+				}
 				raw = append(raw, string(value.Bytes))
 			}
 		}
 	} else if announce, present := root.Lookup("announce"); present {
 		if announce.Type != bencode.Bytes {
 			return nil, fmt.Errorf("%w: announce is not a string", ErrInvalidMetainfo)
+		}
+		if !utf8.Valid(announce.Bytes) {
+			return nil, fmt.Errorf("%w: announce URL is not valid UTF-8", ErrInvalidMetainfo)
 		}
 		raw = append(raw, string(announce.Bytes))
 	}
@@ -397,7 +403,7 @@ func filePath(dict bencode.Value, attr fileAttrs) (string, []string, error) {
 	if value.Type != bencode.List {
 		return "", nil, fmt.Errorf("path is not a list")
 	}
-	if len(value.List) == 0 && !attr.padding {
+	if len(value.List) == 0 {
 		return "", nil, fmt.Errorf("path is empty")
 	}
 	if len(value.List) > limits.PathComponents {

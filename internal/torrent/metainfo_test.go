@@ -148,10 +148,28 @@ func TestParseMetainfoRejectsPathCollisionsAndMalformedSymlinks(t *testing.T) {
 	for _, files := range []bencode.Value{
 		metaList(metaDict(metaEntry("length", metaInteger(1)), metaEntry("path", metaPath("a"))), metaDict(metaEntry("length", metaInteger(1)), metaEntry("path", metaPath("a", "b")))),
 		metaList(metaDict(metaEntry("length", metaInteger(1)), metaEntry("path", metaPath("a"))), metaDict(metaEntry("length", metaInteger(1)), metaEntry("path", metaPath("a")))),
+		metaList(metaDict(metaEntry("attr", metaStringValue("p")), metaEntry("length", metaInteger(1)), metaEntry("path", metaList()))),
 		metaList(metaDict(metaEntry("attr", metaStringValue("l")), metaEntry("path", metaPath("a")))),
 	} {
 		if _, err := ParseMetainfo(makeInfo(files)); err == nil {
 			t.Fatalf("invalid files %#v succeeded", files)
+		}
+	}
+}
+
+func TestParseMetainfoRejectsInvalidUTF8TrackerURLs(t *testing.T) {
+	info := metaDict(
+		metaEntry("length", metaInteger(0)),
+		metaEntry("name", metaStringValue("empty")),
+		metaEntry("piece length", metaInteger(16<<10)),
+		metaEntry("pieces", metaStringBytes(nil)),
+	)
+	for _, root := range []bencode.Value{
+		metaDict(metaEntry("announce", metaStringBytes([]byte{'h', 't', 't', 'p', ':', '/', '/', 0xff})), metaEntry("info", info)),
+		metaDict(metaEntry("announce-list", metaList(metaList(metaStringBytes([]byte{'u', 'd', 'p', ':', '/', '/', 0xff})))), metaEntry("info", info)),
+	} {
+		if _, err := ParseMetainfo(metaEncode(root)); err == nil {
+			t.Fatalf("invalid UTF-8 tracker URL succeeded: %#v", root)
 		}
 	}
 }
