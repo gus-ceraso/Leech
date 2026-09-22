@@ -235,3 +235,20 @@ func TestScanResumePropagatesReadFailure(t *testing.T) {
 		t.Fatalf("read failure error=%v", err)
 	}
 }
+
+func TestScanResumeLargeWantedPlanUsesOneMappingAtATime(t *testing.T) {
+	const pieceCount = 32_768
+	files := []torrent.File{makeResumeFile(0, "payload", 0, pieceCount, torrent.RegularFile)}
+	pieces := make([]torrent.Piece, pieceCount)
+	for index := range pieces {
+		pieces[index] = resumePiece(index, int64(index), []byte{0})
+	}
+	selection, plan := resumeSelection(t, files, pieces, nil)
+	result, err := ScanResume(context.Background(), selection, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.NoTransferNeeded || len(result.VerifiedPieces) != 0 || len(result.VerifiedRanges) != 0 {
+		t.Fatalf("large missing plan result=%+v", result)
+	}
+}

@@ -74,9 +74,13 @@ func ScanResume(ctx context.Context, selection *torrent.SelectionPlan, output *P
 		return ResumeResult{}, err
 	}
 	result := ResumeResult{}
-	pieces := selection.PiecePlans()
+	wanted := selection.WantedPieces()
 	zeroes := make([]byte, limits.BlockBytes)
-	for _, mapping := range pieces {
+	for _, index := range wanted {
+		mapping, ok := selection.Piece(index)
+		if !ok {
+			return result, fmt.Errorf("%w: wanted piece %d is absent from selection plan", ErrResumeInvalid, index)
+		}
 		if err := ctx.Err(); err != nil {
 			return result, err
 		}
@@ -127,7 +131,7 @@ func ScanResume(ctx context.Context, selection *torrent.SelectionPlan, output *P
 	sort.Slice(result.PendingTruncations, func(i, j int) bool {
 		return result.PendingTruncations[i].Index < result.PendingTruncations[j].Index
 	})
-	result.NoTransferNeeded = len(result.VerifiedPieces) == len(pieces)
+	result.NoTransferNeeded = len(result.VerifiedPieces) == len(wanted)
 	return result, nil
 }
 
