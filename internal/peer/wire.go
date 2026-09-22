@@ -233,6 +233,9 @@ func readMessage(conn net.Conn, opts ReadOptions, enforceFast bool) (Message, er
 		if err := validateIndex(index, opts); err != nil {
 			return Message{}, err
 		}
+		if payloadLength-8 > limits.BlockBytes {
+			return Message{}, protocolError("read piece", fmt.Sprintf("piece block length %d exceeds %d bytes", payloadLength-8, limits.BlockBytes))
+		}
 		payload := make([]byte, payloadLength)
 		copy(payload, head[:])
 		if _, err := io.ReadFull(conn, payload[8:]); err != nil {
@@ -322,6 +325,9 @@ func validateMessagePayload(id byte, payload []byte, opts ReadOptions) error {
 	case PieceID:
 		if len(payload) < 9 {
 			return protocolError("validate piece", "piece payload is shorter than 9 bytes")
+		}
+		if len(payload)-8 > limits.BlockBytes {
+			return protocolError("validate piece", fmt.Sprintf("piece block length %d exceeds %d bytes", len(payload)-8, limits.BlockBytes))
 		}
 		index := binary.BigEndian.Uint32(payload[:4])
 		begin := binary.BigEndian.Uint32(payload[4:8])

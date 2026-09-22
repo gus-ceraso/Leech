@@ -147,6 +147,16 @@ func TestFrameErrorsAndUnknownIDs(t *testing.T) {
 	}
 }
 
+func TestPieceBlockBoundIsCheckedBeforeAllocation(t *testing.T) {
+	frameLength := 1 + 8 + limits.BlockBytes + 1
+	wire := make([]byte, 4+1+8)
+	binary.BigEndian.PutUint32(wire[:4], uint32(frameLength))
+	wire[4] = PieceID
+	if _, err := ReadMessage(newChunkConn(wire, 1)); !IsProtocolViolation(err) {
+		t.Fatalf("oversized piece error = %v", err)
+	}
+}
+
 func TestNegotiatedValidation(t *testing.T) {
 	haveNone := []byte{0, 0, 0, 1, HaveNoneID}
 	if _, err := ReadMessageWithOptions(newChunkConn(haveNone, 1), ReadOptions{}); !IsProtocolViolation(err) {
