@@ -333,19 +333,19 @@ starting transfer discovery when selection is already complete.
 **Depends on:** A0. **Owns:** `internal/peer/wire.go`, `handshake.go`, and golden
 fixtures. **References:** DESIGN §§11–12, 16–17; BEPs 3, 4, 6.
 
-- [ ] Parse and validate the BEP 3 handshake, info hash, optional expected peer ID,
+- [x] Parse and validate the BEP 3 handshake, info hash, optional expected peer ID,
   and reserved bits. Read bounded frames and keepalives from any `net.Conn`;
   reject oversized/truncated/invalid frames before payload-sized allocation.
-- [ ] Encode only permitted local control, request, cancel, and reject messages.
+- [x] Encode only permitted local control, request, cancel, and reject messages.
   Provide no outbound file `piece` or metadata `data` encoder and no storage
   access from incoming-request handling.
-- [ ] With Fast, emit immediate `Have None` as the sole local availability
+- [x] With Fast, emit immediate `Have None` as the sole local availability
   message; otherwise omit the bitfield. Never emit `Have`, `Bitfield`, `Have All`,
   or `Unchoke`. Keep extension-specific encoding with M1.
-- [ ] Distinguish severe protocol violations from ordinary disconnects and
+- [x] Distinguish severe protocol violations from ordinary disconnects and
   unsupported cooperation. Ignore bounded unknown core IDs; validate known
   messages against negotiated bits and valid indices.
-- [ ] Add independent wire vectors, fragmented-I/O tests, handshake/framing fuzz
+- [x] Add independent wire vectors, fragmented-I/O tests, handshake/framing fuzz
   targets, and an outbound-message allowlist assertion.
 
 **Acceptance:** captured outbound traffic preserves no-upload/no-availability
