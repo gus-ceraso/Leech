@@ -230,9 +230,6 @@ func ParseMagnet(raw string) (Magnet, error) {
 	}
 
 	trackers := values["tr"]
-	if len(trackers) > limits.Trackers {
-		return Magnet{}, fmt.Errorf("magnet contains too many trackers")
-	}
 	for _, tracker := range trackers {
 		if tracker == "" {
 			return Magnet{}, fmt.Errorf("magnet contains an empty tracker")
@@ -442,7 +439,7 @@ func normalizeTrackerURL(raw string) (string, error) {
 	}
 	u, err := url.Parse(raw)
 	if err != nil || u.Scheme == "" || u.Host == "" || u.Opaque != "" || u.Fragment != "" {
-		return "", fmt.Errorf("malformed tracker URL %q", raw)
+		return "", fmt.Errorf("malformed tracker URL")
 	}
 	u.Scheme = strings.ToLower(u.Scheme)
 	switch u.Scheme {
@@ -451,10 +448,10 @@ func normalizeTrackerURL(raw string) (string, error) {
 		return "", fmt.Errorf("unsupported tracker URL scheme %q", u.Scheme)
 	}
 	if u.Hostname() == "" || strings.ContainsAny(u.Hostname(), "\x00\r\n") {
-		return "", fmt.Errorf("malformed tracker URL %q", raw)
+		return "", fmt.Errorf("malformed tracker URL")
 	}
 	if err := validateURLPort(u.Host); err != nil {
-		return "", fmt.Errorf("malformed tracker URL %q: %w", raw, err)
+		return "", fmt.Errorf("malformed tracker URL: %w", err)
 	}
 	u.Host = strings.ToLower(u.Host)
 	return u.String(), nil

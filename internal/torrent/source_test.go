@@ -2,8 +2,11 @@ package torrent
 
 import (
 	"encoding/base32"
+	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/gus-ceraso/Leech/internal/limits"
 )
 
 const testHashHex = "0123456789abcdef0123456789abcdef01234567"
@@ -89,6 +92,38 @@ func TestTrackerNormalization(t *testing.T) {
 	}
 	if len(trackers) != 3 || trackers[0] != DefaultTracker || trackers[1] != "http://tracker.example:80/announce" {
 		t.Fatalf("trackers = %#v", trackers)
+	}
+}
+
+func TestMagnetTrackerDuplicatesCollapseBeforeLimit(t *testing.T) {
+	query := strings.Repeat("&tr=http%3A%2F%2Ftracker.example%2Fannounce", 65)
+	magnet, err := ParseMagnet("magnet:?xt=urn%3Abtih%3A" + testHashHex + query)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(magnet.Trackers) != 2 || magnet.Trackers[1] != "http://tracker.example/announce" {
+		t.Fatalf("trackers = %#v", magnet.Trackers)
+	}
+
+	tooMany := make([]string, limits.Trackers)
+	for i := range tooMany {
+		tooMany[i] = "http://tracker-" + strconv.Itoa(i) + ".example/announce"
+	}
+	if _, err := TrackersWithDefault(tooMany); err == nil {
+		t.Fatal("expected the default plus 64 unique trackers to exceed the limit")
+	}
+}
+
+func TestTrackerErrorsDoNotExposeURL(t *testing.T) {
+	raw := "http://user:secret@example.test:bad/announce?token=secret-query"
+	_, err := NormalizeTrackers([]string{raw})
+	if err == nil {
+		t.Fatal("expected malformed tracker URL")
+	}
+	for _, secret := range []string{"user", "secret", "secret-query", "/announce"} {
+		if strings.Contains(err.Error(), secret) {
+			t.Fatalf("tracker error %q leaked %q", err, secret)
+		}
 	}
 }
 
