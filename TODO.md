@@ -497,20 +497,20 @@ idle connections, and endgame cannot double-commit a block or leak request slots
 **Depends on:** I1. **Owns:** `internal/tracker/http.go` and HTTP fixtures.
 **References:** DESIGN §§10.2, 10.4, 16; BEPs 3, 7, 23, 31.
 
-- [ ] Build announces with exact binary info-hash/peer-ID encoding. Remove every
+- [x] Build announces with exact binary info-hash/peer-ID encoding. Remove every
   existing Leech-owned parameter plus `ip`, `ipv4`, and `ipv6`, then add one
   authoritative value for each applicable parameter. Preserve unrelated tracker
   data and apply the same sanitization to every redirect target.
-- [ ] Use standard TLS verification, bounded bodies, cancellation/deadlines, and
+- [x] Use standard TLS verification, bounded bodies, cancellation/deadlines, and
   normal redirect limits. Report whether the complete announce was transmitted
   independently of whether any response was received or parsed successfully.
-- [ ] Parse dictionary peers, compact IPv4, and compact IPv6. Validate a complete
+- [x] Parse dictionary peers, compact IPv4, and compact IPv6. Validate a complete
   compact string's stride before dropping excess whole records. A successful
   HTTP status with a bencoded failure is still a tracker failure.
-- [ ] Parse intervals and BEP 31 integer/decimal-string retry minutes with checked
+- [x] Parse intervals and BEP 31 integer/decimal-string retry minutes with checked
   conversions. Distinguish transient failure, definitive HTTP client failure,
   `never`, and invalid delays so T3 can apply the correct policy.
-- [ ] Test local HTTP/TLS servers, redirects, duplicate-query first-value/last-value
+- [x] Test local HTTP/TLS servers, redirects, duplicate-query first-value/last-value
   parsers, malformed bodies, response loss after transmission, family variants,
   credentials in URLs, and response-size limits; fuzz response parsing.
 
