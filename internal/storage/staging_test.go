@@ -12,7 +12,7 @@ import (
 	"github.com/gus-ceraso/Leech/internal/torrent"
 )
 
-func stagePiece(index int, begin int64, data []byte) torrent.Piece {
+func s2StagePiece(index int, begin int64, data []byte) torrent.Piece {
 	return torrent.Piece{Index: index, Range: torrent.ByteRange{Begin: begin, End: begin + int64(len(data))}, Hash: sha1.Sum(data)}
 }
 
@@ -49,17 +49,17 @@ func TestStagerDoesNotCreateWorkspaceBeforeStart(t *testing.T) {
 func TestStagerAdmitsSparsePieceAndEnforcesBudgets(t *testing.T) {
 	parent := t.TempDir()
 	stager := NewStager(StagerConfig{CacheRoot: parent, MaxPieces: 1, MaxBytes: 8})
-	if _, err := stager.AdmitPiece(stagePiece(0, 0, make([]byte, 9))); !errors.Is(err, ErrStagerNotStarted) {
+	if _, err := stager.AdmitPiece(s2StagePiece(0, 0, make([]byte, 9))); !errors.Is(err, ErrStagerNotStarted) {
 		t.Fatalf("admit before Start = %v, want not started", err)
 	}
 	if err := stager.Start(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	tooLarge := stagePiece(0, 0, make([]byte, 9))
+	tooLarge := s2StagePiece(0, 0, make([]byte, 9))
 	if _, err := stager.AdmitPiece(tooLarge); !errors.Is(err, ErrStagingLimit) {
 		t.Fatalf("oversized admission = %v, want budget error", err)
 	}
-	piece := stagePiece(0, 0, make([]byte, 8))
+	piece := s2StagePiece(0, 0, make([]byte, 8))
 	stage, err := stager.AdmitPiece(piece)
 	if err != nil {
 		t.Fatal(err)
@@ -71,7 +71,7 @@ func TestStagerAdmitsSparsePieceAndEnforcesBudgets(t *testing.T) {
 	if info.Mode().Perm() != 0o600 || info.Size() != 8 {
 		t.Fatalf("stage file mode/size = %o/%d", info.Mode().Perm(), info.Size())
 	}
-	if _, err := stager.AdmitPiece(stagePiece(1, 8, make([]byte, 1))); !errors.Is(err, ErrStagingLimit) {
+	if _, err := stager.AdmitPiece(s2StagePiece(1, 8, make([]byte, 1))); !errors.Is(err, ErrStagingLimit) {
 		t.Fatalf("piece-count admission = %v, want budget error", err)
 	}
 	if err := stage.WriteBlock(0, []byte("abcdefgh")); err != nil {
@@ -98,7 +98,7 @@ func TestStagerRejectsOversizedAndOutOfRangeBlocks(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer stager.Close()
-	stage, err := stager.AdmitPiece(stagePiece(0, 0, make([]byte, limits.BlockBytes+1)))
+	stage, err := stager.AdmitPiece(s2StagePiece(0, 0, make([]byte, limits.BlockBytes+1)))
 	if err != nil {
 		// The piece itself exceeds the supported piece limit only when the
 		// block limit is changed; retain this branch for the default constants.

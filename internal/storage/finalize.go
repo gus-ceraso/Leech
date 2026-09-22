@@ -196,7 +196,7 @@ func validateCoverage(snapshot PieceSnapshot, mapping torrent.PiecePlan) error {
 	blocks := make([]BlockCoverage, len(snapshot.Blocks))
 	for i, block := range snapshot.Blocks {
 		if block.Begin < 0 || block.Length <= 0 || block.Length > limits.BlockBytes || block.Begin > length-block.Length {
-			return fmt.Errorf("%w: block %d range [%d,%d)", ErrInvalidCoverage, i, block.Begin, block.Begin+block.Length)
+			return fmt.Errorf("%w: block %d is outside piece length %d", ErrInvalidCoverage, i, length)
 		}
 		blocks[i] = block
 		blocks[i].Contributors = append([]Endpoint(nil), block.Contributors...)
