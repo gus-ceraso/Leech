@@ -335,6 +335,9 @@ starting transfer discovery when selection is already complete.
   focused fixtures. R1 also found that I4 accepts up to 100,000 patterns and
   files but may perform roughly 10 billion pattern comparisons. Ask the I4
   worker for a bounded-work fix that preserves the supported selection domain.
+  R1 also found that S3 clones every wanted piece mapping and its range slices
+  before resume scanning. At the supported piece limit this creates millions
+  of avoidable allocations; scan one piece mapping at a time.
 
 ## Group 2: Peer protocol and the first download
 
