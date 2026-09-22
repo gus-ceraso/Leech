@@ -435,16 +435,16 @@ requests and correct completion/penalties. Streaming and endgame remain D3 work.
 **Depends on:** D1, S2. **Owns:** `internal/session/transfer.go` and its local TCP
 integration fixtures. **References:** DESIGN §§6, 13, 15, 18–19.
 
-- [ ] Connect the coordinator, peer I/O, scheduler, staged writes, and serialized
+- [x] Connect the coordinator, peer I/O, scheduler, staged writes, and serialized
   finalizer. Accept test-supplied handshaken TCP connections so this milestone
   does not depend on trackers, metadata acquisition, or uTP.
-- [ ] Define explicit transfer completion, cancellation, and storage-failure
+- [x] Define explicit transfer completion, cancellation, and storage-failure
   paths. Stop scheduling, unblock and join workers, settle the current bounded
   output operation, close handles, and remove the current workspace.
-- [ ] Download a spec-derived single-file fixture, then selected multi-file
+- [x] Download a spec-derived single-file fixture, then selected multi-file
   ranges with padding and a skipped-file boundary. Verify final bytes and prove
   unselected files are absent. Exercise incoming payload requests throughout.
-- [ ] Add corruption/retry, disconnect/reassignment, cancellation, and fatal
+- [x] Add corruption/retry, disconnect/reassignment, cancellation, and fatal
   storage-failure scenarios. Capture bounded read-only observations needed for
   assertions; do not build a metrics subsystem.
 
