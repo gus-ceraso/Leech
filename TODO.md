@@ -331,9 +331,10 @@ starting transfer discovery when selection is already complete.
   - [x] I1: reject duplicate empty dictionary keys (`6061e62`).
   - [x] I3: reject an explicitly empty padding `path` list and invalid UTF-8
     metainfo announce URLs (`8fdb1d0`).
-  - [ ] I4: bound selection work for up to 100,000 files and patterns without
+  - [x] I4: bound selection work for up to 100,000 files and patterns without
     narrowing the supported selection domain. R1 recheck found that a descending
-    range erases valid members of the same class (for example, `[a-0a]`).
+    range erased valid members of the same class; fixed in `e08df8f`. Independent
+    R1 acceptance recheck is in progress.
   - [x] S3: scan resume mappings one at a time to avoid cloning millions of
     piece descriptors and range slices (`c272bb2`).
 
