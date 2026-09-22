@@ -722,7 +722,10 @@ copies of this implementation successfully talking to each other.
 
   Initial R4 review fixes are integrated: outgoing ACK/window/delay fields and
   STATE ACK headers, handshake RESET rejection, post-FIN delivery, and bounded
-  congestion arithmetic. Recheck those fixes and full-stream coverage before
+  congestion gain arithmetic. R4 recheck found a blocked large `Conn.Write`
+  misses the ACK capacity wakeup, extreme RTT/RTO arithmetic can overflow,
+  and full `Conn` stream simulation remains unproven. Return connection and
+  fixture fixes to U4; return RTO saturation to U3. Recheck both before
   marking R4 complete.
 
 ## Group 5: Complete CLI and lifecycle
