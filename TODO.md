@@ -153,15 +153,15 @@ bootstrap should unblock implementation, not attempt to design every method.
 **Depends on:** A0. **Owns:** `internal/bencode/`.
 **References:** DESIGN §§7.2, 16; BEP 3.
 
-- [ ] Implement bounded decoding with exact byte spans, including the raw `info`
+- [x] Implement bounded decoding with exact byte spans, including the raw `info`
   span. Support decoding a bounded prefix where an extension header precedes
   binary payload; full-value callers must reject trailing bytes.
-- [ ] Reject unsorted or duplicate dictionary keys, invalid lengths/integers,
+- [x] Reject unsorted or duplicate dictionary keys, invalid lengths/integers,
   negative zero, leading zeros, signed-64-bit overflow, truncation, and excessive
   bytes, depth, values, or container entries before excessive work or allocation.
-- [ ] Add only the encoding needed for Leech's permitted protocol messages.
+- [x] Add only the encoding needed for Leech's permitted protocol messages.
   Keep exact received bytes available; never derive an info hash by re-encoding.
-- [ ] Add independently specified golden bytes and a decoder fuzz target covering
+- [x] Add independently specified golden bytes and a decoder fuzz target covering
   malformed, truncated, canonical, and near-limit inputs.
 
 **Acceptance:** canonical values decode predictably, invalid inputs fail within
