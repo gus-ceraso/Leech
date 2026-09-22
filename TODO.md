@@ -174,20 +174,20 @@ the decoded structure again.
 and `internal/torrent/source.go`.
 **References:** DESIGN §§4.1, 4.4–4.8, 7.1; BEPs 9, 53.
 
-- [ ] Implement every documented option, long-option value form, `--`, one-source
+- [x] Implement every documented option, long-option value form, `--`, one-source
   arity, uncombined short options, and options-before-source rule. Preserve the
   exact defaults and reject list-mode conflicts even when an explicitly supplied
   option equals its default. Validate log levels and positive Go durations.
-- [ ] Classify case-insensitive `magnet:` first, exact-length hex/Base32 hashes
+- [x] Classify case-insensitive `magnet:` first, exact-length hex/Base32 hashes
   second, and paths otherwise. Reject literal `-`; allow `./` to disambiguate a
   hash-shaped filename. Parse and validate without output/cache mutations.
-- [ ] Parse one effective v1 `btih`, reject conflicts and any `btmh`, and preserve
+- [x] Parse one effective v1 `btih`, reject conflicts and any `btmh`, and preserve
   `tr`, `x.pe`, display-only `dn`, and bounded `so` indices/ranges. Reject malformed
   endpoints, selections, and unsupported schemes without unbounded expansion.
-- [ ] Provide tracker URL deduplication and mandatory default-tracker inclusion.
+- [x] Provide tracker URL deduplication and mandatory default-tracker inclusion.
   Keep hostname resolution separate from parsing. Use the same normalization
   when I3 extracts metainfo trackers.
-- [ ] Add parser tables and fuzz cases for option errors, escaped names, malformed
+- [x] Add parser tables and fuzz cases for option errors, escaped names, malformed
   magnets, numeric overflow, source precedence, and all accepted hash forms.
 
 **Acceptance:** help exits 0, usage errors exit 2, parsing causes no network or
