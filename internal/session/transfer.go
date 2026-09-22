@@ -75,6 +75,7 @@ type transferPeer struct {
 	input              ConnectedPeer
 	worker             *peer.ConnectionWorker
 	state              *peer.PeerState
+	active             map[peer.Block]struct{}
 	done               bool
 	removed            bool
 	availabilitySynced bool
@@ -289,7 +290,7 @@ func (t *Transfer) startPeer(ctx context.Context, input ConnectedPeer) (*transfe
 		LastPieceLength: t.lastPieceLength,
 	})
 	worker.Start(ctx)
-	return &transferPeer{input: input, worker: worker, state: state}, nil
+	return &transferPeer{input: input, worker: worker, state: state, active: make(map[peer.Block]struct{})}, nil
 }
 
 func (t *Transfer) drive(ctx context.Context, peers []*transferPeer) error {
@@ -356,10 +357,12 @@ func (t *Transfer) drive(ctx context.Context, peers []*transferPeer) error {
 				_ = t.scheduler.RejectBlock(p.input.ID, request.Block)
 				continue
 			}
+			p.active[request.Block] = struct{}{}
 			message := peer.Message{ID: peer.RequestID, Payload: blockPayload(request.Block)}
 			if err := p.worker.SendContext(ctx, message); err != nil {
 				_ = p.state.CancelRequest(request.Block)
 				_ = t.scheduler.RejectBlock(p.input.ID, request.Block)
+				delete(p.active, request.Block)
 				return err
 			}
 		}
@@ -385,6 +388,21 @@ func (t *Transfer) handleEvent(ctx context.Context, p *transferPeer, event peer.
 			return t.disconnectPeer(p, err)
 		}
 		return err
+	}
+	if event.Message.ID == peer.ChokeID && !p.state.Fast() {
+		// BEP 3 choke releases ordinary outstanding requests in PeerState,
+		// which leaves their scheduler assignments to be explicitly returned
+		// to the pending set. Fast requests remain outstanding and therefore
+		// stay assigned.
+		for block := range p.active {
+			if p.state.Requests().Outstanding(block) {
+				continue
+			}
+			if err := t.scheduler.RejectBlock(p.input.ID, block); err != nil && !errors.Is(err, ErrBlockNotOutstanding) {
+				return err
+			}
+			delete(p.active, block)
+		}
 	}
 	if effect.Response != nil {
 		if err := p.worker.SendContext(ctx, *effect.Response); err != nil {
@@ -413,6 +431,7 @@ func (t *Transfer) handleEvent(ctx context.Context, p *transferPeer, event peer.
 		}
 		switch effect.Terminal {
 		case peer.TerminalPiece:
+			delete(p.active, block)
 			data := event.Message.Payload[8:]
 			stage := stageFor(t, int(block.Index))
 			if stage == nil {
@@ -429,6 +448,7 @@ func (t *Transfer) handleEvent(ctx context.Context, p *transferPeer, event peer.
 				return t.finalizePiece(ctx, int(block.Index))
 			}
 		case peer.TerminalReject:
+			delete(p.active, block)
 			if err := t.scheduler.RejectBlock(p.input.ID, block); err != nil {
 				return err
 			}

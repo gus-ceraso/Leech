@@ -638,6 +638,122 @@ func TestTransferFastAllowedPieceCanProgressWhileChoked(t *testing.T) {
 	}
 }
 
+func TestTransferOrdinaryChokeReassignsAfterLateTerminal(t *testing.T) {
+	data := []byte("flip")
+	meta := singleFileMeta(data)
+	selection, err := torrent.Select(meta, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	plan, err := storage.Validate(root, meta, selection.SelectedIndices())
+	if err != nil {
+		t.Fatal(err)
+	}
+	infoHash := [20]byte{4, 4, 4}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	serverDone := make(chan error, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		defer conn.Close()
+		if _, err := peer.ReadHandshake(conn, &infoHash, nil); err != nil {
+			serverDone <- err
+			return
+		}
+		if err := peer.WriteHandshake(conn, infoHash, [20]byte{6, 6, 6}, [8]byte{}); err != nil {
+			serverDone <- err
+			return
+		}
+		if err := writeFixtureFrame(conn, peer.BitfieldID, []byte{0x80}); err != nil {
+			serverDone <- err
+			return
+		}
+		if err := writeFixtureFrame(conn, peer.UnchokeID, nil); err != nil {
+			serverDone <- err
+			return
+		}
+		requests := 0
+		for {
+			message, err := peer.ReadMessage(conn)
+			if err != nil {
+				if peer.IsDisconnect(err) && requests >= 2 {
+					serverDone <- nil
+				} else {
+					serverDone <- err
+				}
+				return
+			}
+			if message.KeepAlive || message.ID == peer.InterestedID {
+				continue
+			}
+			if message.ID != peer.RequestID {
+				serverDone <- fmt.Errorf("unexpected message id %d", message.ID)
+				return
+			}
+			requests++
+			if requests == 1 {
+				if err := writeFixtureFrame(conn, peer.ChokeID, nil); err != nil {
+					serverDone <- err
+					return
+				}
+				if err := writeFixtureFrame(conn, peer.UnchokeID, nil); err != nil {
+					serverDone <- err
+					return
+				}
+			}
+			payload := make([]byte, 8+len(data))
+			copy(payload[8:], data)
+			if err := writeFixtureFrame(conn, peer.PieceID, payload); err != nil {
+				serverDone <- err
+				return
+			}
+		}
+	}()
+	conn, err := net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	local := peer.Handshake{InfoHash: infoHash, PeerID: [20]byte{4, 5, 6}}
+	if err := peer.WriteHandshake(conn, local.InfoHash, local.PeerID, local.Reserved); err != nil {
+		t.Fatal(err)
+	}
+	remote, err := peer.ReadHandshake(conn, &infoHash, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transfer, err := NewTransfer(TransferConfig{
+		Selection: selection, Output: plan,
+		Stager:         storage.NewStager(storage.StagerConfig{CacheRoot: filepath.Join(t.TempDir(), "cache"), MaxPieces: 1, MaxBytes: int64(len(data))}),
+		LocalHandshake: local,
+		Peers:          []ConnectedPeer{{ID: "choking-peer", Conn: conn, Handshake: remote}},
+		PieceCount:     1, PieceLength: uint32(len(data)), LastPieceLength: uint32(len(data)),
+	})
+	if err != nil {
+		conn.Close()
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := transfer.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-serverDone; err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(filepath.Join(root, "fixture"))
+	if err != nil || string(got) != string(data) {
+		t.Fatalf("output = %q, %v", got, err)
+	}
+}
+
 type fixturePiece struct {
 	index int
 	data  []byte
