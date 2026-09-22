@@ -326,18 +326,15 @@ starting transfer discovery when selection is already complete.
   offline listing and the storage regression tests; do not wait for networking
   to review this group.
 
-  R1 found that I1's canonical encoder accepts two empty dictionary keys because
-  its duplicate-key sentinel is `nil`. Return this to the I1 worker for a small
-  fix and regression test before closing R1. R1 also found that I3 accepts an
-  explicitly present empty padding `path` list; BEP 47 permits omission, not an
-  empty list. I3 also accepts invalid UTF-8 in announce URLs because Go's URL
-  parser percent-encodes the raw invalid byte. Return both to the I3 worker with
-  focused fixtures. R1 also found that I4 accepts up to 100,000 patterns and
-  files but may perform roughly 10 billion pattern comparisons. Ask the I4
-  worker for a bounded-work fix that preserves the supported selection domain.
-  R1 also found that S3 clones every wanted piece mapping and its range slices
-  before resume scanning. At the supported piece limit this creates millions
-  of avoidable allocations; scan one piece mapping at a time.
+  R1 fixes to recheck:
+
+  - [x] I1: reject duplicate empty dictionary keys (`6061e62`).
+  - [ ] I3: reject an explicitly empty padding `path` list and invalid UTF-8
+    metainfo announce URLs.
+  - [ ] I4: bound selection work for up to 100,000 files and patterns without
+    narrowing the supported selection domain.
+  - [ ] S3: scan resume mappings one at a time to avoid cloning millions of
+    piece descriptors and range slices.
 
 ## Group 2: Peer protocol and the first download
 
