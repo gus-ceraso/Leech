@@ -310,6 +310,7 @@ func serveAcknowledgeStream(server *net.UDPConn, wantBytes int) error {
 type scriptedStreamStats struct {
 	firstPacketDropped bool
 	timeoutObserved    bool
+	timeoutArrivals    int
 	sackObserved       bool
 	peerDataDuplicated bool
 	peerDataReordered  bool
@@ -373,7 +374,7 @@ func TestConnScriptedStream(t *testing.T) {
 	if err := <-errCh; err != nil {
 		t.Fatal(err)
 	}
-	if !stats.firstPacketDropped || !stats.timeoutObserved {
+	if !stats.firstPacketDropped || !stats.timeoutObserved || stats.timeoutArrivals < 2 {
 		t.Fatalf("loss script did not exercise drop and timeout: %+v", stats)
 	}
 	if !stats.sackObserved || !stats.peerDataDuplicated || !stats.peerDataReordered || !stats.peerDataDelayed {
@@ -411,7 +412,7 @@ func serveScriptedStream(server *net.UDPConn, want []byte) (scriptedStreamStats,
 	ack := first.Add(^uint16(0))
 	timeoutSeq := first.Add(4)
 	firstDropped := false
-	timeoutReleased := false
+	timeoutFirstSeen := false
 	pending := make(map[Sequence][]byte)
 	seen := make(map[Sequence]struct{})
 	received := make([]byte, 0, len(want))
@@ -432,17 +433,19 @@ func serveScriptedStream(server *net.UDPConn, want []byte) (scriptedStreamStats,
 			stats.firstPacketDropped = true
 			continue
 		}
-		if packet.SeqNr == timeoutSeq && !timeoutReleased {
-			// Do not acknowledge this in-order packet. Sleeping past the
-			// initial RTO forces the client's timeout retransmission while
-			// preserving the same fake peer state.
-			time.Sleep(650 * time.Millisecond)
-			timeoutReleased = true
-			stats.timeoutObserved = true
-			if err := sendScriptAck(server, packetAddr, syn.ConnectionID, ack, pending, peerWindow); err != nil {
-				return stats, err
+		if packet.SeqNr == timeoutSeq {
+			stats.timeoutArrivals++
+			if !timeoutFirstSeen {
+				// Drop the first arrival and do not acknowledge later packets
+				// while waiting. Sleeping past the initial RTO prevents SACK
+				// evidence from triggering fast retransmission of this packet.
+				timeoutFirstSeen = true
+				time.Sleep(650 * time.Millisecond)
+				continue
 			}
-			continue
+			// The exact sequence returned after the RTO. Only now does this
+			// fixture record timeout recovery and acknowledge the packet.
+			stats.timeoutObserved = true
 		}
 		if _, exists := seen[packet.SeqNr]; exists {
 			if err := sendScriptAck(server, packetAddr, syn.ConnectionID, ack, pending, peerWindow); err != nil {
