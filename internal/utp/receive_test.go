@@ -116,6 +116,70 @@ func TestReceiveFINWaitsForMissingPackets(t *testing.T) {
 	}
 }
 
+func TestReceiveDropsDataPastFINWhenDataArrivesFirst(t *testing.T) {
+	r, err := NewReceiveStateWithLimits(1, 4, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result := r.Receive(receiveData(2, "past-fin")); !result.Accepted {
+		t.Fatalf("buffered post-FIN data = %+v", result)
+	}
+	if packets, bytes := r.Buffered(); packets != 1 || bytes != len("past-fin") {
+		t.Fatalf("before FIN buffered=(%d,%d)", packets, bytes)
+	}
+	result := r.Receive(receiveFIN(1))
+	if !result.Accepted || !r.Finished() {
+		t.Fatalf("FIN result = %+v, finished=%v", result, r.Finished())
+	}
+	if packets, bytes := r.Buffered(); packets != 0 || bytes != 0 {
+		t.Fatalf("post-FIN data was retained: buffered=(%d,%d)", packets, bytes)
+	}
+	if r.WindowSize() != 8 {
+		t.Fatalf("window after dropping post-FIN data = %d", r.WindowSize())
+	}
+	if n, readErr := r.Read(make([]byte, 8)); n != 0 || !errors.Is(readErr, io.EOF) {
+		t.Fatalf("post-FIN data reached application: n=%d err=%v", n, readErr)
+	}
+	if _, ok := result.Actions[0].Packet.SelectiveACK(); ok {
+		t.Fatal("ACK retained a SACK for dropped post-FIN data")
+	}
+}
+
+func TestReceiveFINBeforeDataAndDuplicateFIN(t *testing.T) {
+	r := NewReceiveState(10)
+	if result := r.Receive(receiveFIN(10)); !result.Accepted || !r.Finished() {
+		t.Fatalf("in-order FIN = %+v, finished=%v", result, r.Finished())
+	}
+	duplicate := r.Receive(receiveFIN(10))
+	if !duplicate.Duplicate || len(duplicate.Actions) != 1 || duplicate.Actions[0].Kind != ActionSend {
+		t.Fatalf("duplicate FIN = %+v", duplicate)
+	}
+	postFIN := r.Receive(receiveData(11, "late"))
+	if len(postFIN.Actions) != 1 || postFIN.Actions[0].Kind != ActionClose || !errors.Is(postFIN.Actions[0].Err, ErrReceiveAfterFIN) {
+		t.Fatalf("DATA after FIN = %+v", postFIN)
+	}
+}
+
+func TestReceiveDropsPostFINDataAcrossWraparound(t *testing.T) {
+	r, err := NewReceiveStateWithLimits(0xffff, 4, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result := r.Receive(receiveData(0, "late")); !result.Accepted {
+		t.Fatalf("wrapped post-FIN data = %+v", result)
+	}
+	result := r.Receive(receiveFIN(0xffff))
+	if !result.Accepted || !r.Finished() {
+		t.Fatalf("wrapped FIN = %+v, finished=%v", result, r.Finished())
+	}
+	if packets, bytes := r.Buffered(); packets != 0 || bytes != 0 {
+		t.Fatalf("wrapped post-FIN data retained: buffered=(%d,%d)", packets, bytes)
+	}
+	if n, readErr := r.Read(make([]byte, 16)); n != 0 || !errors.Is(readErr, io.EOF) {
+		t.Fatalf("wrapped post-FIN read = %d, %v", n, readErr)
+	}
+}
+
 func TestReceiveWindowPressureAndReopening(t *testing.T) {
 	r, err := NewReceiveStateWithLimits(1, 1, 3)
 	if err != nil {

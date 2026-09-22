@@ -179,6 +179,7 @@ func (r *ReceiveState) receiveData(packet Packet) ReceiveResult {
 			r.finSeq = packet.SeqNr
 		}
 		r.acceptContiguous(packet)
+		r.discardPostFIN()
 		r.drainPending()
 		return ReceiveResult{Actions: []PacketAction{r.ackAction()}, Accepted: true}
 	}
@@ -201,6 +202,7 @@ func (r *ReceiveState) receiveData(packet Packet) ReceiveResult {
 	if packet.Type == Fin {
 		r.finSeen = true
 		r.finSeq = packet.SeqNr
+		r.discardPostFIN()
 	}
 	return ReceiveResult{Actions: []PacketAction{r.ackAction()}, Accepted: true}
 }
@@ -219,6 +221,9 @@ func (r *ReceiveState) acceptContiguous(packet Packet) {
 
 func (r *ReceiveState) drainPending() {
 	for {
+		if r.finReady {
+			return
+		}
 		packet, ok := r.pending[r.next]
 		if !ok {
 			return
@@ -232,6 +237,24 @@ func (r *ReceiveState) drainPending() {
 		if packet.fin {
 			r.finReady = true
 		}
+	}
+}
+
+// discardPostFIN removes packets that were buffered before the receiver knew
+// the peer's eof_pkt. BEP 29 defines FIN as the final sequence number, so a
+// packet after FIN can never become application data even when it arrived
+// first. Releasing its payload also reopens the advertised receive window.
+func (r *ReceiveState) discardPostFIN() {
+	if !r.finSeen {
+		return
+	}
+	for sequence, packet := range r.pending {
+		comparison, ok := CompareSequence(r.finSeq, sequence)
+		if !ok || comparison >= 0 {
+			continue
+		}
+		delete(r.pending, sequence)
+		r.bufferedByte -= len(packet.payload)
 	}
 }
 
