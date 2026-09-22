@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	pathpkg "path"
+	"regexp"
 	"sort"
 	"strings"
 	"unicode/utf8"
@@ -199,24 +200,232 @@ func selectPatterns(meta Metainfo, patterns []string, selected []bool) error {
 	if len(patterns) > limits.Files {
 		return fmt.Errorf("%w: too many file patterns", ErrInvalidSelection)
 	}
+	unique := make([]string, 0, len(patterns))
+	seen := make(map[string]struct{}, len(patterns))
 	for _, pattern := range patterns {
 		if err := validatePattern(pattern); err != nil {
 			return err
 		}
-	}
-	for index, file := range meta.Files {
-		if file.Path == "" {
-			// Padding has no selectable path.
+		if _, duplicate := seen[pattern]; duplicate {
 			continue
 		}
-		for _, pattern := range patterns {
-			if pathPatternMatches(pattern, file.Path) {
-				selected[index] = true
-				break
-			}
+		seen[pattern] = struct{}{}
+		unique = append(unique, pattern)
+	}
+
+	paths := make([]indexedPath, 0, len(meta.Files))
+	for index, file := range meta.Files {
+		if file.Path != "" {
+			paths = append(paths, indexedPath{path: file.Path, index: index})
 		}
 	}
+	sort.Slice(paths, func(i, j int) bool { return paths[i].path < paths[j].path })
+
+	globs := make([]string, 0, len(unique))
+	for _, pattern := range unique {
+		if hasPatternMeta(pattern) {
+			globs = append(globs, pattern)
+			continue
+		}
+		selectExactPattern(pattern, paths, selected)
+	}
+	if len(globs) == 0 {
+		return nil
+	}
+	selectGlobPatterns(paths, globs, selected)
 	return nil
+}
+
+type indexedPath struct {
+	path  string
+	index int
+}
+
+func hasPatternMeta(pattern string) bool {
+	return strings.ContainsAny(pattern, "*?[")
+}
+
+func selectExactPattern(pattern string, paths []indexedPath, selected []bool) {
+	start := sort.Search(len(paths), func(i int) bool { return paths[i].path >= pattern })
+	descendantPrefix := pattern + "/"
+	for i := start; i < len(paths); i++ {
+		candidate := paths[i].path
+		if candidate == pattern || strings.HasPrefix(candidate, descendantPrefix) {
+			selected[paths[i].index] = true
+			continue
+		}
+		// All paths beginning with descendantPrefix are contiguous. Values
+		// between pattern and that prefix (for example, "dir-old" for
+		// pattern "dir") must be skipped before the descendant range.
+		if candidate > descendantPrefix {
+			return
+		}
+	}
+}
+
+// globBatchBytes bounds the temporary union expression. It is an internal
+// batching limit, not a restriction on the accepted selector domain. Large
+// selector sets are matched in several linear passes over the file paths.
+const globBatchBytes = 4 << 20
+
+func selectGlobPatterns(paths []indexedPath, patterns []string, selected []bool) {
+	for start := 0; start < len(patterns); {
+		end, size := start, 0
+		for end < len(patterns) {
+			patternSize := len(patterns[end])
+			if end > start && size+patternSize > globBatchBytes {
+				break
+			}
+			size += patternSize
+			end++
+		}
+		selectGlobBatch(paths, patterns[start:end], selected)
+		start = end
+	}
+}
+
+func selectGlobBatch(paths []indexedPath, patterns []string, selected []bool) {
+	matcher, err := compileGlobPatterns(patterns)
+	if err == nil {
+		for _, candidate := range paths {
+			if matcher.MatchString(candidate.path) {
+				selected[candidate.index] = true
+			}
+		}
+		return
+	}
+	if len(patterns) == 1 {
+		// A valid path.Match pattern can be larger than regexp's implementation
+		// limit. Preserve the accepted domain with the direct matcher in this
+		// rare case; ordinary bounded sets use the union above.
+		pattern := patterns[0]
+		for _, candidate := range paths {
+			if pathPatternMatches(pattern, candidate.path) {
+				selected[candidate.index] = true
+			}
+		}
+		return
+	}
+	middle := len(patterns) / 2
+	selectGlobBatch(paths, patterns[:middle], selected)
+	selectGlobBatch(paths, patterns[middle:], selected)
+}
+
+func compileGlobPatterns(patterns []string) (*regexp.Regexp, error) {
+	var expression strings.Builder
+	expression.WriteString("^(")
+	for index, pattern := range patterns {
+		if index > 0 {
+			expression.WriteByte('|')
+		}
+		converted, err := globToRegexp(pattern)
+		if err != nil {
+			return nil, err
+		}
+		expression.WriteString(converted)
+	}
+	expression.WriteString(")(/|$)")
+	return regexp.Compile(expression.String())
+}
+
+func globToRegexp(pattern string) (string, error) {
+	var expression strings.Builder
+	for position := 0; position < len(pattern); {
+		switch pattern[position] {
+		case '*':
+			expression.WriteString("[^/]*")
+			position++
+		case '?':
+			expression.WriteString("[^/]")
+			position++
+		case '[':
+			class, next, err := globClassToRegexp(pattern, position)
+			if err != nil {
+				return "", err
+			}
+			expression.WriteString(class)
+			position = next
+		default:
+			runeValue, width := utf8.DecodeRuneInString(pattern[position:])
+			if runeValue == utf8.RuneError && width == 1 {
+				return "", fmt.Errorf("invalid UTF-8")
+			}
+			expression.WriteString(regexp.QuoteMeta(string(runeValue)))
+			position += width
+		}
+	}
+	return expression.String(), nil
+}
+
+func globClassToRegexp(pattern string, start int) (string, int, error) {
+	position := start + 1
+	negated := false
+	if position < len(pattern) && pattern[position] == '^' {
+		negated = true
+		position++
+	}
+	type classRange struct {
+		low, high rune
+		rangeEnd  bool
+	}
+	ranges := make([]classRange, 0, 4)
+	count := 0
+	invalidRange := false
+	for {
+		if position >= len(pattern) {
+			return "", 0, fmt.Errorf("unterminated character class")
+		}
+		if pattern[position] == ']' && count > 0 {
+			if invalidRange {
+				// path.Match accepts descending ranges but they match no
+				// character. Metadata paths cannot contain NUL, so this is a
+				// compact RE2 representation of an empty class.
+				return `[\x00]`, position + 1, nil
+			}
+			var class strings.Builder
+			class.WriteByte('[')
+			if negated {
+				class.WriteByte('^')
+			}
+			for _, item := range ranges {
+				writeRegexpClassRune(&class, item.low)
+				if item.rangeEnd {
+					class.WriteByte('-')
+					writeRegexpClassRune(&class, item.high)
+				}
+			}
+			class.WriteByte(']')
+			return class.String(), position + 1, nil
+		}
+		low, width := utf8.DecodeRuneInString(pattern[position:])
+		if low == utf8.RuneError && width == 1 {
+			return "", 0, fmt.Errorf("invalid UTF-8 in character class")
+		}
+		position += width
+		item := classRange{low: low}
+		if position < len(pattern) && pattern[position] == '-' {
+			position++
+			high, highWidth := utf8.DecodeRuneInString(pattern[position:])
+			if high == utf8.RuneError && highWidth == 1 {
+				return "", 0, fmt.Errorf("invalid UTF-8 in character class range")
+			}
+			position += highWidth
+			item.high = high
+			item.rangeEnd = true
+			if low > high {
+				invalidRange = true
+			}
+		}
+		ranges = append(ranges, item)
+		count++
+	}
+}
+
+func writeRegexpClassRune(expression *strings.Builder, value rune) {
+	if strings.ContainsRune(`\[]^-`, value) {
+		expression.WriteByte('\\')
+	}
+	expression.WriteRune(value)
 }
 
 func selectRanges(meta Metainfo, ranges []IndexRange, selected []bool) error {

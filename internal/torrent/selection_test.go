@@ -72,6 +72,57 @@ func TestSelectPatternsAndDirectoryDescendants(t *testing.T) {
 	}
 }
 
+func TestGlobUnionPreservesPathMatchSemantics(t *testing.T) {
+	paths := []string{
+		"a",
+		"a/b",
+		"a/c/d",
+		"a/z",
+		"b",
+		"c",
+		"unicode/éclair",
+	}
+	files := make([]File, len(paths))
+	pieces := make([]Piece, len(paths))
+	for index, path := range paths {
+		files[index] = selectionFile(index, path, int64(index), int64(index+1), RegularFile)
+		pieces[index] = selectionPiece(index, int64(index), int64(index+1))
+	}
+	meta := selectionMeta(files, pieces)
+	patterns := []string{
+		"a/*/d",
+		"a/[b-c]",
+		"[a-bd]",
+		"a/[^b]",
+		"a[^x]b",
+		"[c-0]",
+		"unicode/?clair",
+		"unicode/é*",
+		"missing/[a-z]",
+	}
+	for _, pattern := range patterns {
+		plan, err := Select(meta, []string{pattern}, nil)
+		want := make([]int, 0)
+		for index, file := range meta.Files {
+			if pathPatternMatches(pattern, file.Path) {
+				want = append(want, index)
+			}
+		}
+		if len(want) == 0 {
+			if !errors.Is(err, ErrSelectionNoMatch) {
+				t.Errorf("pattern %q error = %v, want ErrSelectionNoMatch", pattern, err)
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatalf("pattern %q: %v", pattern, err)
+		}
+		if got := plan.SelectedIndices(); !reflect.DeepEqual(got, want) {
+			t.Errorf("pattern %q selected = %v, want %v", pattern, got, want)
+		}
+	}
+}
+
 func TestSelectBEP53KeepsOriginalIndicesAndRejectsSpecialFiles(t *testing.T) {
 	meta := selectionMeta(
 		[]File{
@@ -184,6 +235,25 @@ func TestSelectionScalesAcrossManyFilesAndPieces(t *testing.T) {
 	}
 }
 
+func TestSelectionScalesAcrossManyDistinctWildcardPatterns(t *testing.T) {
+	const count = 100_000
+	files := make([]File, count)
+	pieces := make([]Piece, count)
+	patterns := make([]string, count)
+	for index := 0; index < count; index++ {
+		files[index] = selectionFile(index, "file-"+fmt.Sprintf("%05d", index), int64(index), int64(index+1), RegularFile)
+		pieces[index] = selectionPiece(index, int64(index), int64(index+1))
+		// Every selector starts with '?', so there is no usable literal
+		// prefix. None matches the file paths; this exercises the worst-case
+		// nonmatching set without relying on repeated-pattern deduplication.
+		patterns[index] = "?missing-" + fmt.Sprintf("%05d", index)
+	}
+	meta := selectionMeta(files, pieces)
+	if _, err := Select(meta, patterns, nil); !errors.Is(err, ErrSelectionNoMatch) {
+		t.Fatalf("selection error = %v, want ErrSelectionNoMatch", err)
+	}
+}
+
 func formatSelectionIndex(index int) string {
 	return fmt.Sprintf("%04d", index)
 }
@@ -195,5 +265,27 @@ func FuzzSelectPattern(f *testing.F) {
 	meta := selectionMeta([]File{selectionFile(0, "dir/a.bin", 0, 1, RegularFile)}, []Piece{selectionPiece(0, 0, 1)})
 	f.Fuzz(func(t *testing.T, pattern string) {
 		_, _ = Select(meta, []string{pattern}, nil)
+	})
+}
+
+func FuzzGlobRegexMatchesPathMatch(f *testing.F) {
+	for _, seed := range []string{"*", "a/?", "a/[b-d]", "a/[^x]b", "unicode/é*", "[a-bd]"} {
+		f.Add(seed)
+	}
+	candidates := []string{"", "a", "a/b", "a/c", "a/c/d", "a/bb", "a/bx", "unicode/éclair", "x/y"}
+	f.Fuzz(func(t *testing.T, pattern string) {
+		if err := validatePattern(pattern); err != nil {
+			return
+		}
+		matcher, err := compileGlobPatterns([]string{pattern})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, candidate := range candidates {
+			want := pathPatternMatches(pattern, candidate)
+			if got := matcher.MatchString(candidate); got != want {
+				t.Fatalf("pattern %q candidate %q = %v, want %v", pattern, candidate, got, want)
+			}
+		}
 	})
 }
