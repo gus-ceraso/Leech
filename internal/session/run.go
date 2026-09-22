@@ -660,9 +660,6 @@ func (c *coordinator) startTransferPhase(ctx context.Context, source torrent.Sou
 	if finalErr := trackerRun.Finalize(context.Background(), full); finalErr != nil && c.config.OnSecondary != nil {
 		c.config.OnSecondary(finalErr)
 	}
-	if closeErr := c.closeSet(); closeErr != nil && c.config.OnSecondary != nil {
-		c.config.OnSecondary(closeErr)
-	}
 	if err != nil {
 		return err
 	}
