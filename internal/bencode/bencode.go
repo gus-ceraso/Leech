@@ -455,11 +455,13 @@ func (e *encoder) value(out *[]byte, v Value, depth int) error {
 		})
 		*out = append(*out, 'd')
 		var previous []byte
+		havePrevious := false
 		for _, item := range entries {
-			if previous != nil && bytes.Equal(previous, item.Key) {
+			if havePrevious && bytes.Equal(previous, item.Key) {
 				return ErrMalformed
 			}
 			previous = item.Key
+			havePrevious = true
 			e.entries++
 			if e.entries > e.bound.MaxDictionaryEntries {
 				return ErrLimit

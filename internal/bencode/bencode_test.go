@@ -153,6 +153,13 @@ func TestEncodeSortsAndRejectsDuplicateKeys(t *testing.T) {
 	if _, err := Encode(value); !errors.Is(err, ErrMalformed) {
 		t.Fatalf("duplicate encode error = %v, want ErrMalformed", err)
 	}
+	value.Dict = []Entry{
+		{Key: nil, Value: Value{Type: Integer, Int: 1}},
+		{Key: []byte{}, Value: Value{Type: Integer, Int: 2}},
+	}
+	if _, err := Encode(value); !errors.Is(err, ErrMalformed) {
+		t.Fatalf("duplicate empty-key encode error = %v, want ErrMalformed", err)
+	}
 }
 
 // LookupMust is test-only shorthand that keeps the golden test focused on the
