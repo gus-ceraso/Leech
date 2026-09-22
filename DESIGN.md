@@ -502,7 +502,7 @@ For each phase and tracker:
 
 On a phase transition or final shutdown, the session first cancels and joins every regular announce loop. It then uses a separate bounded context to send at most one announce for each applicable final event per tracker: full completion sends `completed` and then `stopped`; every other exit sends only `stopped`. `stopped` is attempted for every nonpermanently-disabled tracker to which a `started` request was transmitted, whether or not a response arrived. No regular announce may begin after the final-event sequence starts. Final announce failure is secondary and never changes an existing primary result.
 
-Tracker and magnet endpoints may be public, private, or loopback. Invalid ports, unspecified addresses, and multicast addresses are rejected. This intentionally permits untrusted inputs to induce connections to local unicast services.
+Peer endpoints from trackers or magnets may be public, private, or loopback. Reject peer endpoints with invalid ports, unspecified addresses, or multicast addresses. Tracker-server destinations retain unrestricted address resolution, including loopback and private addresses. This intentionally permits untrusted inputs to induce connections to local services.
 
 ## 11. Candidate peers and dialing
 
