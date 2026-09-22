@@ -510,16 +510,16 @@ successful tracker activations. Diagnostic data is safe for L1 to render.
 **Depends on:** A0. **Owns:** `internal/tracker/udp.go` and UDP fixtures.
 **References:** DESIGN §§10.3–10.4, 16; BEPs 7, 15, 41.
 
-- [ ] Implement connect/announce messages, connection-ID validity, transaction
+- [x] Implement connect/announce messages, connection-ID validity, transaction
   and action checks, tracker errors, and bounded datagrams. A mismatched
   transaction ID is a tracker-local failure, never an accepted response.
-- [ ] Follow BEP 15's `15 × 2^n` transaction retransmission schedule and reconnect
+- [x] Follow BEP 15's `15 × 2^n` transaction retransmission schedule and reconnect
   when the connection ID expires. Keep transaction retries distinct from T3's
   tracker-loop backoff and interruptible by the final-event deadline.
-- [ ] Encode BEP 41 URL data and parse complete IPv4/IPv6 peer strides. For a
+- [x] Encode BEP 41 URL data and parse complete IPv4/IPv6 peer strides. For a
   dual-stack hostname, announce to one resolved endpoint per available family
   with the same session identity; handle unequal family support.
-- [ ] Report transmission before awaiting a response. Test exact packet bytes,
+- [x] Report transmission before awaiting a response. Test exact packet bytes,
   loss/retry schedules using controlled time, ID expiry, malformed/mismatched
   replies, URL data, family handling, and cancellation; fuzz packet decoding.
 
@@ -685,7 +685,7 @@ transport tests. **References:** DESIGN §§11, 14–16; BEP 29.
 - [ ] Combine the state logic behind one outgoing connection using a connected
   UDP socket per attempt. Implement SYN setup, connection-ID rules, IPv4/IPv6,
   FIN/RESET, and protocol teardown. Expose no listener or inbound-SYN/server API.
-- [ ] Implement `Read`, `Write`, addresses, deadlines, context-aware dialing, and
+- [x] Implement `Read`, `Write`, addresses, deadlines, context-aware dialing, and
   idempotent `Close` with `net.Conn` concurrency semantics. Unblock all pending
   I/O on deadline, cancellation, reset, or close and join owned workers.
 - [ ] Exercise complete streams over the deterministic link with loss, delay,
