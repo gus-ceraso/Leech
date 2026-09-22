@@ -122,21 +122,22 @@ development documentation until milestone 5 passes.
 types in their owning packages, and `internal/limits/`.
 **References:** DESIGN §§6, 15–16, 19.
 
-- [ ] Verify the installed stable Go toolchain and create a standard-library-only
+- [x] Verify the installed stable Go toolchain and create a standard-library-only
   module and buildable command. Keep production pure Go. Use the existing
   `bash -ic 'go ...'` environment when needed.
-- [ ] Establish only the shared types needed to unblock the table: immutable
+- [x] Establish only the shared types needed to unblock the table: immutable
   info hash/file/piece metadata, original file indices and byte ranges, selection
   ranges, resolved endpoint identity, and the small worker event/command shapes.
   Keep types with their owning component; avoid a catch-all model package.
-- [ ] Agree on ownership of input buffers, blocks, connections, and completion
-  signals. The session coordinator owns mutable torrent state; I/O workers report
-  bounded events. Specify how a canceled producer or full queue unblocks.
-- [ ] Put every fixed supported-domain limit from DESIGN §16 in one place.
+- [x] Keep buffer, block, connection, and completion-signal ownership with the
+  first component that uses each resource. The session coordinator owns mutable
+  torrent state; I/O workers report bounded events. P2, D2, and T3 must specify
+  how a canceled producer or full queue unblocks when they add those queues.
+- [x] Put every fixed supported-domain limit from DESIGN §16 in one place.
   Validate arithmetic before conversion, allocation, seeking, or duration use.
   Add unspecified operational timings as named constants in the component that
   introduces them; use reasonable initial values without creating tuning flags.
-- [ ] Establish private dependency injection for clocks, dialers/resolvers, and
+- [x] Establish private dependency injection for clocks, dialers/resolvers, and
   failing I/O only where the first consumers need it. Ensure test construction
   can route the mandatory default tracker locally without changing its inclusion
   in production. Do not build all fake peers and trackers up front.
