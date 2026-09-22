@@ -51,12 +51,13 @@ type MetadataConfig struct {
 	Trackers []string
 	Peers    []torrent.PeerAddress
 
-	TrackerSet *tracker.TrackerSet
-	Updates    <-chan tracker.Update
-	Identity   tracker.Identity
-	HTTP       tracker.TrackerHTTP
-	UDP        tracker.TrackerUDP
-	Random     io.Reader
+	TrackerSet   *tracker.TrackerSet
+	Updates      <-chan tracker.Update
+	Identity     tracker.Identity
+	HTTP         tracker.TrackerHTTP
+	UDP          tracker.TrackerUDP
+	TrackerClock tracker.Clock
+	Random       io.Reader
 
 	Resolver       peer.Resolver
 	TCPDial        peer.DialFunc
@@ -203,6 +204,7 @@ func (d *MetadataDiscovery) Run(ctx context.Context) (result MetadataResult, pri
 			Identity:  identity,
 			HTTP:      config.HTTP,
 			UDP:       config.UDP,
+			Clock:     config.TrackerClock,
 			Random:    config.Random,
 			OnUpdate:  callback,
 			NeedPeers: func() bool { return true },
