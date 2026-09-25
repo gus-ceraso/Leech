@@ -209,9 +209,12 @@ func TestFinalizeHashMismatchRemovesStageWithoutCreatingOutput(t *testing.T) {
 	if err := stage.WriteBlock(0, []byte("bad!")); err != nil {
 		t.Fatal(err)
 	}
-	_, err = stager.Finalize(context.Background(), NewPieceSnapshot(piece, []BlockCoverage{s2Coverage(0, 4, s2FinalizeEndpoint())}), selection, plan)
+	result, err := stager.Finalize(context.Background(), NewPieceSnapshot(piece, []BlockCoverage{s2Coverage(0, 4, s2FinalizeEndpoint())}), selection, plan)
 	if !errors.Is(err, ErrPieceHashMismatch) {
 		t.Fatalf("mismatch error = %v", err)
+	}
+	if result.OutputCommitted {
+		t.Fatal("hash mismatch reported committed output")
 	}
 	if stager.StagedCount() != 0 {
 		t.Fatal("mismatching stage was retained")
@@ -279,14 +282,119 @@ func TestFinalizePreservesStageWhenOutputCloseFails(t *testing.T) {
 		return &closeFailureFile{closeErr: &closeErr, closes: &closes}, nil
 	}
 	defer func() { openOutputFile = previous }()
-	_, err = stager.Finalize(context.Background(), NewPieceSnapshot(piece, []BlockCoverage{s2Coverage(0, int64(len(data)), s2FinalizeEndpoint())}), selection, plan)
+	result, err := stager.Finalize(context.Background(), NewPieceSnapshot(piece, []BlockCoverage{s2Coverage(0, int64(len(data)), s2FinalizeEndpoint())}), selection, plan)
 	if !errors.Is(err, closeErr) {
 		t.Fatalf("close error = %v, want %v", err, closeErr)
+	}
+	if result.OutputCommitted {
+		t.Fatal("output close failure reported committed output")
 	}
 	if !errors.Is(stager.Fatal(), ErrStagingFatal) {
 		t.Fatalf("output close did not become fatal: %v", stager.Fatal())
 	}
 	if stager.StagedCount() != 1 {
 		t.Fatal("stage removed before output close succeeded")
+	}
+}
+
+func TestFinalizeWithNoSelectedBytesDoesNotReportOutputCommit(t *testing.T) {
+	data := []byte("unselected")
+	piece, mapping, plan := s2PlanForPiece(t, data)
+	mapping.Selected = nil
+	stager := NewStager(StagerConfig{CacheRoot: t.TempDir()})
+	if err := stager.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer stager.Close()
+	stage, err := stager.AdmitPiece(piece)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := stage.WriteBlock(0, data); err != nil {
+		t.Fatal(err)
+	}
+	result, err := stager.Finalize(context.Background(), NewPieceSnapshot(piece, []BlockCoverage{s2Coverage(0, int64(len(data)), s2FinalizeEndpoint())}), mapping, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.OutputCommitted {
+		t.Fatal("piece with no selected bytes reported committed output")
+	}
+}
+
+func TestFinalizeReportsCommittedOutputWhenCanceledAfterOutputClose(t *testing.T) {
+	data := []byte("committed before cancel")
+	piece, mapping, plan := s2PlanForPiece(t, data)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	previous := openOutputFile
+	openOutputFile = func(path string, flag int, mode os.FileMode) (outputFile, error) {
+		file, err := os.OpenFile(path, flag, mode)
+		if err != nil {
+			return nil, err
+		}
+		return &s2OutputEventFile{outputFile: file, onClose: cancel}, nil
+	}
+	t.Cleanup(func() { openOutputFile = previous })
+	stager := NewStager(StagerConfig{CacheRoot: t.TempDir()})
+	if err := stager.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer stager.Close()
+	stage, err := stager.AdmitPiece(piece)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := stage.WriteBlock(0, data); err != nil {
+		t.Fatal(err)
+	}
+	result, err := stager.Finalize(ctx, NewPieceSnapshot(piece, []BlockCoverage{s2Coverage(0, int64(len(data)), s2FinalizeEndpoint())}), mapping, plan)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("finalize error = %v, want context cancellation", err)
+	}
+	if !result.OutputCommitted {
+		t.Fatal("successful output close before cancellation was not reported committed")
+	}
+	got, readErr := os.ReadFile(filepath.Join(plan.Root(), "bundle", "file"))
+	if readErr != nil || string(got) != string(data) {
+		t.Fatalf("output = %q, %v; want committed payload", got, readErr)
+	}
+}
+
+func TestFinalizeReportsCommittedOutputWhenStageRemovalFails(t *testing.T) {
+	data := []byte("committed output")
+	piece, mapping, plan := s2PlanForPiece(t, data)
+	stager := NewStager(StagerConfig{CacheRoot: t.TempDir()})
+	if err := stager.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	stage, err := stager.AdmitPiece(piece)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := stage.WriteBlock(0, data); err != nil {
+		t.Fatal(err)
+	}
+	removeErr := errors.New("injected staged removal failure")
+	previous := removeStagedFile
+	removeStagedFile = func(string) error { return removeErr }
+	t.Cleanup(func() { removeStagedFile = previous })
+	result, finalizeErr := stager.Finalize(context.Background(), NewPieceSnapshot(piece, []BlockCoverage{s2Coverage(0, int64(len(data)), s2FinalizeEndpoint())}), mapping, plan)
+	removeStagedFile = previous
+	if !errors.Is(finalizeErr, removeErr) {
+		t.Fatalf("finalize error = %v, want removal error", finalizeErr)
+	}
+	if !result.OutputCommitted {
+		t.Fatal("finalize result did not report committed output")
+	}
+	got, err := os.ReadFile(filepath.Join(plan.Root(), "bundle", "file"))
+	if err != nil || string(got) != string(data) {
+		t.Fatalf("output = %q, %v; want committed payload", got, err)
+	}
+	if err := os.Remove(stage.Path()); err != nil {
+		t.Fatalf("remove leftover stage: %v", err)
+	}
+	if err := stager.Close(); !errors.Is(err, ErrStagingFatal) {
+		t.Fatalf("stager close error = %v, want remembered removal failure", err)
 	}
 }

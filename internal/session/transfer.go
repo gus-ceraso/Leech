@@ -932,7 +932,7 @@ func (t *Transfer) finalizePiece(ctx context.Context, index int) error {
 			Contributors: []storage.Endpoint{{Addr: block.Endpoint.Addr, Port: block.Endpoint.Port}},
 		}
 	}
-	_, err = t.stager.Finalize(ctx, storage.NewPieceSnapshot(snapshot.Piece, coverage), snapshot.Plan, t.output)
+	finalized, err := t.stager.Finalize(ctx, storage.NewPieceSnapshot(snapshot.Piece, coverage), snapshot.Plan, t.output)
 	if err != nil {
 		if errors.Is(err, storage.ErrPieceHashMismatch) {
 			delete(t.stages, index)
@@ -942,14 +942,20 @@ func (t *Transfer) finalizePiece(ctx context.Context, index int) error {
 			}
 			return verifyErr
 		}
-		return err
+	}
+	return t.settleFinalizedPiece(index, snapshot.Piece, finalized, err)
+}
+
+func (t *Transfer) settleFinalizedPiece(index int, piece torrent.Piece, finalized storage.FinalizeResult, finalizeErr error) error {
+	if finalizeErr != nil && !finalized.OutputCommitted {
+		return finalizeErr
 	}
 	delete(t.stages, index)
-	result, err := t.scheduler.VerifyPiece(index, true)
-	if err == nil && t.onPieceVerified != nil {
-		t.onPieceVerified(PieceVerified{PieceIndex: index, PieceBytes: snapshot.Piece.Range.End - snapshot.Piece.Range.Begin, SelectedBytes: result.SelectedBytes})
+	result, verifyErr := t.scheduler.VerifyPiece(index, true)
+	if verifyErr == nil && result.SelectedBytes > 0 && t.onPieceVerified != nil {
+		t.onPieceVerified(PieceVerified{PieceIndex: index, PieceBytes: piece.Range.End - piece.Range.Begin, SelectedBytes: result.SelectedBytes})
 	}
-	return err
+	return errors.Join(finalizeErr, verifyErr)
 }
 
 func (t *Transfer) disconnectPeer(p *transferPeer, cause error) error {

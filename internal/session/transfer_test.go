@@ -168,6 +168,60 @@ func TestTransferLocalTCPSingleFile(t *testing.T) {
 	}
 }
 
+func TestCommittedFinalizeErrorSettlesPieceAndCallsVerifiedOnce(t *testing.T) {
+	data := []byte("payload")
+	selection := schedulerPlan(t,
+		[]torrent.File{regularFile(0, "payload", 0, int64(len(data)))},
+		[]torrent.Piece{piece(0, 0, int64(len(data)))}, nil)
+	scheduler, err := NewScheduler(selection, Config{Shuffle: keepTieOrder})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := scheduler.AddPeer("peer", endpoint(1)); err != nil {
+		t.Fatal(err)
+	}
+	if err := scheduler.SetAvailability("peer", []int{0}); err != nil {
+		t.Fatal(err)
+	}
+	offer, ok, err := scheduler.ReservePiece("peer")
+	if err != nil || !ok {
+		t.Fatalf("reserve = %#v, %v", offer, err)
+	}
+	if err := scheduler.AdmitPiece(offer); err != nil {
+		t.Fatal(err)
+	}
+	requests, err := scheduler.NextRequests("peer", 1)
+	if err != nil || len(requests) != 1 {
+		t.Fatalf("requests = %#v, %v", requests, err)
+	}
+	if _, err := scheduler.AcceptBlock("peer", requests[0].Block); err != nil {
+		t.Fatal(err)
+	}
+	var verified []PieceVerified
+	transfer := &Transfer{
+		scheduler:       scheduler,
+		onPieceVerified: func(piece PieceVerified) { verified = append(verified, piece) },
+	}
+	removeErr := errors.New("staged file removal failed")
+	finalized := storage.FinalizeResult{Piece: piece(0, 0, int64(len(data))), OutputCommitted: true}
+	gotErr := transfer.settleFinalizedPiece(0, finalized.Piece, finalized, removeErr)
+	if !errors.Is(gotErr, removeErr) {
+		t.Fatalf("settlement error = %v, want removal error", gotErr)
+	}
+	if progress := scheduler.Progress(); progress.Verified != int64(len(data)) || !scheduler.IsComplete() {
+		t.Fatalf("scheduler progress = %#v, complete=%v", progress, scheduler.IsComplete())
+	}
+	if len(verified) != 1 || verified[0].SelectedBytes != int64(len(data)) {
+		t.Fatalf("verified callbacks = %#v, want one committed selected piece", verified)
+	}
+	if err := transfer.settleFinalizedPiece(0, finalized.Piece, finalized, removeErr); !errors.Is(err, removeErr) {
+		t.Fatalf("duplicate settlement error = %v, want original removal error", err)
+	}
+	if len(verified) != 1 {
+		t.Fatalf("verified callback count = %d, want one", len(verified))
+	}
+}
+
 func TestTransferReqQPresencePreservesExplicitZero(t *testing.T) {
 	data := []byte("q")
 	selection, err := torrent.Select(singleFileMeta(data), nil, nil)

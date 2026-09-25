@@ -321,9 +321,12 @@ func TestS2OutputWriteFailureIsFatalAndRetainsStage(t *testing.T) {
 	if err := stage.WriteBlock(0, data); err != nil {
 		t.Fatal(err)
 	}
-	_, err = stager.Finalize(context.Background(), NewPieceSnapshot(piece, []BlockCoverage{s2Coverage(0, 4, s2FinalizeEndpoint())}), mapping, plan)
+	result, err := stager.Finalize(context.Background(), NewPieceSnapshot(piece, []BlockCoverage{s2Coverage(0, 4, s2FinalizeEndpoint())}), mapping, plan)
 	if !errors.Is(err, writeErr) {
 		t.Fatalf("output write error = %v", err)
+	}
+	if result.OutputCommitted {
+		t.Fatal("output write failure reported committed output")
 	}
 	if !errors.Is(stager.Fatal(), ErrStagingFatal) {
 		t.Fatalf("output write did not poison stager: %v", stager.Fatal())

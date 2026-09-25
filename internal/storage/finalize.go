@@ -69,6 +69,9 @@ func NewPieceSnapshot(piece torrent.Piece, blocks []BlockCoverage) PieceSnapshot
 type FinalizeResult struct {
 	Piece        torrent.Piece
 	Contributors []Endpoint
+	// OutputCommitted is true when a verified piece's selected bytes were
+	// written and all output handles closed, even if later stage removal fails.
+	OutputCommitted bool
 }
 
 // Finalize verifies one complete staged piece, writes only its selected
@@ -124,13 +127,23 @@ func (s *Stager) Finalize(ctx context.Context, snapshot PieceSnapshot, mapping t
 		}
 		return FinalizeResult{Piece: snapshot.Piece, Contributors: contributors}, writeErr
 	}
+	outputCommitted := hasSelectedBytes(mapping.Selected)
 	if err := ctx.Err(); err != nil {
-		return FinalizeResult{Piece: snapshot.Piece, Contributors: contributors}, err
+		return FinalizeResult{Piece: snapshot.Piece, Contributors: contributors, OutputCommitted: outputCommitted}, err
 	}
 	if err := stage.abort(); err != nil {
-		return FinalizeResult{Piece: snapshot.Piece, Contributors: contributors}, err
+		return FinalizeResult{Piece: snapshot.Piece, Contributors: contributors, OutputCommitted: outputCommitted}, err
 	}
-	return FinalizeResult{Piece: snapshot.Piece, Contributors: contributors}, nil
+	return FinalizeResult{Piece: snapshot.Piece, Contributors: contributors, OutputCommitted: outputCommitted}, nil
+}
+
+func hasSelectedBytes(selected []torrent.FileRange) bool {
+	for _, span := range selected {
+		if span.Range.End > span.Range.Begin {
+			return true
+		}
+	}
+	return false
 }
 
 // Verify checks a staged piece without touching output. It is useful for a
