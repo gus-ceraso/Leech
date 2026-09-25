@@ -2,11 +2,14 @@ package peer
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"net"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/gus-ceraso/Leech/internal/limits"
 )
 
 func TestConnectionWorkerClosesWhenEventQueueIsBlocked(t *testing.T) {
@@ -140,4 +143,62 @@ func TestConnectionWorkerReportsFastFrameAndJoins(t *testing.T) {
 		t.Fatalf("Close = %v", err)
 	}
 	_ = remote.Close()
+}
+
+func TestPeerEventRetentionBoundAcrossActivePeers(t *testing.T) {
+	const maxBitfieldBytes = (limits.Pieces + 7) / 8
+	bitfield := make([]byte, 4+1+maxBitfieldBytes)
+	binary.BigEndian.PutUint32(bitfield[:4], uint32(1+maxBitfieldBytes))
+	bitfield[4] = BitfieldID
+
+	workers := make([]*ConnectionWorker, 0, limits.ActivePeers)
+	for peerIndex := 0; peerIndex < limits.ActivePeers; peerIndex++ {
+		local, remote := net.Pipe()
+		worker, err := NewConnectionWorkerWithCaps(local, ReadOptions{
+			PieceCount:      limits.Pieces,
+			ValidateIndices: true,
+		}, 1, maxPeerEventQueue)
+		if err != nil {
+			t.Fatal(err)
+		}
+		workers = append(workers, worker)
+		worker.Start(context.Background())
+		for eventIndex := 0; eventIndex < maxPeerEventQueue; eventIndex++ {
+			if n, err := remote.Write(bitfield); err != nil || n != len(bitfield) {
+				t.Fatalf("peer %d frame %d wrote %d/%d bytes: %v", peerIndex, eventIndex, n, len(bitfield), err)
+			}
+		}
+		_ = remote.Close()
+	}
+
+	var retained int64
+	for peerIndex, worker := range workers {
+		<-worker.done
+		for event := range worker.Events() {
+			if event.Err == nil {
+				retained += int64(len(event.Message.Payload))
+			}
+		}
+		_ = worker.Close()
+		_ = worker.conn.Close()
+		if cap(worker.events) != maxPeerEventQueue {
+			t.Fatalf("peer %d event capacity = %d, want %d", peerIndex, cap(worker.events), maxPeerEventQueue)
+		}
+	}
+	want := int64(limits.ActivePeers) * maxPeerEventQueue * maxBitfieldBytes
+	if retained != want {
+		t.Fatalf("queued payload bytes = %d, want maximum %d", retained, want)
+	}
+	if retained > 64<<20 {
+		t.Fatalf("queued payload retention = %d bytes, exceeds 64 MiB", retained)
+	}
+}
+
+func TestWorkerEventQueueRejectsExcessCapacity(t *testing.T) {
+	local, remote := net.Pipe()
+	defer remote.Close()
+	if _, err := NewConnectionWorkerWithCaps(local, ReadOptions{}, 1, maxPeerEventQueue+1); !errors.Is(err, ErrWorkerConfig) {
+		t.Fatalf("excess event capacity error = %v", err)
+	}
+	_ = local.Close()
 }

@@ -16,6 +16,11 @@ var (
 	ErrWorkerConfig    = errors.New("invalid peer connection worker configuration")
 )
 
+// A queued event owns its decoded payload until the coordinator receives it.
+// Four queued messages leave room for ordinary peer bursts while placing a
+// fixed bound on payload retention across the 64 supported connections.
+const maxPeerEventQueue = 4
+
 // PeerEvent is the only output produced by a connection worker. The worker
 // never mutates PeerState; a coordinator consumes Message events and applies
 // them in its own goroutine.
@@ -50,12 +55,12 @@ type ConnectionWorker struct {
 // NewConnectionWorker creates a worker with supported queue bounds. Start or
 // SendContext starts it; construction itself does not create goroutines.
 func NewConnectionWorker(conn net.Conn, options ReadOptions) *ConnectionWorker {
-	worker, _ := NewConnectionWorkerWithCaps(conn, options, limits.PeerCommands, limits.PeerCommands)
+	worker, _ := NewConnectionWorkerWithCaps(conn, options, limits.PeerCommands, maxPeerEventQueue)
 	return worker
 }
 
 func NewConnectionWorkerWithCaps(conn net.Conn, options ReadOptions, commandCap, eventCap int) (*ConnectionWorker, error) {
-	if conn == nil || commandCap < 1 || commandCap > limits.PeerCommands || eventCap < 1 || eventCap > limits.PeerCommands {
+	if conn == nil || commandCap < 1 || commandCap > limits.PeerCommands || eventCap < 1 || eventCap > maxPeerEventQueue {
 		return nil, ErrWorkerConfig
 	}
 	return &ConnectionWorker{

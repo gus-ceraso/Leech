@@ -154,6 +154,9 @@ type ReadOptions struct {
 	ValidateIndices bool
 	PieceLength     uint32
 	LastPieceLength uint32
+	// MetadataExtensionID is the local ut_metadata ID advertised for this
+	// connection. Zero selects Leech's standard ID 1.
+	MetadataExtensionID byte
 }
 
 // MessageOptions is retained as a descriptive alias for callers that prefer
@@ -257,18 +260,58 @@ func readMessage(conn net.Conn, opts ReadOptions, enforceFast bool) (Message, er
 			return Message{}, err
 		}
 		return Message{ID: id[0], Payload: payload}, nil
+	case ExtendedID:
+		return readExtendedPayload(conn, payloadLength, opts)
 	default:
-		// Unknown IDs are ignored by higher layers when their frame is bounded
-		// and well framed. Retaining their payload keeps stream alignment.
-		payload, err := readPayload(conn, payloadLength)
-		if err != nil {
+		// Unknown core IDs are ignored, but their bounded payload need not live
+		// in the event queue. Drain it with a fixed-size copy buffer to preserve
+		// framing without allocating in proportion to an untrusted frame.
+		if err := discardPayload(conn, payloadLength); err != nil {
 			return Message{}, err
 		}
-		if err := validateMessagePayload(id[0], payload, opts); err != nil {
-			return Message{}, err
-		}
-		return Message{ID: id[0], Payload: payload}, nil
+		return Message{ID: id[0]}, nil
 	}
+}
+
+func readExtendedPayload(conn net.Conn, payloadLength int, opts ReadOptions) (Message, error) {
+	if payloadLength == 0 {
+		return Message{}, protocolError("read extension", "extended message has no extension ID")
+	}
+	var extensionID [1]byte
+	if _, err := io.ReadFull(conn, extensionID[:]); err != nil {
+		return Message{}, disconnectError("read extension ID", err)
+	}
+	bodyLength := payloadLength - 1
+	maxBody := 0
+	switch extensionID[0] {
+	case ExtensionHandshakeID:
+		maxBody = maxExtensionHandshakeBytes
+	case metadataExtensionID(opts):
+		maxBody = maxMetadataHeaderBytes + limits.BlockBytes
+	default:
+		// Unknown extension messages are forward-compatible and ignored. Keep
+		// only the ID needed by ExtensionState to report that they were ignored.
+		if err := discardPayload(conn, bodyLength); err != nil {
+			return Message{}, err
+		}
+		return Message{ID: ExtendedID, Payload: extensionID[:]}, nil
+	}
+	if bodyLength > maxBody {
+		return Message{}, protocolError("read extension", fmt.Sprintf("extension ID %d payload length %d exceeds %d bytes", extensionID[0], bodyLength, maxBody))
+	}
+	payload := make([]byte, payloadLength)
+	payload[0] = extensionID[0]
+	if _, err := io.ReadFull(conn, payload[1:]); err != nil {
+		return Message{}, disconnectError("read extension payload", err)
+	}
+	return Message{ID: ExtendedID, Payload: payload}, nil
+}
+
+func metadataExtensionID(opts ReadOptions) byte {
+	if opts.MetadataExtensionID == ExtensionHandshakeID {
+		return defaultUtMetadataID
+	}
+	return opts.MetadataExtensionID
 }
 
 func readPayload(conn net.Conn, n int) ([]byte, error) {
@@ -280,6 +323,16 @@ func readPayload(conn net.Conn, n int) ([]byte, error) {
 		return nil, disconnectError("read frame payload", err)
 	}
 	return payload, nil
+}
+
+func discardPayload(conn net.Conn, n int) error {
+	if n == 0 {
+		return nil
+	}
+	if _, err := io.CopyN(io.Discard, conn, int64(n)); err != nil {
+		return disconnectError("discard frame payload", err)
+	}
+	return nil
 }
 
 func fixedPayloadLength(id byte) (int, bool) {
@@ -372,6 +425,10 @@ func validatePieceRange(index, begin, length uint32, opts ReadOptions) error {
 }
 
 func validateBitfieldLength(n int, opts ReadOptions) error {
+	max := (uint64(limits.Pieces) + 7) / 8
+	if uint64(n) > max {
+		return protocolError("validate bitfield", fmt.Sprintf("bitfield length %d exceeds supported maximum %d", n, max))
+	}
 	if !opts.ValidateIndices {
 		return nil
 	}

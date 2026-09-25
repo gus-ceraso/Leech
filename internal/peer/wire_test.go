@@ -141,10 +141,92 @@ func TestFrameErrorsAndUnknownIDs(t *testing.T) {
 		t.Fatalf("truncated frame error = %v", err)
 	}
 	unknown := []byte{0, 0, 0, 3, 0x12, 0xaa, 0xbb}
-	message, err := ReadMessage(newChunkConn(unknown, 1))
-	if err != nil || message.ID != 0x12 || !bytes.Equal(message.Payload, []byte{0xaa, 0xbb}) {
+	unknown = append(unknown, 0, 0, 0, 1, ChokeID)
+	conn := newChunkConn(unknown, 1)
+	message, err := ReadMessage(conn)
+	if err != nil || message.ID != 0x12 || len(message.Payload) != 0 {
 		t.Fatalf("unknown frame = %#v, err %v", message, err)
 	}
+	message, err = ReadMessage(conn)
+	if err != nil || message.ID != ChokeID || len(message.Payload) != 0 {
+		t.Fatalf("frame following unknown ID = %#v, err %v", message, err)
+	}
+}
+
+func TestUnknownCorePayloadIsDrainedWithoutRetention(t *testing.T) {
+	payload := bytes.Repeat([]byte{0xa5}, MaxPeerFrameBytes-1)
+	wire := make([]byte, 4+1+len(payload)+5)
+	binary.BigEndian.PutUint32(wire[:4], uint32(1+len(payload)))
+	wire[4] = 0x12
+	copy(wire[5:], payload)
+	copy(wire[5+len(payload):], []byte{0, 0, 0, 1, ChokeID})
+	conn := newChunkConn(wire, 4096)
+	message, err := ReadMessage(conn)
+	if err != nil || message.ID != 0x12 || len(message.Payload) != 0 {
+		t.Fatalf("large unknown frame = %#v, err %v", message, err)
+	}
+	message, err = ReadMessage(conn)
+	if err != nil || message.ID != ChokeID {
+		t.Fatalf("frame following large unknown ID = %#v, err %v", message, err)
+	}
+}
+
+func TestExtendedMetadataDataRemainsAvailable(t *testing.T) {
+	block := bytes.Repeat([]byte{0x5a}, limits.BlockBytes)
+	body := metadataBody(t, MetadataData, 0, limits.BlockBytes, block)
+	for _, extensionID := range []byte{1, 6} {
+		wire := extensionFrame(extensionID, body)
+		message, err := ReadMessageWithOptions(newChunkConn(wire, 7), ReadOptions{MetadataExtensionID: extensionID})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if message.ID != ExtendedID || len(message.Payload) != len(body)+1 || message.Payload[0] != extensionID {
+			t.Fatalf("extended metadata frame = id %d, payload length %d", message.ID, len(message.Payload))
+		}
+		parsed, err := ParseMetadataData(message.Payload[1:], limits.BlockBytes)
+		if err != nil || !bytes.Equal(parsed.Block, block) {
+			t.Fatalf("parsed metadata block length %d, err %v", len(parsed.Block), err)
+		}
+	}
+}
+
+func TestExtendedHandshakeRemainsAvailable(t *testing.T) {
+	body := extensionHandshakeBody(t, map[string]int64{"ut_metadata": 9}, 32769)
+	message, err := ReadMessage(newChunkConn(extensionFrame(ExtensionHandshakeID, body), 3))
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := NewExtensionState()
+	if _, err := state.ApplyMessage(message); err != nil {
+		t.Fatal(err)
+	}
+	if id, ok := state.RemoteExtensionID(UtMetadataExtension); !ok || id != 9 {
+		t.Fatalf("remote ut_metadata ID = %d, enabled %t", id, ok)
+	}
+}
+
+func TestUnknownExtendedPayloadIsDrainedWithoutRetention(t *testing.T) {
+	body := bytes.Repeat([]byte{0x7b}, MaxPeerFrameBytes-2)
+	wire := extensionFrame(99, body)
+	wire = append(wire, 0, 0, 0, 1, ChokeID)
+	conn := newChunkConn(wire, 4096)
+	message, err := ReadMessage(conn)
+	if err != nil || message.ID != ExtendedID || !bytes.Equal(message.Payload, []byte{99}) {
+		t.Fatalf("unknown extension = %#v, err %v", message, err)
+	}
+	message, err = ReadMessage(conn)
+	if err != nil || message.ID != ChokeID {
+		t.Fatalf("frame following unknown extension = %#v, err %v", message, err)
+	}
+}
+
+func extensionFrame(extensionID byte, body []byte) []byte {
+	wire := make([]byte, 6+len(body))
+	binary.BigEndian.PutUint32(wire[:4], uint32(2+len(body)))
+	wire[4] = ExtendedID
+	wire[5] = extensionID
+	copy(wire[6:], body)
+	return wire
 }
 
 func TestPieceBlockBoundIsCheckedBeforeAllocation(t *testing.T) {
