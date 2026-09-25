@@ -23,7 +23,8 @@ finished CLI's promised behavior.
 - **Workers:** GPT-6 Luna, `high`, one worker per task ID. A task includes its
   implementation, focused tests, and fixes. Its checkboxes are subtasks for that
   worker, not separate agent assignments.
-- **Reviewers:** GPT-6 Luna, `max`, one separate reviewer per group, R1–R5.
+- **Reviewers:** GPT-6 Luna, `max`, one separate reviewer per group, R1–R5
+  for the original implementation and R6 for the robustness follow-up.
   Review the integrated group once; return fixes to the responsible workers and
   recheck affected areas. No reviewer for every small task or additional review
   hierarchy. The orchestrator accepts the small A0 bootstrap directly.
@@ -109,7 +110,7 @@ while the first TCP transfer is assembled.
 | 2: TCP transfer | Verified selected bytes from a local TCP fixture reach final files | S1, S2, P1, P2, D1, D2, plus their dependencies |
 | 3: Metadata | Local tracker-driven metadata acquisition stops cleanly before returning metadata | T1–T3, P2, P3, M1, M2, plus their dependencies |
 | 4: uTP | Outgoing uTP stream survives deterministic loss and reordering | U1–U4 |
-| 5: Complete CLI | Complete CLI passes the local acceptance suite | All tasks and R1–R5 |
+| 5: Complete CLI | Complete CLI passes the local acceptance suite | A0–V1 and R1–R5 |
 
 Milestone 2 is an integration test of the transfer path, not a claim that the
 public CLI already supports discovery. Milestone 3 uses injected dialers until
@@ -906,7 +907,7 @@ required invariant. Style preferences and speculative performance improvements
 are advisory. The orchestrator resolves findings; do not add another reviewer
 merely because there is a disagreement.
 
-Before marking the implementation complete:
+Before marking the original implementation complete:
 
 - [x] All task checkboxes and R1–R5 are complete; any breaking change has explicit
   user approval and a matching design update. Development subsets are not
@@ -920,3 +921,94 @@ Before marking the implementation complete:
   the final tree; repeat only after relevant changes or failures.
 - [x] Validation has used no existing BitTorrent clients or live trackers. State
   that limit in the completion report rather than implying tested compatibility.
+
+## Post-completion robustness testing
+
+The checked gates above record completion of the original implementation. These
+new tasks strengthen independent evidence and interactions without changing the
+supported behavior. Reuse the current local fixtures and test seams. Do not add
+a Cartesian product, a second generic simulator, a coverage-percentage target,
+or tests against live trackers or existing clients. Keep expected bytes and
+outcomes independent of Leech's encoders and implementation where practical.
+
+### H1. Independent vectors and useful fuzz seeds
+
+**Depends on:** V1. **Owns:** parser, peer-wire, and uTP send tests in their
+existing packages. **References:** DESIGN §§7, 11–14, 19; libtorrent's
+[semantic fuzz corpus](https://github.com/arvidn/libtorrent/blob/6da363d2994f17c0b3c0450d124cf73a31a73847/fuzzers/tools/generate_initial_corpus.py#L47-L213)
+and Transmission's
+[fixed-hash metainfo tests](https://github.com/transmission/transmission/blob/48835c6660a7a3730b5a122bb7b88909997addbe/tests/libtransmission/torrent-metainfo-test.cc#L214-L294).
+
+- [ ] Add a literal canonical v1 `info` golden, independent of Leech's bencoder:
+  one-byte payload `A`, piece hash
+  `6dcd4ce23d88e2ee9568ba546c007c63d9131c1b`, and exact info hash
+  `1db2e0a5d96e3ef52f804b928b28a19f90e3f92e`. Derive small mutations
+  for duplicate or unordered keys, wrong piece count, and an unsafe path;
+  assert parser rejection, then use one representative invalid fixture to
+  check that the CLI creates no output or cache and starts no network work.
+- [ ] Add `so=2-4&so=1` as a repeated-parameter magnet vector; assert the
+  union selects original file indices 1–4 after metadata acquisition. Seed
+  valid Fast and BEP 10 wire frames, including Bitfield, Allowed Fast, and
+  Have None, and assert their state transitions and bounded parsing.
+- [ ] Make `FuzzSendStateBounded` use its `initial` sequence argument; its
+  current `65535` seed never exercises send-side wrap. Seed `FuzzReadHandshake`
+  with a valid handshake and `FuzzReadMessage` with valid Fast and BEP 10
+  frames. Add useful compact and dictionary peer responses to tracker fuzz
+  seeds. Keep minimized failures as named regression inputs.
+
+**Acceptance:** literal vectors have independently known results, valid seeds
+reach the intended parser or state path, and fuzz assertions check safety and
+protocol invariants rather than merely avoiding a panic. Preserve Leech's strict
+rejection rules where the upstream clients accept or repair malformed input.
+
+### H2. Cross-boundary local sessions
+
+**Depends on:** V1. **Owns:** complete-session tests in `internal/cli/` and
+`internal/session/`. **References:** DESIGN §§8–13, 15, 19; Transmission's
+[file-to-piece cases](https://github.com/transmission/transmission/blob/48835c6660a7a3730b5a122bb7b88909997addbe/tests/libtransmission/file-piece-map-test.cc#L21-L131).
+
+- [ ] Test a four-byte piece spanning selected `A="AB"` and unselected
+  `B="CD"`, with existing `A="AB"` under `--resume`. Request the full piece,
+  verify it, write only `A`, create no `B`, and finish with whole-torrent
+  `left=2` and `stopped` but no `completed`.
+- [ ] In separate scripted sessions, reassign an outstanding block after a
+  peer disconnects, and recover from a piece whose blocks came from two bad
+  endpoints. Assert strikes by resolved endpoint, a later clean piece, final
+  bytes, no upload, and joined connections.
+- [ ] Inject an output-close or staged-read error after tracker `started` was
+  transmitted. Assert the error remains primary, `stopped` is attempted under
+  its deadline, `completed` is absent, the current workspace is removed, and
+  network workers join. Include one mixed-tracker shutdown trace only if it
+  reveals ordering not already proved by the tracker and metadata tests.
+
+**Acceptance:** each new session proves an interaction that component tests
+cannot; assertions include outbound wire and tracker traces, filesystem state,
+and worker lifetime. Reuse the existing fixture seams.
+
+### H3. Address-family smoke test and fixture reliability
+
+**Depends on:** H2, to avoid simultaneous ownership of CLI fixtures.
+**Owns:** `internal/cli/v1_utp_test.go`, the existing UDP wire fixture in
+`internal/cli/v1_test.go`, and focused uTP tests as needed.
+
+- [ ] Complete one real IPv6 uTP loopback transfer through a BEP 3 handshake,
+  with a scripted TCP loser and outbound no-upload assertions. Keep the
+  existing deterministic uTP loss, reordering, SACK, and wrap tests; this
+  test covers the `utp6` socket and address-family path only.
+- [ ] Remove the timing dependence behind the observed intermittent
+  `TestV1UDPTrackerWirePathCompletesCLITransfer` fixture-join failure. Use a
+  deterministic barrier or explicit event trace so the test knows whether
+  `started` was transmitted before requiring `stopped`. Do not mask the race
+  by increasing sleeps or deadlines. Repeat the focused test under `-race`.
+
+### R6. Robustness-test review and validation
+
+**Depends on:** H1–H3. One reviewer checks that each new test has an
+independent expected result, exercises its claimed path, and would detect the
+intended failure. Avoid duplicate cases and tests that mirror implementation.
+
+- [ ] Resolve R6 findings, then run `go test ./...`, `go test -race ./...`,
+  `go vet ./...`, and a pure-Go build on the integrated tree. Replay all fuzz
+  seeds and run bounded fuzz campaigns for changed parsers and state machines.
+  Keep every minimized regression. Use local deterministic peers and trackers
+  throughout; report the absence of external interoperability testing.
