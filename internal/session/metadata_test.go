@@ -572,7 +572,7 @@ func serveMetadataPeer(t *testing.T, conn net.Conn, infoHash torrent.InfoHash, m
 		return
 	}
 	for {
-		message, err := peer.ReadMessage(conn)
+		message, err := readMetadataPeerMessage(conn, 7)
 		if err != nil {
 			return
 		}
@@ -600,6 +600,10 @@ func serveMetadataPeer(t *testing.T, conn net.Conn, infoHash torrent.InfoHash, m
 	}
 }
 
+func readMetadataPeerMessage(conn net.Conn, remoteID byte) (peer.Message, error) {
+	return peer.ReadMessageWithOptions(conn, peer.ReadOptions{MetadataExtensionID: remoteID})
+}
+
 func serveRefusingMetadataPeer(t *testing.T, conn net.Conn, infoHash torrent.InfoHash) {
 	t.Helper()
 	defer conn.Close()
@@ -616,7 +620,7 @@ func serveRefusingMetadataPeer(t *testing.T, conn net.Conn, infoHash torrent.Inf
 	if err := writeTestFrame(conn, extensionHandshakeFrame(7, 1)); err != nil {
 		return
 	}
-	_, _ = peer.ReadMessage(conn)
+	_, _ = readMetadataPeerMessage(conn, 7)
 	_ = writeTestFrame(conn, metadataControlFrame(7, peer.MetadataReject, 0))
 }
 
@@ -638,7 +642,7 @@ func serveWrongSizeMetadataPeer(t *testing.T, conn net.Conn, infoHash torrent.In
 	if err := writeTestFrame(conn, extensionHandshakeFrame(7, wrongSize)); err != nil {
 		return
 	}
-	request, err := peer.ReadMessage(conn)
+	request, err := readMetadataPeerMessage(conn, 7)
 	if err != nil || request.ID != peer.ExtendedID || len(request.Payload) == 0 {
 		return
 	}
@@ -648,7 +652,7 @@ func serveWrongSizeMetadataPeer(t *testing.T, conn net.Conn, infoHash torrent.In
 	}
 	// The advertised size is wrong, but the first block is otherwise valid.
 	// A second supplier must restart at piece zero instead of combining blocks.
-	_ = writeTestFrame(conn, metadataDataFrame(7, 0, wrongSize, metadata[:16<<10]))
+	_ = writeTestFrame(conn, metadataDataFrame(1, 0, wrongSize, metadata[:16<<10]))
 }
 
 func serveMetadataPeerWithCoreRequest(t *testing.T, conn net.Conn, infoHash torrent.InfoHash, metadata []byte, result chan string) {
@@ -684,7 +688,7 @@ func serveMetadataPeerWithCoreRequest(t *testing.T, conn net.Conn, infoHash torr
 		result <- "write extension handshake failed"
 		return
 	}
-	request, err := peer.ReadMessage(conn)
+	request, err := readMetadataPeerMessage(conn, 7)
 	if err != nil || request.ID != peer.ExtendedID || len(request.Payload) == 0 {
 		t.Logf("payload fixture: read metadata request: message=%+v err=%v", request, err)
 		result <- "read metadata request failed"
@@ -734,8 +738,9 @@ func serveMetadataPeerWithIDChange(t *testing.T, conn net.Conn, infoHash torrent
 	if err := writeTestFrame(conn, extensionHandshakeFrame(7, total)); err != nil {
 		return
 	}
+	remoteMetadataID := byte(7)
 	for piece := uint32(0); ; piece++ {
-		message, err := peer.ReadMessage(conn)
+		message, err := readMetadataPeerMessage(conn, remoteMetadataID)
 		if err != nil || message.ID != peer.ExtendedID || len(message.Payload) == 0 {
 			return
 		}
@@ -747,6 +752,7 @@ func serveMetadataPeerWithIDChange(t *testing.T, conn net.Conn, infoHash torrent
 			if err := writeTestFrame(conn, extensionHandshakeFrame(9, total)); err != nil {
 				return
 			}
+			remoteMetadataID = 9
 		}
 		begin := int(piece) * 16 << 10
 		end := begin + 16<<10
@@ -798,7 +804,7 @@ func serveNoUploadMetadataPeer(t *testing.T, conn net.Conn, infoHash torrent.Inf
 		result <- false
 		return
 	}
-	message, err := peer.ReadMessage(conn)
+	message, err := readMetadataPeerMessage(conn, 7)
 	if err != nil || message.ID != peer.ExtendedID || len(message.Payload) == 0 {
 		result <- false
 		return
@@ -812,7 +818,7 @@ func serveNoUploadMetadataPeer(t *testing.T, conn net.Conn, infoHash torrent.Inf
 		result <- false
 		return
 	}
-	message, err = peer.ReadMessage(conn)
+	message, err = readMetadataPeerMessage(conn, 7)
 	if err != nil || message.ID != peer.ExtendedID || len(message.Payload) == 0 {
 		result <- false
 		return
