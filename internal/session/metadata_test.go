@@ -148,6 +148,57 @@ func TestMetadataDiscoveryObtainsAllBlocksAndFinalizesPhase(t *testing.T) {
 	var dialCount int
 	fixture := &metadataFixtureTracker{}
 	fixture.port = 51413
+	identity := tracker.Identity{PeerID: [20]byte{1}, Port: 49152}
+	updates := make(chan tracker.Update, 64)
+	startedTrackers := make(map[string]struct{}, 2)
+	var startedMu sync.Mutex
+	bothStarted := make(chan struct{})
+	trackerSet, err := tracker.NewTrackerSet(tracker.TrackerSetConfig{
+		InfoHash: [20]byte(expected),
+		Trackers: []string{torrent.DefaultTracker, "http://fixture.test/announce"},
+		Identity: identity,
+		HTTP:     fixture,
+		OnUpdate: func(update tracker.Update) {
+			select {
+			case updates <- update:
+			default:
+				t.Errorf("metadata tracker update queue is full")
+			}
+			if update.Phase != tracker.MetadataPhase || update.Request.Event != tracker.EventStarted || !update.Transmitted {
+				return
+			}
+			startedMu.Lock()
+			if _, seen := startedTrackers[update.Tracker]; !seen {
+				startedTrackers[update.Tracker] = struct{}{}
+				if len(startedTrackers) == 2 {
+					close(bothStarted)
+				}
+			}
+			startedMu.Unlock()
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewTrackerSet: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	t.Cleanup(func() {
+		cancel()
+		closeCtx, closeCancel := context.WithTimeout(context.Background(), time.Second)
+		defer closeCancel()
+		if err := trackerSet.Close(closeCtx); err != nil {
+			t.Errorf("close tracker set: %v", err)
+		}
+		dialMu.Lock()
+		dialed := dialCount != 0
+		dialMu.Unlock()
+		if dialed {
+			select {
+			case <-serverDone:
+			case <-closeCtx.Done():
+				t.Errorf("metadata peer fixture did not join: %v", closeCtx.Err())
+			}
+		}
+	})
 	dial := func(ctx context.Context, _ string, _ string) (net.Conn, error) {
 		select {
 		case <-ctx.Done():
@@ -158,17 +209,25 @@ func TestMetadataDiscoveryObtainsAllBlocksAndFinalizesPhase(t *testing.T) {
 		dialMu.Lock()
 		dialCount++
 		dialMu.Unlock()
-		go serveMetadataPeer(t, server, expected, info, serverDone)
+		go func() {
+			defer close(serverDone)
+			select {
+			case <-bothStarted:
+				serveMetadataPeer(t, server, expected, info, make(chan struct{}))
+			case <-ctx.Done():
+				_ = server.Close()
+			}
+		}()
 		return client, nil
 	}
 
-	result, err := DiscoverMetadata(context.Background(), MetadataConfig{
+	result, err := DiscoverMetadata(ctx, MetadataConfig{
 		InfoHash:    expected,
-		Trackers:    []string{"http://fixture.test/announce"},
-		HTTP:        fixture,
+		TrackerSet:  trackerSet,
+		Updates:     updates,
 		TCPDial:     dial,
 		PeerTimeout: time.Second,
-		Identity:    tracker.Identity{PeerID: [20]byte{1}, Port: 49152},
+		Identity:    identity,
 	})
 	if err != nil {
 		t.Fatalf("DiscoverMetadata: %v", err)
@@ -189,6 +248,12 @@ func TestMetadataDiscoveryObtainsAllBlocksAndFinalizesPhase(t *testing.T) {
 		t.Fatalf("dial count = %d, want one deduplicated endpoint", dialCount)
 	}
 	dialMu.Unlock()
+	startedMu.Lock()
+	startedCount := len(startedTrackers)
+	startedMu.Unlock()
+	if startedCount != 2 {
+		t.Fatalf("transmitted metadata started updates = %d, want both trackers", startedCount)
+	}
 
 	requests := fixture.snapshot()
 	if len(requests) < 4 {
