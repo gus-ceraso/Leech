@@ -490,7 +490,7 @@ func (s *Scheduler) ReservePiece(peerID string) (PieceOffer, bool, error) {
 	if s.staged+s.reserved >= s.cfg.MaxStagedPieces {
 		return PieceOffer{}, false, nil
 	}
-	index, ok, err := s.choosePiece(p, peerID, false, false)
+	index, ok, err := s.choosePiece(p, peerID, false, false, nil)
 	if err != nil || !ok {
 		return PieceOffer{}, false, err
 	}
@@ -557,6 +557,14 @@ func (s *Scheduler) RejectPiece(offer PieceOffer) error {
 // each block one assignment; after endgame is entered, an eligible peer may
 // receive a duplicate assignment within the same bounded request budgets.
 func (s *Scheduler) NextRequests(peerID string, max int) ([]Request, error) {
+	return s.nextRequestsExcluding(peerID, max, nil)
+}
+
+// nextRequestsExcluding assigns requests while avoiding tuples for which this
+// peer still owes a terminal response. A timed-out Fast request may be
+// reassigned to another peer, but its tuple cannot be reused on the same
+// connection until the exact late terminal is consumed.
+func (s *Scheduler) nextRequestsExcluding(peerID string, max int, excluded map[peer.Block]struct{}) ([]Request, error) {
 	p, ok := s.peers[peerID]
 	if !ok {
 		return nil, ErrUnknownPeer
@@ -583,7 +591,7 @@ func (s *Scheduler) NextRequests(peerID string, max int) ([]Request, error) {
 	requests := make([]Request, 0, remaining)
 	endgame := s.endgameReady()
 	for len(requests) < remaining {
-		index, found, err := s.choosePiece(p, peerID, true, endgame)
+		index, found, err := s.choosePiece(p, peerID, true, endgame, excluded)
 		if err != nil {
 			return nil, err
 		}
@@ -592,7 +600,7 @@ func (s *Scheduler) NextRequests(peerID string, max int) ([]Request, error) {
 		}
 		piece := s.pieces[index]
 		for len(requests) < remaining {
-			blockIndex := firstAssignableBlock(piece, peerID, endgame)
+			blockIndex := firstAssignableBlock(piece, peerID, endgame, excluded)
 			if blockIndex < 0 {
 				break
 			}
@@ -637,7 +645,7 @@ func (s *Scheduler) endgameReady() bool {
 	return remaining
 }
 
-func (s *Scheduler) choosePiece(p *schedulerPeer, peerID string, admittedOnly, endgame bool) (int, bool, error) {
+func (s *Scheduler) choosePiece(p *schedulerPeer, peerID string, admittedOnly, endgame bool, excluded map[peer.Block]struct{}) (int, bool, error) {
 	bestRarity := int(^uint(0) >> 1)
 	bestIndex := int(^uint(0) >> 1)
 	candidates := make([]int, 0)
@@ -654,10 +662,10 @@ func (s *Scheduler) choosePiece(p *schedulerPeer, peerID string, admittedOnly, e
 			continue
 		}
 		if endgame {
-			if !hasAssignableBlock(piece, peerID, true) {
+			if !hasAssignableBlock(piece, peerID, true, excluded) {
 				continue
 			}
-		} else if pendingBlocks(piece) == 0 {
+		} else if pendingBlocksExcluding(piece, excluded) == 0 {
 			continue
 		}
 		rarity := s.rarity(index)
@@ -718,20 +726,24 @@ func clearBit(words []uint64, index int) {
 	}
 }
 
-func pendingBlocks(piece *pieceState) int {
+func pendingBlocksExcluding(piece *pieceState, excluded map[peer.Block]struct{}) int {
 	n := 0
 	for _, block := range piece.blocks {
-		if !block.done && !block.active {
+		if !block.done && !block.active && !blockExcluded(excluded, block.block) {
 			n++
 		}
 	}
 	return n
 }
 
-func firstAssignableBlock(piece *pieceState, peerID string, endgame bool) int {
+func pendingBlocks(piece *pieceState) int {
+	return pendingBlocksExcluding(piece, nil)
+}
+
+func firstAssignableBlock(piece *pieceState, peerID string, endgame bool, excluded map[peer.Block]struct{}) int {
 	for i := range piece.blocks {
 		block := &piece.blocks[i]
-		if block.done {
+		if block.done || blockExcluded(excluded, block.block) {
 			continue
 		}
 		if !endgame {
@@ -747,10 +759,10 @@ func firstAssignableBlock(piece *pieceState, peerID string, endgame bool) int {
 	return -1
 }
 
-func hasAssignableBlock(piece *pieceState, peerID string, endgame bool) bool {
+func hasAssignableBlock(piece *pieceState, peerID string, endgame bool, excluded map[peer.Block]struct{}) bool {
 	for i := range piece.blocks {
 		block := &piece.blocks[i]
-		if block.done {
+		if block.done || blockExcluded(excluded, block.block) {
 			continue
 		}
 		if !endgame && block.active {
@@ -762,6 +774,11 @@ func hasAssignableBlock(piece *pieceState, peerID string, endgame bool) bool {
 		return true
 	}
 	return false
+}
+
+func blockExcluded(excluded map[peer.Block]struct{}, block peer.Block) bool {
+	_, ok := excluded[block]
+	return ok
 }
 
 func assignBlock(block *blockState, peerID string, endpoint peer.Endpoint) {

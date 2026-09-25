@@ -99,7 +99,7 @@ type TransferConfig struct {
 	// BeforePeerShutdown runs once after scheduling stops and before workers
 	// and the staging workspace are cleaned up. A prior Run error wins.
 	BeforePeerShutdown func() error
-	// Now is a deterministic clock seam for peer replacement tests.
+	// Now is a deterministic clock seam for request timeout and peer replacement tests.
 	Now func() time.Time
 }
 
@@ -131,20 +131,20 @@ type transferPeer struct {
 	input      ConnectedPeer
 	worker     *peer.ConnectionWorker
 	state      *peer.PeerState
-	active     map[peer.Block]struct{}
+	active     map[peer.Block]time.Time
+	tombstoned map[peer.Block]struct{}
 	done       bool
 	removed    bool
-	startedAt  time.Time
 	lastUseful time.Time
-	productive bool
 	released   bool
 }
 
 const (
-	peerInitialGrace = 30 * time.Second
-	peerIdleLimit    = 60 * time.Second
-	peerAcquireBase  = 100 * time.Millisecond
-	peerAcquireMax   = 5 * time.Second
+	peerRequestTimeout = 30 * time.Second
+	peerCancelTimeout  = 100 * time.Millisecond
+	peerIdleLimit      = 60 * time.Second
+	peerAcquireBase    = 100 * time.Millisecond
+	peerAcquireMax     = 5 * time.Second
 )
 
 // NewTransfer validates immutable transfer inputs and creates the scheduler.
@@ -474,7 +474,11 @@ func (t *Transfer) startPeer(ctx context.Context, input ConnectedPeer) (*transfe
 	})
 	worker.Start(ctx)
 	now := t.clock()
-	return &transferPeer{input: input, worker: worker, state: state, active: make(map[peer.Block]struct{}), startedAt: now, lastUseful: now}, nil
+	return &transferPeer{
+		input: input, worker: worker, state: state,
+		active: make(map[peer.Block]time.Time), tombstoned: make(map[peer.Block]struct{}),
+		lastUseful: now,
+	}, nil
 }
 
 func (t *Transfer) drive(ctx context.Context, peers *[]*transferPeer) error {
@@ -522,7 +526,7 @@ func (t *Transfer) drive(ctx context.Context, peers *[]*transferPeer) error {
 				return fmt.Errorf("%w: duplicate staged piece %d", ErrTransferConfig, offer.PieceIndex)
 			}
 		}
-		requests, err := t.scheduler.NextRequests(p.input.ID, p.state.ReqQ())
+		requests, err := t.scheduler.nextRequestsExcluding(p.input.ID, p.state.ReqQ(), p.tombstoned)
 		if err != nil {
 			return err
 		}
@@ -541,7 +545,7 @@ func (t *Transfer) drive(ctx context.Context, peers *[]*transferPeer) error {
 				_ = t.scheduler.RejectBlock(p.input.ID, request.Block)
 				continue
 			}
-			p.active[request.Block] = struct{}{}
+			p.active[request.Block] = t.clock()
 			message := peer.Message{ID: peer.RequestID, Payload: blockPayload(request.Block)}
 			if err := p.worker.SendContext(ctx, message); err != nil {
 				if p.worker.Err() != nil || errors.Is(err, peer.ErrWorkerClosed) {
@@ -642,7 +646,9 @@ func (t *Transfer) admitCandidate(ctx context.Context, peers *[]*transferPeer, i
 }
 
 func (t *Transfer) rotateUnproductive(ctx context.Context, peers *[]*transferPeer) error {
-	_ = ctx
+	if err := t.expireRequests(ctx, *peers); err != nil {
+		return err
+	}
 	if stale := t.findUnproductive(*peers); stale != nil {
 		// Retiring the stale connection first frees the dial slot. The next
 		// AcquirePeer result can then be admitted without exceeding the active
@@ -655,27 +661,60 @@ func (t *Transfer) rotateUnproductive(ctx context.Context, peers *[]*transferPee
 func (t *Transfer) findUnproductive(peers []*transferPeer) *transferPeer {
 	now := t.clock()
 	for _, p := range peers {
-		if p == nil || p.done || p.productive || t.usefulAllowedFast(p) {
+		if p == nil || p.done {
 			continue
 		}
-		age := now.Sub(p.startedAt)
-		if age >= peerInitialGrace || now.Sub(p.lastUseful) >= peerIdleLimit {
+		// A useful Allowed Fast piece remains requestable during this window,
+		// but availability does not extend it without useful data.
+		if now.Sub(p.lastUseful) >= peerIdleLimit {
 			return p
 		}
 	}
 	return nil
 }
 
-func (t *Transfer) usefulAllowedFast(p *transferPeer) bool {
-	if p == nil || !p.state.Choked() {
-		return false
-	}
-	for _, index := range t.selection.WantedPieces() {
-		if p.state.Availability(uint32(index)) && p.state.AllowedFast(uint32(index)) {
-			return true
+// expireRequests returns stalled assignments to the scheduler while retaining
+// the peer's exact terminal obligation in a bounded tombstone. A timed-out
+// tuple is excluded from this peer until its late Piece or Reject is consumed.
+func (t *Transfer) expireRequests(ctx context.Context, peers []*transferPeer) error {
+	now := t.clock()
+	for _, p := range peers {
+		if p == nil || p.done {
+			continue
+		}
+		var cancelCtx context.Context
+		var cancel context.CancelFunc
+		for block, sentAt := range p.active {
+			if now.Sub(sentAt) < peerRequestTimeout {
+				continue
+			}
+			if err := p.state.TimeoutRequest(block); err != nil {
+				// A full tombstone set cannot forget a terminal obligation. Closing
+				// this connection releases its scheduler assignments without a strike.
+				_ = t.disconnectPeer(p, err)
+				break
+			}
+			p.tombstoned[block] = struct{}{}
+			if cancelCtx == nil {
+				cancelCtx, cancel = context.WithTimeout(ctx, peerCancelTimeout)
+			}
+			if err := p.worker.SendContext(cancelCtx, peer.Message{ID: peer.CancelID, Payload: blockPayload(block)}); err != nil {
+				_ = t.disconnectPeer(p, err)
+				break
+			}
+			if err := t.scheduler.RejectBlock(p.input.ID, block); err != nil && !errors.Is(err, ErrBlockNotOutstanding) {
+				if cancel != nil {
+					cancel()
+				}
+				return err
+			}
+			delete(p.active, block)
+		}
+		if cancel != nil {
+			cancel()
 		}
 	}
-	return false
+	return nil
 }
 
 func (t *Transfer) clock() time.Time {
@@ -782,6 +821,9 @@ func (t *Transfer) handleEventWithPeers(ctx context.Context, peers []*transferPe
 			if p.state.Requests().Outstanding(block) {
 				continue
 			}
+			if p.state.Requests().Tombstoned(block) {
+				p.tombstoned[block] = struct{}{}
+			}
 			if err := t.scheduler.RejectBlock(p.input.ID, block); err != nil && !errors.Is(err, ErrBlockNotOutstanding) {
 				return err
 			}
@@ -813,6 +855,7 @@ func (t *Transfer) handleEventWithPeers(ctx context.Context, peers []*transferPe
 		switch effect.Terminal {
 		case peer.TerminalPiece:
 			delete(p.active, block)
+			delete(p.tombstoned, block)
 			data := event.Message.Payload[8:]
 			result, err := t.scheduler.AcceptBlock(p.input.ID, block)
 			if err != nil {
@@ -831,7 +874,6 @@ func (t *Transfer) handleEventWithPeers(ctx context.Context, peers []*transferPe
 			if err := stage.WriteBlockContext(ctx, int64(block.Begin), data); err != nil {
 				return err
 			}
-			p.productive = true
 			p.lastUseful = t.clock()
 			if err := t.cancelRedundant(ctx, peers, result.Canceled); err != nil {
 				return err
@@ -841,6 +883,7 @@ func (t *Transfer) handleEventWithPeers(ctx context.Context, peers []*transferPe
 			}
 		case peer.TerminalReject:
 			delete(p.active, block)
+			delete(p.tombstoned, block)
 			if err := t.scheduler.RejectBlock(p.input.ID, block); err != nil {
 				if errors.Is(err, ErrBlockNotOutstanding) {
 					// A redundant endgame request may have been settled by
@@ -852,6 +895,7 @@ func (t *Transfer) handleEventWithPeers(ctx context.Context, peers []*transferPe
 		case peer.TerminalLatePiece, peer.TerminalLateReject:
 			// The request table consumed the bounded tombstone.  The payload
 			// cannot be attributed to a current scheduler assignment.
+			delete(p.tombstoned, block)
 		}
 	}
 	return nil
@@ -898,6 +942,7 @@ func (t *Transfer) cancelRedundant(ctx context.Context, peers []*transferPeer, c
 			continue
 		}
 		delete(loser.active, request.Block)
+		loser.tombstoned[request.Block] = struct{}{}
 		if err := loser.worker.SendContext(ctx, peer.Message{ID: peer.CancelID, Payload: blockPayload(request.Block)}); err != nil {
 			_ = t.disconnectPeer(loser, err)
 		}

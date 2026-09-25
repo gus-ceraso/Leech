@@ -6,6 +6,7 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/gus-ceraso/Leech/internal/limits"
 	"github.com/gus-ceraso/Leech/internal/peer"
 	"github.com/gus-ceraso/Leech/internal/torrent"
 )
@@ -476,4 +477,36 @@ func schedulerPlanForFuzz() *torrent.SelectionPlan {
 		panic(err)
 	}
 	return plan
+}
+
+func TestSchedulerSkipsPeerTombstonesWithoutStarvingOtherBlocks(t *testing.T) {
+	length := int64(2 * limits.BlockBytes)
+	plan := schedulerPlan(t,
+		[]torrent.File{regularFile(0, "a", 0, length)},
+		[]torrent.Piece{piece(0, 0, length)}, nil)
+	s, err := NewScheduler(plan, Config{Shuffle: keepTieOrder})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AddPeer("peer", endpoint(1)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetAvailability("peer", []int{0}); err != nil {
+		t.Fatal(err)
+	}
+	offer, ok, err := s.ReservePiece("peer")
+	if err != nil || !ok {
+		t.Fatalf("reserve = %#v, %v", offer, err)
+	}
+	if err := s.AdmitPiece(offer); err != nil {
+		t.Fatal(err)
+	}
+	excluded := map[peer.Block]struct{}{{Index: 0, Begin: 0, Length: limits.BlockBytes}: {}}
+	requests, err := s.nextRequestsExcluding("peer", 2, excluded)
+	if err != nil || len(requests) != 1 {
+		t.Fatalf("requests excluding tombstone = %#v, %v", requests, err)
+	}
+	if got := requests[0].Block; got != (peer.Block{Index: 0, Begin: limits.BlockBytes, Length: limits.BlockBytes}) {
+		t.Fatalf("request = %#v, want second block", got)
+	}
 }

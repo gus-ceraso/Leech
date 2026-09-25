@@ -14,6 +14,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -755,7 +756,7 @@ func TestTransferPayloadCallbackErrorStopsBeforeAcceptance(t *testing.T) {
 	if err := p.state.AddRequest(block); err != nil {
 		t.Fatal(err)
 	}
-	p.active[block] = struct{}{}
+	p.active[block] = transfer.clock()
 	payload := make([]byte, 8+len(data))
 	binary.BigEndian.PutUint32(payload[:4], block.Index)
 	binary.BigEndian.PutUint32(payload[4:8], block.Begin)
@@ -1796,4 +1797,544 @@ func startFixturePeerMode(t *testing.T, infoHash [20]byte, pieces []fixturePiece
 		t.Fatal(err)
 	}
 	return conn, done
+}
+
+func TestTransferExpiresStalledBlocksAndUsesLaterPeer(t *testing.T) {
+	data := make([]byte, 2*limits.BlockBytes+5000)
+	for i := range data {
+		data[i] = byte(i * 31)
+	}
+	meta := singleFileMeta(data)
+	selection, err := torrent.Select(meta, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	plan, err := storage.Validate(root, meta, selection.SelectedIndices())
+	if err != nil {
+		t.Fatal(err)
+	}
+	infoHash := [20]byte{71, 72, 73}
+	firstEndpoint, secondEndpoint := endpoint(71), endpoint(72)
+	firstConn, firstDone, firstBlock, canceled := startFixturePeerOneBlockThenSilent(t, infoHash, data)
+	secondRequests := make(chan peer.Block, 4)
+	secondConn, secondDone := startFixturePeerObserved(t, infoHash, []fixturePiece{{index: 0, data: data}}, false, false, secondRequests)
+	replacement := make(chan struct{})
+	var provided bool
+	base := time.Unix(1000, 0)
+	var sawUsefulPayload atomic.Bool
+	var usefulClockReturned atomic.Bool
+	transfer, err := NewTransfer(TransferConfig{
+		Selection: selection, Output: plan,
+		Stager:         storage.NewStager(storage.StagerConfig{CacheRoot: filepath.Join(t.TempDir(), "cache"), MaxPieces: 1, MaxBytes: int64(len(data))}),
+		LocalHandshake: peer.Handshake{InfoHash: infoHash, PeerID: [20]byte{4, 5, 6}},
+		Peers:          []ConnectedPeer{{ID: "stalling", Endpoint: firstEndpoint, Conn: firstConn, Handshake: peer.Handshake{InfoHash: infoHash, PeerID: [20]byte{1, 2, 3}}}},
+		AcquirePeer: func(ctx context.Context) (ConnectedPeer, error) {
+			if provided {
+				<-ctx.Done()
+				return ConnectedPeer{}, ctx.Err()
+			}
+			select {
+			case <-replacement:
+				provided = true
+				return ConnectedPeer{ID: "replacement", Endpoint: secondEndpoint, Conn: secondConn, Handshake: peer.Handshake{InfoHash: infoHash, PeerID: [20]byte{2, 3, 4}}}, nil
+			case <-ctx.Done():
+				return ConnectedPeer{}, ctx.Err()
+			}
+		},
+		OnPayloadReceived: func(int64) error {
+			sawUsefulPayload.CompareAndSwap(false, true)
+			return nil
+		},
+		Now: func() time.Time {
+			if sawUsefulPayload.Load() && usefulClockReturned.Swap(true) {
+				return base.Add(peerRequestTimeout + time.Second)
+			}
+			return base
+		},
+		PieceCount: 1, PieceLength: uint32(len(data)), LastPieceLength: uint32(len(data)),
+	})
+	if err != nil {
+		firstConn.Close()
+		secondConn.Close()
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	runDone := make(chan error, 1)
+	go func() { runDone <- transfer.Run(ctx) }()
+	select {
+	case block := <-firstBlock:
+		if block.Begin != 0 {
+			t.Fatalf("first block = %#v, want begin zero", block)
+		}
+	case <-ctx.Done():
+		t.Fatal("stalling peer did not send its first valid block")
+	}
+	expired := make(map[peer.Block]struct{}, 2)
+	for len(expired) < 2 {
+		select {
+		case block := <-canceled:
+			expired[block] = struct{}{}
+		case <-ctx.Done():
+			t.Fatalf("timed-out requests were not canceled: got %d", len(expired))
+		}
+	}
+	close(replacement)
+	select {
+	case err := <-runDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-ctx.Done():
+		t.Fatal("later peer did not complete transfer without a no-progress timeout")
+	}
+	if err := <-firstDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-secondDone; err != nil {
+		t.Fatal(err)
+	}
+	requested := make(map[peer.Block]struct{}, len(secondRequests))
+	for len(secondRequests) != 0 {
+		requested[<-secondRequests] = struct{}{}
+	}
+	for block := range expired {
+		if _, ok := requested[block]; !ok {
+			t.Errorf("expired block %#v was not reassigned to the later peer", block)
+		}
+	}
+	if transfer.scheduler.StrikeCount(firstEndpoint) != 0 || transfer.scheduler.StrikeCount(secondEndpoint) != 0 {
+		t.Fatalf("request timeout caused corruption strikes: first=%d second=%d", transfer.scheduler.StrikeCount(firstEndpoint), transfer.scheduler.StrikeCount(secondEndpoint))
+	}
+	got, err := os.ReadFile(filepath.Join(root, "fixture"))
+	if err != nil || !bytes.Equal(got, data) {
+		t.Fatalf("output matches input = %v, %v", bytes.Equal(got, data), err)
+	}
+}
+
+func TestTransferTimeoutPreservesFastLateTerminalWithoutStrike(t *testing.T) {
+	transfer, p, remote, messages, block, setNow, base := newTransferWithOutstandingTestRequest(t, true)
+	defer func() {
+		_ = p.worker.Close()
+		_ = transfer.scheduler.RemovePeer(p.input.ID)
+		_ = remote.Close()
+	}()
+	setNow(base.Add(peerRequestTimeout + time.Second))
+	if err := transfer.expireRequests(context.Background(), []*transferPeer{p}); err != nil {
+		t.Fatal(err)
+	}
+	if !p.state.Requests().Tombstoned(block) || transfer.scheduler.ActiveRequests() != 0 {
+		t.Fatalf("timeout did not preserve the terminal and release the assignment: tombstone=%v active=%d", p.state.Requests().Tombstoned(block), transfer.scheduler.ActiveRequests())
+	}
+	if _, ok := p.tombstoned[block]; !ok {
+		t.Fatal("timed-out tuple was not excluded from this connection")
+	}
+	var cancelMessage peer.Message
+	timeout := time.After(time.Second)
+	for cancelMessage.ID != peer.CancelID {
+		select {
+		case cancelMessage = <-messages:
+		case <-timeout:
+			t.Fatal("timeout did not send a bounded Cancel")
+		}
+	}
+	if cancelMessage.ID != peer.CancelID || !bytes.Equal(cancelMessage.Payload, blockPayload(block)) {
+		t.Fatalf("timeout cancel = %#v, want exact tuple %#v", cancelMessage, block)
+	}
+	if requests, err := transfer.scheduler.nextRequestsExcluding(p.input.ID, p.state.ReqQ(), p.tombstoned); err != nil || len(requests) != 0 {
+		t.Fatalf("tombstoned tuple was reassigned on same connection: %#v, %v", requests, err)
+	}
+	payload := make([]byte, 8+block.Length)
+	binary.BigEndian.PutUint32(payload[:4], block.Index)
+	binary.BigEndian.PutUint32(payload[4:8], block.Begin)
+	if err := transfer.handleEvent(context.Background(), p, peer.PeerEvent{Message: peer.Message{ID: peer.PieceID, Payload: payload}}); err != nil {
+		t.Fatal(err)
+	}
+	if p.state.Requests().TombstoneCount() != 0 {
+		t.Fatalf("late terminal left %d tombstones", p.state.Requests().TombstoneCount())
+	}
+	if _, ok := p.tombstoned[block]; ok {
+		t.Fatal("late terminal did not release the tuple exclusion")
+	}
+	requests, err := transfer.scheduler.NextRequests(p.input.ID, p.state.ReqQ())
+	if err != nil || len(requests) != 1 || requests[0].Block != block {
+		t.Fatalf("consumed late tuple was not reusable: %#v, %v", requests, err)
+	}
+	if transfer.scheduler.StrikeCount(p.input.Endpoint) != 0 {
+		t.Fatalf("timeout or late terminal caused a strike: %d", transfer.scheduler.StrikeCount(p.input.Endpoint))
+	}
+}
+
+func TestTransferTimeoutPreservesFastLateRejectWithoutStrike(t *testing.T) {
+	transfer, p, remote, messages, block, setNow, base := newTransferWithOutstandingTestRequest(t, true)
+	defer func() {
+		_ = p.worker.Close()
+		_ = transfer.scheduler.RemovePeer(p.input.ID)
+		_ = remote.Close()
+	}()
+	setNow(base.Add(peerRequestTimeout + time.Second))
+	if err := transfer.expireRequests(context.Background(), []*transferPeer{p}); err != nil {
+		t.Fatal(err)
+	}
+	timeout := time.After(time.Second)
+	cancelSeen := false
+	for !cancelSeen {
+		select {
+		case message := <-messages:
+			if message.ID == peer.CancelID {
+				cancelSeen = true
+			}
+		case <-timeout:
+			t.Fatal("timeout did not send a bounded Cancel")
+		}
+	}
+	if err := transfer.handleEvent(context.Background(), p, peer.PeerEvent{Message: peer.Message{ID: peer.RejectRequestID, Payload: blockPayload(block)}}); err != nil {
+		t.Fatal(err)
+	}
+	if p.state.Requests().TombstoneCount() != 0 {
+		t.Fatalf("late Reject left %d tombstones", p.state.Requests().TombstoneCount())
+	}
+	if _, ok := p.tombstoned[block]; ok {
+		t.Fatal("late Reject did not release the tuple exclusion")
+	}
+	if transfer.scheduler.StrikeCount(p.input.Endpoint) != 0 {
+		t.Fatalf("timeout or late Reject caused a strike: %d", transfer.scheduler.StrikeCount(p.input.Endpoint))
+	}
+}
+
+func TestTransferClosesWithoutStrikeWhenTimeoutTombstonesAreFull(t *testing.T) {
+	transfer, p, remote, _, block, setNow, base := newTransferWithOutstandingTestRequest(t, false)
+	defer func() {
+		_ = p.worker.Close()
+		_ = remote.Close()
+	}()
+	for i := 0; i < limits.RequestTombstones; i++ {
+		prior := peer.Block{Index: uint32(1000 + i), Begin: uint32(i), Length: 1}
+		if err := p.state.Requests().Add(prior); err != nil {
+			t.Fatalf("seed tombstone request %d: %v", i, err)
+		}
+		if err := p.state.TimeoutRequest(prior); err != nil {
+			t.Fatalf("seed tombstone %d: %v", i, err)
+		}
+	}
+	setNow(base.Add(peerRequestTimeout + time.Second))
+	if err := transfer.expireRequests(context.Background(), []*transferPeer{p}); err != nil {
+		t.Fatal(err)
+	}
+	if !p.done || transfer.scheduler.ActiveRequests() != 0 {
+		t.Fatalf("full tombstone set did not close and release peer: done=%v active=%d", p.done, transfer.scheduler.ActiveRequests())
+	}
+	if transfer.scheduler.StrikeCount(p.input.Endpoint) != 0 {
+		t.Fatalf("full tombstone set caused a strike: %d", transfer.scheduler.StrikeCount(p.input.Endpoint))
+	}
+	if !p.state.Requests().Outstanding(block) {
+		t.Fatal("full tombstone set forgot the request before the connection closed")
+	}
+}
+
+func TestTransferClosesWithoutStrikeWhenTimeoutCancelQueueIsBlocked(t *testing.T) {
+	transfer, p, remote, _, block, setNow, base := newTransferWithOutstandingTestRequest(t, false)
+	defer func() {
+		_ = p.worker.Close()
+		_ = remote.Close()
+	}()
+	fillCtx, cancelFill := context.WithTimeout(context.Background(), time.Second)
+	defer cancelFill()
+	full := false
+	for i := 0; i < 2*limits.PeerCommands; i++ {
+		if err := p.worker.SendContext(fillCtx, peer.Message{ID: peer.InterestedID}); err != nil {
+			if errors.Is(err, context.DeadlineExceeded) {
+				full = true
+				break
+			}
+			t.Fatalf("fill peer command queue: %v", err)
+		}
+	}
+	if !full {
+		t.Fatal("fixture did not block the peer command queue")
+	}
+	setNow(base.Add(peerRequestTimeout + time.Second))
+	started := time.Now()
+	if err := transfer.expireRequests(context.Background(), []*transferPeer{p}); err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("blocked Cancel enqueue took %v", elapsed)
+	}
+	if !p.done || transfer.scheduler.ActiveRequests() != 0 {
+		t.Fatalf("blocked Cancel did not close and release peer: done=%v active=%d", p.done, transfer.scheduler.ActiveRequests())
+	}
+	if transfer.scheduler.StrikeCount(p.input.Endpoint) != 0 {
+		t.Fatalf("blocked Cancel caused a strike: %d", transfer.scheduler.StrikeCount(p.input.Endpoint))
+	}
+	if !p.state.Requests().Tombstoned(block) {
+		t.Fatal("blocked Cancel discarded the timeout tombstone before closing")
+	}
+}
+
+func TestTransferRotatesNonrespondingAllowedFastPeer(t *testing.T) {
+	transfer, p, remote, _, _, setNow, base := newTransferWithOutstandingTestRequest(t, true)
+	defer func() {
+		_ = p.worker.Close()
+		_ = transfer.scheduler.RemovePeer(p.input.ID)
+		_ = remote.Close()
+	}()
+	if _, err := p.state.ApplyMessage(peer.Message{ID: peer.ChokeID}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.state.ApplyMessage(peer.Message{ID: peer.AllowedFastID, Payload: []byte{0, 0, 0, 0}}); err != nil {
+		t.Fatal(err)
+	}
+	if p.state.RequestableCount() != 1 {
+		t.Fatalf("Allowed Fast requestable count = %d, want 1", p.state.RequestableCount())
+	}
+	setNow(base.Add(peerIdleLimit - time.Second))
+	if got := transfer.findUnproductive([]*transferPeer{p}); got != nil {
+		t.Fatal("useful Allowed Fast connection was rotated before its idle window")
+	}
+	setNow(base.Add(peerIdleLimit + time.Second))
+	if got := transfer.findUnproductive([]*transferPeer{p}); got != p {
+		t.Fatal("nonresponding Allowed Fast connection retained its slot indefinitely")
+	}
+}
+
+func TestTransferReplacesIdlePeerAtActivePeerCap(t *testing.T) {
+	data := []byte("cap")
+	meta := singleFileMeta(data)
+	selection, err := torrent.Select(meta, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fakeNow = time.Unix(2000, 0)
+	inputs := make([]ConnectedPeer, limits.ActivePeers)
+	remotes := make([]net.Conn, 0, limits.ActivePeers+1)
+	for i := range inputs {
+		local, remote := net.Pipe()
+		remotes = append(remotes, remote)
+		inputs[i] = ConnectedPeer{ID: fmt.Sprintf("cap-%d", i), Endpoint: endpoint(byte(i + 1)), Conn: local}
+	}
+	transfer, err := NewTransfer(TransferConfig{
+		Selection: selection, Output: &storage.Plan{}, Peers: inputs,
+		PieceCount: 1, PieceLength: uint32(len(data)), LastPieceLength: uint32(len(data)),
+		Now: func() time.Time { return fakeNow },
+	})
+	if err != nil {
+		for _, input := range inputs {
+			_ = input.Conn.Close()
+		}
+		t.Fatal(err)
+	}
+	peers := make([]*transferPeer, len(inputs))
+	for i, input := range inputs {
+		p, err := transfer.startPeer(context.Background(), input)
+		if err != nil {
+			for _, remote := range remotes {
+				_ = remote.Close()
+			}
+			t.Fatal(err)
+		}
+		peers[i] = p
+	}
+	defer func() {
+		for _, p := range peers {
+			if p != nil {
+				_ = p.worker.Close()
+			}
+		}
+		for _, remote := range remotes {
+			_ = remote.Close()
+		}
+	}()
+	// This timestamp represents useful data delivered earlier; that connection
+	// must still become replaceable after 60 idle seconds.
+	peers[0].lastUseful = fakeNow
+	fakeNow = fakeNow.Add(peerIdleLimit + time.Second)
+	local, remote := net.Pipe()
+	remotes = append(remotes, remote)
+	candidate := ConnectedPeer{ID: "cap-replacement", Endpoint: endpoint(65), Conn: local}
+	if err := transfer.admitCandidate(context.Background(), &peers, &candidate); err != nil {
+		t.Fatal(err)
+	}
+	if countLive(peers) != limits.ActivePeers {
+		t.Fatalf("live peers = %d, want cap %d", countLive(peers), limits.ActivePeers)
+	}
+	if !peers[0].done {
+		t.Fatal("idle connection that had delivered useful data retained its slot")
+	}
+	if peers[len(peers)-1] == nil || peers[len(peers)-1].done || peers[len(peers)-1].input.ID != candidate.ID {
+		t.Fatal("later candidate was not admitted after the idle peer released its slot")
+	}
+}
+
+func newTransferWithOutstandingTestRequest(t *testing.T, fast bool) (*Transfer, *transferPeer, net.Conn, <-chan peer.Message, peer.Block, func(time.Time), time.Time) {
+	t.Helper()
+	data := []byte("late")
+	meta := singleFileMeta(data)
+	selection, err := torrent.Select(meta, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	output, err := storage.Validate(t.TempDir(), meta, selection.SelectedIndices())
+	if err != nil {
+		t.Fatal(err)
+	}
+	local, remote := net.Pipe()
+	messages := make(chan peer.Message, 8)
+	go func() {
+		defer remote.Close()
+		for {
+			message, err := peer.ReadMessage(remote)
+			if err != nil {
+				return
+			}
+			messages <- message
+		}
+	}()
+	base := time.Unix(3000, 0)
+	fakeNow := base
+	var reserved [8]byte
+	if fast {
+		reserved[7] = peer.FastExtensionBit
+	}
+	transfer, err := NewTransfer(TransferConfig{
+		Selection: selection, Output: output,
+		Stager:         storage.NewStager(storage.StagerConfig{CacheRoot: filepath.Join(t.TempDir(), "cache"), MaxPieces: 1, MaxBytes: int64(len(data))}),
+		LocalHandshake: peer.Handshake{InfoHash: [20]byte{8, 8, 8}, PeerID: [20]byte{4, 5, 6}, Reserved: reserved},
+		Peers:          []ConnectedPeer{{ID: "timeout-peer", Endpoint: endpoint(80), Conn: local, Handshake: peer.Handshake{Reserved: reserved}}},
+		PieceCount:     1, PieceLength: uint32(len(data)), LastPieceLength: uint32(len(data)),
+		Now: func() time.Time { return fakeNow },
+	})
+	if err != nil {
+		_ = local.Close()
+		_ = remote.Close()
+		t.Fatal(err)
+	}
+	p, err := transfer.startPeer(context.Background(), transfer.peers[0])
+	if err != nil {
+		_ = local.Close()
+		_ = remote.Close()
+		t.Fatal(err)
+	}
+	if _, err := p.state.ApplyMessage(peer.Message{ID: peer.BitfieldID, Payload: []byte{0x80}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := transfer.scheduler.SetAvailability(p.input.ID, []int{0}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.state.ApplyMessage(peer.Message{ID: peer.UnchokeID}); err != nil {
+		t.Fatal(err)
+	}
+	offer, ok, err := transfer.scheduler.ReservePiece(p.input.ID)
+	if err != nil || !ok {
+		t.Fatalf("reserve stage = %#v, %v (available=%v requestable=%d rarity=%d)", offer, err, p.state.Availability(0), p.state.RequestableCount(), transfer.scheduler.pieces[0].rarity)
+	}
+	if err := transfer.scheduler.AdmitPiece(offer); err != nil {
+		t.Fatal(err)
+	}
+	requests, err := transfer.scheduler.NextRequests(p.input.ID, p.state.ReqQ())
+	if err != nil || len(requests) != 1 {
+		t.Fatalf("scheduler request = %#v, %v", requests, err)
+	}
+	block := requests[0].Block
+	if err := p.state.AddRequest(block); err != nil {
+		t.Fatal(err)
+	}
+	p.active[block] = fakeNow
+	return transfer, p, remote, messages, block, func(now time.Time) { fakeNow = now }, base
+}
+
+func startFixturePeerOneBlockThenSilent(t *testing.T, infoHash [20]byte, data []byte) (net.Conn, <-chan error, <-chan peer.Block, <-chan peer.Block) {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	first := make(chan peer.Block, 1)
+	canceled := make(chan peer.Block, 8)
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			done <- err
+			return
+		}
+		defer conn.Close()
+		defer listener.Close()
+		if _, err := peer.ReadHandshake(conn, &infoHash, nil); err != nil {
+			done <- err
+			return
+		}
+		if err := peer.WriteHandshake(conn, infoHash, [20]byte{3, 2, 1}, [8]byte{}); err != nil {
+			done <- err
+			return
+		}
+		if err := writeFixtureFrame(conn, peer.BitfieldID, []byte{0x80}); err != nil {
+			done <- err
+			return
+		}
+		if err := writeFixtureFrame(conn, peer.UnchokeID, nil); err != nil {
+			done <- err
+			return
+		}
+		answered := false
+		for {
+			message, err := peer.ReadMessage(conn)
+			if err != nil {
+				if peer.IsDisconnect(err) {
+					done <- nil
+				} else {
+					done <- err
+				}
+				return
+			}
+			if message.KeepAlive || message.ID == peer.InterestedID || message.ID == peer.NotInterestedID {
+				continue
+			}
+			if len(message.Payload) != 12 {
+				done <- io.ErrUnexpectedEOF
+				return
+			}
+			block := peer.Block{Index: binary.BigEndian.Uint32(message.Payload[:4]), Begin: binary.BigEndian.Uint32(message.Payload[4:8]), Length: binary.BigEndian.Uint32(message.Payload[8:12])}
+			if message.ID == peer.CancelID {
+				canceled <- block
+				continue
+			}
+			if message.ID != peer.RequestID || answered || int(block.Begin+block.Length) > len(data) {
+				if message.ID == peer.RequestID {
+					// The fixture intentionally leaves all later requests unanswered.
+					continue
+				}
+				done <- io.ErrUnexpectedEOF
+				return
+			}
+			answered = true
+			first <- block
+			payload := make([]byte, 8+block.Length)
+			binary.BigEndian.PutUint32(payload[:4], block.Index)
+			binary.BigEndian.PutUint32(payload[4:8], block.Begin)
+			copy(payload[8:], data[block.Begin:block.Begin+block.Length])
+			if err := writeFixtureFrame(conn, peer.PieceID, payload); err != nil {
+				done <- err
+				return
+			}
+		}
+	}()
+	conn, err := net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		_ = listener.Close()
+		t.Fatal(err)
+	}
+	local := peer.Handshake{InfoHash: infoHash, PeerID: [20]byte{4, 5, 6}}
+	if err := peer.WriteHandshake(conn, local.InfoHash, local.PeerID, local.Reserved); err != nil {
+		_ = conn.Close()
+		_ = listener.Close()
+		t.Fatal(err)
+	}
+	if _, err := peer.ReadHandshake(conn, &infoHash, nil); err != nil {
+		_ = conn.Close()
+		_ = listener.Close()
+		t.Fatal(err)
+	}
+	return conn, done, first, canceled
 }
