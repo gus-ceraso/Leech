@@ -988,13 +988,29 @@ func TestTransferDisconnectReassignsOutstandingBlock(t *testing.T) {
 	firstRequests, secondRequests := make(chan peer.Block, 1), make(chan peer.Block, 1)
 	firstConn, firstDone := startFixturePeerMode(t, infoHash, []fixturePiece{{index: 0, data: data}}, false, true, false, firstRequests, nil, nil)
 	secondConn, secondDone := startFixturePeerObserved(t, infoHash, []fixturePiece{{index: 0, data: data}}, false, false, secondRequests)
+	firstFixtureResult := make(chan error, 1)
+	provided := false
 	transfer, err := NewTransfer(TransferConfig{
 		Selection: selection, Output: plan,
 		Stager:         storage.NewStager(storage.StagerConfig{CacheRoot: filepath.Join(t.TempDir(), "cache"), MaxPieces: 1, MaxBytes: int64(len(data))}),
 		LocalHandshake: peer.Handshake{InfoHash: infoHash, PeerID: [20]byte{4, 5, 6}},
-		Peers: []ConnectedPeer{
-			{ID: "disconnecting", Endpoint: firstEndpoint, Conn: firstConn, Handshake: peer.Handshake{InfoHash: infoHash, PeerID: [20]byte{1, 1, 1}}},
-			{ID: "replacement", Endpoint: secondEndpoint, Conn: secondConn, Handshake: peer.Handshake{InfoHash: infoHash, PeerID: [20]byte{2, 2, 2}}},
+		Peers:          []ConnectedPeer{{ID: "disconnecting", Endpoint: firstEndpoint, Conn: firstConn, Handshake: peer.Handshake{InfoHash: infoHash, PeerID: [20]byte{1, 1, 1}}}},
+		AcquirePeer: func(ctx context.Context) (ConnectedPeer, error) {
+			if !provided {
+				select {
+				case firstErr := <-firstDone:
+					firstFixtureResult <- firstErr
+					if firstErr != nil {
+						return ConnectedPeer{}, firstErr
+					}
+				case <-ctx.Done():
+					return ConnectedPeer{}, ctx.Err()
+				}
+				provided = true
+				return ConnectedPeer{ID: "replacement", Endpoint: secondEndpoint, Conn: secondConn, Handshake: peer.Handshake{InfoHash: infoHash, PeerID: [20]byte{2, 2, 2}}}, nil
+			}
+			<-ctx.Done()
+			return ConnectedPeer{}, ctx.Err()
 		},
 		PieceCount: 1, PieceLength: uint32(len(data)), LastPieceLength: uint32(len(data)),
 	})
@@ -1008,13 +1024,28 @@ func TestTransferDisconnectReassignsOutstandingBlock(t *testing.T) {
 	if err := transfer.Run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if err := <-firstDone; err != nil {
-		t.Fatal(err)
+	select {
+	case err := <-firstFixtureResult:
+		if err != nil {
+			t.Fatal(err)
+		}
+	default:
+		t.Fatal("replacement peer was not gated on first peer disconnect")
 	}
 	if err := <-secondDone; err != nil {
 		t.Fatal(err)
 	}
-	firstBlock, secondBlock := <-firstRequests, <-secondRequests
+	var firstBlock, secondBlock peer.Block
+	select {
+	case firstBlock = <-firstRequests:
+	default:
+		t.Fatal("disconnecting peer did not receive an outstanding request")
+	}
+	select {
+	case secondBlock = <-secondRequests:
+	default:
+		t.Fatal("replacement peer did not receive the reassigned request")
+	}
 	if firstBlock != secondBlock {
 		t.Fatalf("disconnected request %v was not reassigned unchanged; replacement requested %v", firstBlock, secondBlock)
 	}
@@ -1649,6 +1680,7 @@ func startFixturePeerMode(t *testing.T, infoHash [20]byte, pieces []fixturePiece
 				return
 			}
 			if disconnectBeforePiece {
+				_ = conn.Close()
 				done <- nil
 				return
 			}

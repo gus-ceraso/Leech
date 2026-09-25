@@ -265,26 +265,22 @@ func h2Torrent(t *testing.T, root string, data []byte) (torrent.InfoHash, string
 
 func assertH2Final(t *testing.T, traces map[string][]tracker.AnnounceRequest) {
 	t.Helper()
+	if len(traces) == 0 {
+		t.Fatal("no tracker events recorded")
+	}
+	wantEvents := []tracker.Event{tracker.EventStarted, tracker.EventCompleted, tracker.EventStopped}
 	for url, requests := range traces {
-		var started, completed, stopped int
-		for _, request := range requests {
+		if len(requests) != len(wantEvents) {
+			t.Errorf("tracker %s requests=%v; want exactly started, completed, stopped", url, requests)
+			continue
+		}
+		for i, request := range requests {
 			if request.Uploaded != 0 {
 				t.Errorf("tracker %s uploaded=%d", url, request.Uploaded)
 			}
-			switch request.Event {
-			case tracker.EventStarted:
-				started++
-			case tracker.EventCompleted:
-				completed++
-			case tracker.EventStopped:
-				stopped++
+			if request.Event != wantEvents[i] {
+				t.Errorf("tracker %s event[%d]=%v, want %v; trace=%v", url, i, request.Event, wantEvents[i], requests)
 			}
-		}
-		if started == 0 || completed != 1 || stopped != 1 {
-			t.Errorf("tracker %s events=%v; want started/completed/stopped", url, requests)
-		}
-		if requests[len(requests)-1].Event != tracker.EventStopped {
-			t.Errorf("tracker %s last event=%v, want stopped", url, requests[len(requests)-1].Event)
 		}
 	}
 }
