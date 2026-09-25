@@ -1007,7 +1007,7 @@ and worker lifetime. Reuse the existing fixture seams.
 independent expected result, exercises its claimed path, and would detect the
 intended failure. Avoid duplicate cases and tests that mirror implementation.
 
-- [ ] Resolve R6 findings, then run `go test ./...`, `go test -race ./...`,
+- [x] Resolve R6 findings, then run `go test ./...`, `go test -race ./...`,
   `go vet ./...`, and a pure-Go build on the integrated tree. Replay all fuzz
   seeds and run bounded fuzz campaigns for changed parsers and state machines.
   Keep every minimized regression. Use local deterministic peers and trackers
