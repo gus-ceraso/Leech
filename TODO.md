@@ -503,6 +503,12 @@ idle connections, and endgame cannot double-commit a block or leak request slots
     preserve explicit `reqq=0`; expose received-payload accounting and a
     pre-peer-shutdown callback for ordered tracker quiescence (`f43f7c6`);
     recover when a worker closes during scheduling (`909a369`).
+  - [x] P3: start TCP after the head start even if uTP fails early, and blacklist
+    endpoints after severe handshake violations (`bb0e235`).
+  - [x] D3: propagate transfer-phase severe and corruption blacklists to the
+    candidate dialer (`0ce6e28`).
+  - [ ] P1: bound retained peer event payload across 64 connections; unknown
+    well-framed core messages must remain ignorable without large queue memory.
 
 ## Group 3: Trackers and metadata discovery
 
@@ -787,26 +793,26 @@ the test runner. L2 receives a small reporter/cancellation adapter.
 `internal/cli/run.go` and `cmd/leech/main.go`.
 **References:** DESIGN §§4, 6, 9–11, 15, 18.
 
-- [ ] Wire `.torrent`, magnet, and bare-hash flows through one explicit lifecycle.
+- [x] Wire `.torrent`, magnet, and bare-hash flows through one explicit lifecycle.
   Keep run identity/strikes across phases. Bind real TCP/uTP dialers, independent
   trackers, the scheduler, storage, and reporter without production test switches.
-- [ ] For known metadata, validate/select and finish resume before tracker/peer
+- [x] For known metadata, validate/select and finish resume before tracker/peer
   activity. For fetched metadata, join metadata discovery and finish its stopped
   sequence before normalization/selection/resume. Start transfer with fresh
   started events and real `left` only if selected content is missing.
-- [ ] Finish listing immediately after validated metadata, including remote
+- [x] Finish listing immediately after validated metadata, including remote
   metadata-phase cleanup, without selection/resume/destination access. Finish a
   complete resume without transfer discovery or piece-cache creation. Prepare
   default overwrite only after metadata, selection, and path validation.
-- [ ] Start the optional no-progress timer only at file transfer; reset it only
+- [x] Start the optional no-progress timer only at file transfer; reset it only
   for a newly verified file piece. Metadata, resume, duplicates, mere received
   bytes, and tracker responses must not extend it. With no option, keep retrying.
-- [ ] Implement the complete ordered shutdown from DESIGN §15: stop admission,
+- [x] Implement the complete ordered shutdown from DESIGN §15: stop admission,
   join regular trackers, join dials/peers, settle/join finalization, attempt
   applicable completed/stopped, close resources, and remove this workspace.
   Preserve the primary result; cleanup failure changes an otherwise successful
   result, while final tracker-event failures remain secondary.
-- [ ] Map help/list/download outcomes, usage failures, runtime failures, and
+- [x] Map help/list/download outcomes, usage failures, runtime failures, and
   supported signals to 0/2/1/130/143 as specified. Apply pending overlong-file
   truncation only when that file has validated. Cover empty/zero-length selected
   content and final output-close failures.
