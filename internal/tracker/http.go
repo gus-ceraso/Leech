@@ -171,6 +171,9 @@ func (c *HTTPClient) Announce(ctx context.Context, trackerURL string, announce A
 	client := *c.client
 	previousRedirect := client.CheckRedirect
 	client.CheckRedirect = func(next *http.Request, via []*http.Request) error {
+		if len(via) >= 10 {
+			return errors.New("stopped after 10 redirects")
+		}
 		// Sanitize before and after an injected callback. This keeps both the
 		// request sent to a custom callback and the final redirect authoritative.
 		next.URL = sanitizeHTTPURL(next.URL, announce)

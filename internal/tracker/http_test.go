@@ -84,6 +84,28 @@ func TestHTTPAnnounceSanitizesOriginalAndRedirectQueries(t *testing.T) {
 	}
 }
 
+func TestHTTPAnnounceLimitsRedirects(t *testing.T) {
+	var mu sync.Mutex
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		requests++
+		mu.Unlock()
+		http.Redirect(w, r, "/loop", http.StatusFound)
+	}))
+	defer server.Close()
+
+	_, err := NewHTTPClient(HTTPConfig{Timeout: time.Second}).Announce(context.Background(), server.URL+"/loop", testRequest())
+	if err == nil {
+		t.Fatal("redirect loop was accepted")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if requests != 10 {
+		t.Fatalf("redirect loop sent %d requests, want 10", requests)
+	}
+}
+
 func countQueryKey(raw, want string) int {
 	count := 0
 	for _, part := range strings.Split(raw, "&") {
