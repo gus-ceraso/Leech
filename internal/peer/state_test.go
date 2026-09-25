@@ -4,6 +4,8 @@ import (
 	"encoding/binary"
 	"errors"
 	"testing"
+
+	"github.com/gus-ceraso/Leech/internal/limits"
 )
 
 func TestRequestTableFastChokeKeepsTerminalObligation(t *testing.T) {
@@ -161,6 +163,103 @@ func TestPeerStateRepeatedInitialAvailabilityDoesNotRestoreState(t *testing.T) {
 				t.Fatalf("first %#v restored stale piece %d", first, index)
 			}
 		}
+	}
+}
+
+func TestPeerStateLargeWantedAvailabilityUsesChangedBits(t *testing.T) {
+	state, err := NewPeerStateWithConfig(PeerStateConfig{PieceCount: limits.Pieces, Fast: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wanted := make([]int, int(limits.Pieces))
+	for index := range wanted {
+		wanted[index] = index
+	}
+	if err := state.SetWantedPieces(wanted); err != nil {
+		t.Fatal(err)
+	}
+	if state.RequestableCount() != 0 {
+		t.Fatalf("initial requestable count = %d, want zero", state.RequestableCount())
+	}
+
+	last := uint32(limits.Pieces - 1)
+	effect, err := state.ApplyMessage(Message{ID: HaveID, Payload: uint32Payload(last)})
+	if err != nil || !effect.InterestChanged || !effect.Interested || len(effect.AvailabilityAdded) != 0 {
+		t.Fatalf("first choked Have = %#v, %v", effect, err)
+	}
+	if state.RequestableCount() != 0 {
+		t.Fatalf("ordinary choked Have requestable count = %d, want zero", state.RequestableCount())
+	}
+	for i := 0; i < 64; i++ {
+		effect, err = state.ApplyMessage(Message{ID: HaveID, Payload: uint32Payload(last)})
+		if err != nil || effect.InterestChanged || !effect.Interested || len(effect.AvailabilityAdded) != 0 || len(effect.AvailabilityRemoved) != 0 {
+			t.Fatalf("repeated Have %d = %#v, %v", i, effect, err)
+		}
+	}
+
+	effect, err = state.ApplyMessage(Message{ID: AllowedFastID, Payload: uint32Payload(last)})
+	if err != nil || len(effect.AvailabilityAdded) != 1 || effect.AvailabilityAdded[0] != last {
+		t.Fatalf("Allowed Fast availability delta = %#v, %v", effect, err)
+	}
+	if state.RequestableCount() != 1 {
+		t.Fatalf("Allowed Fast requestable count = %d, want one", state.RequestableCount())
+	}
+	effect, err = state.ApplyMessage(Message{ID: HaveNoneID})
+	if err != nil || !effect.InterestChanged || effect.Interested || len(effect.AvailabilityRemoved) != 1 || effect.AvailabilityRemoved[0] != last || !state.AllowedFast(last) {
+		t.Fatalf("Have None delta = %#v, allowed=%v, err=%v", effect, state.AllowedFast(last), err)
+	}
+	if state.RequestableCount() != 0 {
+		t.Fatalf("empty Have None requestable count = %d, want zero", state.RequestableCount())
+	}
+	for i := 0; i < 64; i++ {
+		effect, err = state.ApplyMessage(Message{ID: HaveNoneID})
+		if err != nil || effect.InterestChanged || effect.Interested || len(effect.AvailabilityAdded) != 0 || len(effect.AvailabilityRemoved) != 0 {
+			t.Fatalf("repeated empty Have None %d = %#v, %v", i, effect, err)
+		}
+	}
+}
+
+func TestPeerStateRequestableCountAcrossBulkAndChokeTransitions(t *testing.T) {
+	state, err := NewPeerState(4, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := state.SetWantedPieces([]int{0, 1, 2}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := state.ApplyMessage(Message{ID: AllowedFastID, Payload: uint32Payload(2)}); err != nil {
+		t.Fatal(err)
+	}
+	effect, err := state.ApplyMessage(Message{ID: HaveAllID})
+	if err != nil || state.RequestableCount() != 1 || len(effect.AvailabilityAdded) != 1 || effect.AvailabilityAdded[0] != 2 {
+		t.Fatalf("Have All requestable state = %#v, count %d, err %v", effect, state.RequestableCount(), err)
+	}
+	effect, err = state.ApplyMessage(Message{ID: UnchokeID})
+	if err != nil || state.RequestableCount() != 3 || len(effect.AvailabilityAdded) != 2 {
+		t.Fatalf("Unchoke requestable state = %#v, count %d, err %v", effect, state.RequestableCount(), err)
+	}
+	effect, err = state.ApplyMessage(Message{ID: ChokeID})
+	if err != nil || state.RequestableCount() != 1 || len(effect.AvailabilityRemoved) != 2 {
+		t.Fatalf("Choke requestable state = %#v, count %d, err %v", effect, state.RequestableCount(), err)
+	}
+	effect, err = state.ApplyMessage(Message{ID: HaveNoneID})
+	if err != nil || state.RequestableCount() != 0 || len(effect.AvailabilityRemoved) != 1 || effect.AvailabilityRemoved[0] != 2 || !state.AllowedFast(2) {
+		t.Fatalf("Have None requestable state = %#v, count %d, err %v", effect, state.RequestableCount(), err)
+	}
+
+	bitfield, err := NewPeerState(16, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := bitfield.SetWantedPieces([]int{0, 3, 8}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := bitfield.ApplyMessage(Message{ID: UnchokeID}); err != nil {
+		t.Fatal(err)
+	}
+	effect, err = bitfield.ApplyMessage(Message{ID: BitfieldID, Payload: []byte{0x90, 0x80}})
+	if err != nil || bitfield.RequestableCount() != 3 || len(effect.AvailabilityAdded) != 3 {
+		t.Fatalf("Bitfield requestable state = %#v, count %d, err %v", effect, bitfield.RequestableCount(), err)
 	}
 }
 

@@ -128,17 +128,16 @@ type Transfer struct {
 }
 
 type transferPeer struct {
-	input              ConnectedPeer
-	worker             *peer.ConnectionWorker
-	state              *peer.PeerState
-	active             map[peer.Block]struct{}
-	done               bool
-	removed            bool
-	availabilitySynced bool
-	startedAt          time.Time
-	lastUseful         time.Time
-	productive         bool
-	released           bool
+	input      ConnectedPeer
+	worker     *peer.ConnectionWorker
+	state      *peer.PeerState
+	active     map[peer.Block]struct{}
+	done       bool
+	removed    bool
+	startedAt  time.Time
+	lastUseful time.Time
+	productive bool
+	released   bool
 }
 
 const (
@@ -451,10 +450,8 @@ func (t *Transfer) startPeer(ctx context.Context, input ConnectedPeer) (*transfe
 	if err != nil {
 		return nil, err
 	}
-	for _, index := range t.selection.WantedPieces() {
-		if _, _, err := state.SetWanted(uint32(index), true); err != nil {
-			return nil, err
-		}
+	if err := state.SetWantedPieces(t.selection.WantedPieces()); err != nil {
+		return nil, err
 	}
 	if err := t.scheduler.AddPeerWithLimit(input.ID, input.Endpoint, state.ReqQ()); err != nil {
 		return nil, err
@@ -492,17 +489,8 @@ func (t *Transfer) drive(ctx context.Context, peers *[]*transferPeer) error {
 			_ = t.disconnectPeer(p, fmt.Errorf("peer endpoint blacklisted"))
 			continue
 		}
-		if p.state.Choked() {
-			requestable := false
-			for _, index := range t.selection.WantedPieces() {
-				if p.state.CanRequest(uint32(index)) {
-					requestable = true
-					break
-				}
-			}
-			if !requestable {
-				continue
-			}
+		if p.state.RequestableCount() == 0 {
+			continue
 		}
 		// Admission is separate from assignment.  A stage must exist before
 		// any request can be sent, and a failed admission is fatal storage
@@ -805,11 +793,8 @@ func (t *Transfer) handleEventWithPeers(ctx context.Context, peers []*transferPe
 			return t.disconnectPeer(p, err)
 		}
 	}
-	switch event.Message.ID {
-	case peer.BitfieldID, peer.HaveID, peer.HaveAllID, peer.HaveNoneID, peer.AllowedFastID, peer.ChokeID, peer.UnchokeID:
-		if err := t.syncPeerAvailability(p); err != nil {
-			return err
-		}
+	if err := t.applyAvailabilityChanges(p.input.ID, effect); err != nil {
+		return err
 	}
 	if effect.InterestChanged {
 		id := peer.NotInterestedID
@@ -872,19 +857,20 @@ func (t *Transfer) handleEventWithPeers(ctx context.Context, peers []*transferPe
 	return nil
 }
 
-// syncPeerAvailability stores only pieces that the current peer state allows
-// the scheduler to request. Ordinary availability is always required; while
-// choked, the independent Allowed Fast set is required as well. Allowed Fast
-// therefore never turns an unadvertised piece into an eligible piece, and a
-// rare ordinary piece cannot starve an allowed one.
-func (t *Transfer) syncPeerAvailability(p *transferPeer) error {
-	indices := make([]int, 0)
-	for _, index := range t.selection.WantedPieces() {
-		if p.state.Availability(uint32(index)) && (!p.state.Choked() || p.state.AllowedFast(uint32(index))) {
-			indices = append(indices, index)
+// applyAvailabilityChanges keeps scheduler state aligned with the peer's
+// requestable wanted pieces by applying only the bits changed by this message.
+func (t *Transfer) applyAvailabilityChanges(peerID string, effect peer.StateEffect) error {
+	for _, index := range effect.AvailabilityRemoved {
+		if err := t.scheduler.SetPieceAvailability(peerID, int(index), false); err != nil {
+			return err
 		}
 	}
-	return t.scheduler.SetAvailability(p.input.ID, indices)
+	for _, index := range effect.AvailabilityAdded {
+		if err := t.scheduler.SetPieceAvailability(peerID, int(index), true); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (t *Transfer) cancelRedundant(ctx context.Context, peers []*transferPeer, canceled []Request) error {

@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math/bits"
 
 	"github.com/gus-ceraso/Leech/internal/limits"
 )
@@ -32,13 +33,15 @@ type PeerStateConfig struct {
 // StateEffect reports a decoded message's coordinator-visible consequence.
 // Response is always a local control message; it never carries file payload.
 type StateEffect struct {
-	InterestChanged bool
-	Interested      bool
-	SuggestedPiece  uint32
-	HasSuggestion   bool
-	Terminal        Terminal
-	HasTerminal     bool
-	Response        *Message
+	InterestChanged     bool
+	Interested          bool
+	AvailabilityAdded   []uint32
+	AvailabilityRemoved []uint32
+	SuggestedPiece      uint32
+	HasSuggestion       bool
+	Terminal            Terminal
+	HasTerminal         bool
+	Response            *Message
 }
 
 // IncomingDisposition records how a request from the remote peer is handled.
@@ -55,20 +58,23 @@ const (
 // PeerState is one peer's protocol state. All methods must be called by the
 // coordinator goroutine; no method starts a goroutine or touches a net.Conn.
 type PeerState struct {
-	pieceCount      uint32
-	pieceLength     uint32
-	lastPieceLength uint32
-	fast            bool
-	choked          bool
-	interested      bool
-	initialSeen     bool
-	reqQ            int
-	availability    bitSet
-	allowedFast     bitSet
-	wanted          bitSet
-	suggestions     []uint32
-	seenIncoming    map[Block]struct{}
-	requests        *RequestTable
+	pieceCount        uint32
+	pieceLength       uint32
+	lastPieceLength   uint32
+	fast              bool
+	choked            bool
+	interested        bool
+	initialSeen       bool
+	reqQ              int
+	availability      bitSet
+	allowedFast       bitSet
+	wanted            bitSet
+	availabilityCount uint32
+	wantedAvailable   uint32
+	requestableCount  uint32
+	suggestions       []uint32
+	seenIncoming      map[Block]struct{}
+	requests          *RequestTable
 }
 
 // NewPeerState creates coordinator-owned state with the supported request and
@@ -116,6 +122,12 @@ func (s *PeerState) PieceCount() uint32 {
 	}
 	return s.pieceCount
 }
+func (s *PeerState) RequestableCount() uint32 {
+	if s == nil {
+		return 0
+	}
+	return s.requestableCount
+}
 func (s *PeerState) ReqQ() int {
 	if s == nil {
 		return 0
@@ -160,9 +172,57 @@ func (s *PeerState) SetWanted(index uint32, wanted bool) (bool, bool, error) {
 	if err := s.validIndex(index); err != nil {
 		return false, s.interested, err
 	}
+	if s.wanted.has(index) == wanted {
+		return false, s.interested, nil
+	}
 	s.wanted.set(index, wanted)
+	if s.availability.has(index) {
+		if wanted {
+			s.wantedAvailable++
+			if !s.choked || s.allowedFast.has(index) {
+				s.requestableCount++
+			}
+		} else {
+			s.wantedAvailable--
+			if !s.choked || s.allowedFast.has(index) {
+				s.requestableCount--
+			}
+		}
+	}
 	changed, interested := s.refreshInterestChange()
 	return changed, interested, nil
+}
+
+// SetWantedPieces replaces the wanted set in one pass over the selected
+// indices. Call it before registering the peer with a scheduler.
+func (s *PeerState) SetWantedPieces(indices []int) error {
+	if s == nil {
+		return ErrPeerStateConfig
+	}
+	wanted := newBitSet(s.pieceCount)
+	var wantedAvailable uint32
+	for _, index := range indices {
+		if index < 0 || uint64(index) >= uint64(s.pieceCount) {
+			return fmt.Errorf("%w: wanted piece index %d outside piece count %d", ErrPeerStateConfig, index, s.pieceCount)
+		}
+		piece := uint32(index)
+		if wanted.has(piece) {
+			continue
+		}
+		wanted.set(piece, true)
+		if s.availability.has(piece) {
+			wantedAvailable++
+		}
+	}
+	s.wanted = wanted
+	s.wantedAvailable = wantedAvailable
+	s.interested = wantedAvailable != 0
+	if s.choked {
+		s.requestableCount = bitAndCount(s.availability, s.allowedFast, wanted)
+	} else {
+		s.requestableCount = wantedAvailable
+	}
+	return nil
 }
 
 // SetChoked applies a remote choke. Fast keeps requests outstanding; ordinary
@@ -170,6 +230,13 @@ func (s *PeerState) SetWanted(index uint32, wanted bool) (bool, bool, error) {
 func (s *PeerState) SetChoked(choked bool) error {
 	if s == nil {
 		return ErrPeerStateConfig
+	}
+	if s.choked != choked {
+		if choked {
+			s.requestableCount = bitAndCount(s.availability, s.allowedFast, s.wanted)
+		} else {
+			s.requestableCount = s.wantedAvailable
+		}
 	}
 	s.choked = choked
 	if choked {
@@ -226,17 +293,35 @@ func (s *PeerState) ApplyMessage(message Message) (StateEffect, error) {
 	var effect StateEffect
 	switch message.ID {
 	case ChokeID:
+		if !s.choked {
+			s.appendChokeAvailabilityChanges(&effect, false)
+		}
 		if err := s.SetChoked(true); err != nil {
 			return effect, err
 		}
 	case UnchokeID:
-		s.choked = false
+		if s.choked {
+			s.appendChokeAvailabilityChanges(&effect, true)
+		}
+		if err := s.SetChoked(false); err != nil {
+			return effect, err
+		}
 	case InterestedID, NotInterestedID:
 		// Leech remains choked forever. Incoming reciprocal state has no
 		// effect on the download state and is intentionally ignored.
 	case HaveID:
 		index := binary.BigEndian.Uint32(message.Payload)
-		s.availability.set(index, true)
+		if !s.availability.has(index) {
+			s.availability.set(index, true)
+			s.availabilityCount++
+			if s.wanted.has(index) {
+				s.wantedAvailable++
+				if !s.choked || s.allowedFast.has(index) {
+					s.requestableCount++
+					effect.AvailabilityAdded = append(effect.AvailabilityAdded, index)
+				}
+			}
+		}
 		// A peer may omit its initial Bitfield. Once it has sent an
 		// incremental Have, a later initial availability frame is stale.
 		s.initialSeen = true
@@ -248,7 +333,15 @@ func (s *PeerState) ApplyMessage(message Message) (StateEffect, error) {
 			break
 		}
 		s.availability.fill()
+		s.availabilityCount = s.pieceCount
+		s.wantedAvailable = bitCount(s.wanted)
+		if s.choked {
+			s.requestableCount = bitAndCount(s.availability, s.allowedFast, s.wanted)
+		} else {
+			s.requestableCount = s.wantedAvailable
+		}
 		s.initialSeen = true
+		s.appendCurrentAvailability(&effect, true)
 		effect.InterestChanged, effect.Interested = s.refreshInterestChange()
 	case HaveNoneID:
 		if !s.fast {
@@ -256,8 +349,15 @@ func (s *PeerState) ApplyMessage(message Message) (StateEffect, error) {
 		}
 		// Have None is always a safe empty-state correction. In particular,
 		// it must clear stale ordinary availability without clearing Allowed
-		// Fast, even if a peer sent a duplicate initial frame.
-		s.availability.clear()
+		// Fast, even if a peer sent a duplicate initial frame. An already-empty
+		// availability set is a constant-time no-op.
+		if s.availabilityCount != 0 {
+			s.appendCurrentAvailability(&effect, false)
+			s.availability.clear()
+			s.availabilityCount = 0
+			s.wantedAvailable = 0
+			s.requestableCount = 0
+		}
 		s.initialSeen = true
 		effect.InterestChanged, effect.Interested = s.refreshInterestChange()
 	case BitfieldID:
@@ -270,12 +370,20 @@ func (s *PeerState) ApplyMessage(message Message) (StateEffect, error) {
 			return effect, err
 		}
 		s.initialSeen = true
+		s.appendCurrentAvailability(&effect, true)
 		effect.InterestChanged, effect.Interested = s.refreshInterestChange()
 	case AllowedFastID:
 		if !s.fast {
 			return effect, protocolError("peer state", "Allowed Fast without negotiated Fast")
 		}
-		s.allowedFast.set(binary.BigEndian.Uint32(message.Payload), true)
+		index := binary.BigEndian.Uint32(message.Payload)
+		if !s.allowedFast.has(index) {
+			s.allowedFast.set(index, true)
+			if s.choked && s.availability.has(index) && s.wanted.has(index) {
+				s.requestableCount++
+				effect.AvailabilityAdded = append(effect.AvailabilityAdded, index)
+			}
+		}
 	case SuggestID:
 		index := binary.BigEndian.Uint32(message.Payload)
 		if len(s.suggestions) < maxSuggestions && !containsUint32(s.suggestions, index) {
@@ -384,16 +492,18 @@ func (s *PeerState) applyBitfield(payload []byte) error {
 	if uint64(len(payload)) != want {
 		return protocolError("peer state", fmt.Sprintf("bitfield length %d, want %d", len(payload), want))
 	}
-	s.availability.clear()
+	// ValidateMessage applies the shared wire bitfield rule before this state
+	// transition. This parser only needs to translate its valid bits.
 	for index := uint32(0); index < s.pieceCount; index++ {
 		if payload[index/8]&(1<<(7-index%8)) != 0 {
 			s.availability.set(index, true)
-		}
-	}
-	if s.pieceCount%8 != 0 && len(payload) != 0 {
-		spare := uint8(8 - s.pieceCount%8)
-		if payload[len(payload)-1]&(1<<spare-1) != 0 {
-			return protocolError("peer state", "bitfield spare bit is set")
+			s.availabilityCount++
+			if s.wanted.has(index) {
+				s.wantedAvailable++
+				if !s.choked || s.allowedFast.has(index) {
+					s.requestableCount++
+				}
+			}
 		}
 	}
 	return nil
@@ -401,20 +511,67 @@ func (s *PeerState) applyBitfield(payload []byte) error {
 
 func (s *PeerState) refreshInterestChange() (bool, bool) {
 	old := s.interested
-	current := s.refreshInterest()
+	current := s.wantedAvailable != 0
+	s.interested = current
 	return old != current, current
 }
 
-func (s *PeerState) refreshInterest() bool {
-	current := false
-	for i := uint32(0); i < s.pieceCount; i++ {
-		if s.wanted.has(i) && s.availability.has(i) {
-			current = true
-			break
-		}
+// appendCurrentAvailability reports scheduler availability for currently
+// advertised wanted pieces. The caller uses it only when all of those bits
+// have just changed in the same direction.
+func (s *PeerState) appendCurrentAvailability(effect *StateEffect, available bool) {
+	if s.wantedAvailable == 0 {
+		return
 	}
-	s.interested = current
-	return current
+	for word, value := range s.availability {
+		value &= s.wanted[word]
+		if s.choked {
+			value &= s.allowedFast[word]
+		}
+		s.appendAvailabilityWord(effect, word, value, available)
+	}
+}
+
+// Choking removes non-Allowed-Fast availability from the scheduler; unchoking
+// adds the same bits back. Allowed Fast remains an independent eligibility
+// condition throughout.
+func (s *PeerState) appendChokeAvailabilityChanges(effect *StateEffect, available bool) {
+	if s.wantedAvailable == 0 {
+		return
+	}
+	for word, value := range s.availability {
+		value &= s.wanted[word] &^ s.allowedFast[word]
+		s.appendAvailabilityWord(effect, word, value, available)
+	}
+}
+
+func (s *PeerState) appendAvailabilityWord(effect *StateEffect, word int, value uint64, available bool) {
+	for value != 0 {
+		bit := bits.TrailingZeros64(value)
+		index := uint32(word*64 + bit)
+		if available {
+			effect.AvailabilityAdded = append(effect.AvailabilityAdded, index)
+		} else {
+			effect.AvailabilityRemoved = append(effect.AvailabilityRemoved, index)
+		}
+		value &^= uint64(1) << uint(bit)
+	}
+}
+
+func bitCount(set bitSet) uint32 {
+	var count uint32
+	for _, word := range set {
+		count += uint32(bits.OnesCount64(word))
+	}
+	return count
+}
+
+func bitAndCount(a, b, c bitSet) uint32 {
+	var count uint32
+	for word, value := range a {
+		count += uint32(bits.OnesCount64(value & b[word] & c[word]))
+	}
+	return count
 }
 
 type bitSet []uint64

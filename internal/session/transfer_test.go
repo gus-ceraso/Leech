@@ -169,6 +169,74 @@ func TestTransferLocalTCPSingleFile(t *testing.T) {
 	}
 }
 
+func TestTransferAppliesPeerAvailabilityDeltas(t *testing.T) {
+	const pieceCount = 4096
+	pieces := make([]torrent.Piece, pieceCount)
+	for index := range pieces {
+		pieces[index] = piece(index, int64(index), int64(index+1))
+	}
+	plan := schedulerPlan(t,
+		[]torrent.File{regularFile(0, "payload", 0, int64(pieceCount))},
+		pieces,
+		nil,
+	)
+	scheduler, err := NewScheduler(plan, Config{Shuffle: keepTieOrder})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := scheduler.AddPeer("peer", endpoint(1)); err != nil {
+		t.Fatal(err)
+	}
+	transfer := &Transfer{scheduler: scheduler}
+	state, err := peer.NewPeerState(uint32(pieceCount), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := state.SetWantedPieces(plan.WantedPieces()); err != nil {
+		t.Fatal(err)
+	}
+
+	index := uint32(pieceCount - 1)
+	indexPayload := make([]byte, 4)
+	binary.BigEndian.PutUint32(indexPayload, index)
+	for _, message := range []peer.Message{
+		{ID: peer.HaveID, Payload: indexPayload},
+		{ID: peer.AllowedFastID, Payload: indexPayload},
+	} {
+		effect, err := state.ApplyMessage(message)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := transfer.applyAvailabilityChanges("peer", effect); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if rarity, err := scheduler.Rarity(int(index)); err != nil || rarity != 1 {
+		t.Fatalf("last-piece rarity = %d, %v; want one changed availability", rarity, err)
+	}
+	if rarity, err := scheduler.Rarity(0); err != nil || rarity != 0 {
+		t.Fatalf("unadvertised-piece rarity = %d, %v; want zero", rarity, err)
+	}
+
+	effect, err := state.ApplyMessage(peer.Message{ID: peer.HaveID, Payload: indexPayload})
+	if err != nil || len(effect.AvailabilityAdded) != 0 || len(effect.AvailabilityRemoved) != 0 {
+		t.Fatalf("duplicate Have delta = %#v, %v", effect, err)
+	}
+	if err := transfer.applyAvailabilityChanges("peer", effect); err != nil {
+		t.Fatal(err)
+	}
+	effect, err = state.ApplyMessage(peer.Message{ID: peer.HaveNoneID})
+	if err != nil || len(effect.AvailabilityRemoved) != 1 || effect.AvailabilityRemoved[0] != index || !state.AllowedFast(index) {
+		t.Fatalf("Have None delta = %#v, allowed=%v, err=%v", effect, state.AllowedFast(index), err)
+	}
+	if err := transfer.applyAvailabilityChanges("peer", effect); err != nil {
+		t.Fatal(err)
+	}
+	if rarity, err := scheduler.Rarity(int(index)); err != nil || rarity != 0 {
+		t.Fatalf("rarity after Have None = %d, %v; want zero", rarity, err)
+	}
+}
+
 func TestCommittedFinalizeErrorSettlesPieceAndCallsVerifiedOnce(t *testing.T) {
 	data := []byte("payload")
 	selection := schedulerPlan(t,

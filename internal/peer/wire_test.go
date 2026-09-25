@@ -252,6 +252,30 @@ func TestValidFastAndBEP10WireSequenceReachesState(t *testing.T) {
 	}
 }
 
+func TestBitfieldRejectsEverySpareBitPosition(t *testing.T) {
+	opts := ReadOptions{PieceCount: 11, ValidateIndices: true}
+	for bit := uint(0); bit < 5; bit++ {
+		payload := []byte{0x80, 1 << bit}
+		wire := []byte{0, 0, 0, 3, BitfieldID, payload[0], payload[1]}
+		if _, err := ReadMessageWithOptions(newChunkConn(wire, 1), opts); !IsProtocolViolation(err) {
+			t.Fatalf("spare bit %d read error = %v", bit, err)
+		}
+		if err := ValidateMessage(Message{ID: BitfieldID, Payload: payload}, opts); !IsProtocolViolation(err) {
+			t.Fatalf("spare bit %d decoded-message error = %v", bit, err)
+		}
+		state, err := NewPeerState(11, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := state.ApplyMessage(Message{ID: BitfieldID, Payload: payload}); !IsProtocolViolation(err) {
+			t.Fatalf("spare bit %d state error = %v", bit, err)
+		}
+	}
+	if _, err := ReadMessageWithOptions(newChunkConn([]byte{0, 0, 0, 3, BitfieldID, 0x80, 0}, 1), opts); err != nil {
+		t.Fatalf("valid bitfield rejected: %v", err)
+	}
+}
+
 func TestUnknownExtendedPayloadIsDrainedWithoutRetention(t *testing.T) {
 	body := bytes.Repeat([]byte{0x7b}, MaxPeerFrameBytes-2)
 	wire := extensionFrame(99, body)

@@ -444,7 +444,8 @@ func validateBitfieldSpareBits(payload []byte, opts ReadOptions) error {
 		return nil
 	}
 	spare := uint8(8 - opts.PieceCount%8)
-	if payload[len(payload)-1]&(1<<spare-1) != 0 {
+	mask := uint8((1 << spare) - 1)
+	if payload[len(payload)-1]&mask != 0 {
 		return protocolError("validate bitfield", "spare bit is set")
 	}
 	return nil
