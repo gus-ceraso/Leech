@@ -17,14 +17,14 @@ finished CLI's promised behavior.
   prompt the user for explicit approval before implementing it. Continue
   unaffected work. Routine planning and internal implementation changes do not
   require approval.
-- **Orchestrator:** GPT-6 Sol, `high`. Dispatch ready tasks, settle interface
+- **Orchestrator:** GPT-6 Sol, `max`. Dispatch ready tasks, settle interface
   questions, integrate changes, keep this checklist current, and run integration
   checks. Keep implementation work with the workers when practical.
-- **Workers:** GPT-6 Luna, `high`, one worker per task ID. A task includes its
+- **Workers:** GPT-6 Luna, `max`, one worker per task ID. A task includes its
   implementation, focused tests, and fixes. Its checkboxes are subtasks for that
   worker, not separate agent assignments.
 - **Reviewers:** GPT-6 Luna, `max`, one separate reviewer per group, R1–R5
-  for the original implementation and R6 for the robustness follow-up.
+  for the original implementation, R6 for robustness, and R7 for security.
   Review the integrated group once; return fixes to the responsible workers and
   recheck affected areas. No reviewer for every small task or additional review
   hierarchy. The orchestrator accepts the small A0 bootstrap directly.
@@ -1012,3 +1012,121 @@ intended failure. Avoid duplicate cases and tests that mirror implementation.
   seeds and run bounded fuzz campaigns for changed parsers and state machines.
   Keep every minimized regression. Use local deterministic peers and trackers
   throughout; report the absence of external interoperability testing.
+
+## Security review follow-up
+
+Fix all nine findings in [SECURITY.md](SECURITY.md). The earlier checked gates
+record the original implementation; the tasks below are open. Keep the design's
+protocol and resource contracts, and use local deterministic peers and trackers.
+SEC1, SEC2, SEC4, and SEC6 can start independently; SEC3 follows SEC1 and SEC2,
+SEC5 follows SEC4, and R7 follows all six fixes.
+
+### SEC1. Bound HTTP tracker parsing (F-05, F-09)
+
+**Depends on:** I1, T1. **Owns:** `internal/tracker/http.go` and focused tracker
+tests. **References:** DESIGN §§10.2, 16–17; SECURITY F-05, F-09.
+
+- [ ] Deduplicate compact IPv4, compact IPv6, and dictionary peers with one map
+  per response instead of rebuilding it for each entry. Preserve first-endpoint
+  ordering and the existing optional peer-ID behavior.
+- [ ] Apply tracker-specific decoded-node and container limits that still admit
+  valid responses with 20,000 dictionary peers. Reject tracker responses with
+  large unused trees before they cause disproportionate allocation.
+- [ ] Add bounded local fixtures for unique and duplicate peers, and for small
+  wire bodies containing many decoded nodes. Check work and memory bounds
+  without relying on live trackers.
+
+**Acceptance:** a maximum supported peer list parses with linear deduplication
+work, and ignored tracker fields cannot expand into excessive decoded memory.
+
+### SEC2. Keep candidate identity and capacity trustworthy (F-02, F-07)
+
+**Depends on:** P3. **Owns:** `internal/peer/candidates.go`, `dial.go`, and focused
+peer tests. **References:** DESIGN §§11, 16–17; SECURITY F-02, F-07.
+
+- [ ] Keep a supplied tracker peer ID as an expected handshake value, but do
+  not classify its mismatch as a peer-origin protocol violation or blacklist
+  the endpoint. Let a later unpoisoned announcement retry that endpoint.
+- [ ] Keep the 20,000-endpoint cap and resolved IP/port deduplication while
+  allowing later tracker responses to replace stale or repeatedly failed
+  candidates. One tracker must not permanently occupy every slot.
+- [ ] Cover false tracker IDs, mixed TCP/uTP race outcomes, a full pool from one
+  tracker, and later usable peers from another tracker with deterministic inputs.
+
+**Acceptance:** a tracker cannot blacklist an honest endpoint or exclude all
+later candidates; peer-origin severe handshake violations still blacklist it.
+
+### SEC3. Bound tracker-update admission (F-03)
+
+**Depends on:** SEC1, SEC2. **Owns:** `internal/session/metadata.go`, `run.go`,
+and focused session tests. **References:** DESIGN §§10–11, 15–17; SECURITY F-03.
+
+- [ ] Bound the total peer data retained in pending tracker updates, not just
+  the update count. Keep each tracker loop independent and cancellation safe.
+- [ ] Resolve tracker-supplied hostnames under a small concurrency limit and
+  per-lookup deadline. Interleave admission with dialing so a large hostname
+  batch cannot block already available peers or phase shutdown.
+- [ ] Use a local tracker and controlled resolver to cover slow names, later
+  usable IP peers, queue pressure, cancellation, and both discovery phases.
+
+**Acceptance:** malicious hostname lists cannot stall discovery or cause large
+queued-memory growth; valid private and loopback endpoints remain supported.
+
+### SEC4. Make peer availability updates proportional (F-01, F-06)
+
+**Depends on:** P1, P2, D2. **Owns:** `internal/peer/wire.go`, `state.go`,
+`internal/session/transfer.go`, and focused tests. **References:** DESIGN
+§§12–13, 16–17; SECURITY F-01, F-06.
+
+- [ ] Initialize the wanted set in one pass and update interest and scheduler
+  availability from changed bits. Repeated `Have` and empty `Have None`
+  messages must not trigger whole-torrent scans.
+- [ ] Reject every nonzero spare bit in an initial Bitfield through one shared
+  validation rule. Preserve Fast `Have None` and Allowed Fast semantics.
+- [ ] Cover large piece counts, repeated small availability messages, and each
+  spare-bit position with deterministic peer-state and transfer checks.
+
+**Acceptance:** peer startup is not quadratic in piece count, small repeated
+messages cannot force full scans, and malformed bitfields trigger the required
+protocol rejection.
+
+### SEC5. Expire stalled block requests (F-04)
+
+**Depends on:** SEC4, D3. **Owns:** `internal/session/transfer.go`,
+`scheduler.go`, `internal/peer/requests.go` if needed, and focused tests.
+**References:** DESIGN §§12–13, 15; SECURITY F-04.
+
+- [ ] Give active block requests a bounded timeout, release or reassign expired
+  blocks, and rotate peers based on recent useful activity rather than one
+  lifetime `productive` flag. Free connection slots for later candidates.
+- [ ] Preserve exact Fast terminal obligations and bounded tombstones for late
+  responses. Ordinary stalls must not create corruption strikes.
+- [ ] Script a peer that sends one valid block and then idles while later peers
+  can finish, including the active-peer cap and default indefinite retry.
+
+**Acceptance:** a stalled peer cannot hold requests or a slot indefinitely,
+and late Fast responses remain correctly attributed.
+
+### SEC6. Reuse uTP selective ACK state (F-08)
+
+**Depends on:** U2, U4. **Owns:** `internal/utp/receive.go`, `conn.go`, and
+focused uTP tests. **References:** DESIGN §§14, 16–17; SECURITY F-08.
+
+- [ ] Send the ACK returned by the receive state instead of rebuilding it in
+  the socket adapter. Reuse the selective-ACK mask for duplicate packets when
+  the receive window has not changed.
+- [ ] Cover a nearly full reorder window followed by repeated duplicates,
+  checking ACK fields, bounded work, and recovery when the gap closes.
+
+**Acceptance:** duplicate packets cannot force repeated full reorder-map scans,
+and SACK behavior remains correct under loss and reordering.
+
+### R7. Security-fix review and validation
+
+**Depends on:** SEC1–SEC6. One reviewer checks the integrated fixes against
+F-01–F-09 and the original design contracts. Return concrete defects to the
+responsible worker, then recheck affected paths.
+
+- [ ] Confirm each malicious peer and tracker path has a focused regression.
+  Run the affected tests under `-race`, then `go test ./...`, `go vet ./...`,
+  and a pure-Go build. Use local deterministic fixtures only.
