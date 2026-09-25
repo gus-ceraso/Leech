@@ -13,7 +13,7 @@ import (
 )
 
 func TestRunWithSignalsExitsOnSecondSignalDuringCleanup(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
+	_, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	events := make(chan cli.SignalEvent, 2)
 	runStarted := make(chan struct{})
@@ -23,7 +23,7 @@ func TestRunWithSignalsExitsOnSecondSignalDuringCleanup(t *testing.T) {
 
 	done := make(chan int, 1)
 	go func() {
-		done <- runWithSignals(ctx, func() <-chan cli.SignalEvent { return events }, func() { closed.Store(true) }, func() error {
+		done <- runWithSignals(func() <-chan cli.SignalEvent { return events }, func() { closed.Store(true) }, func() error {
 			close(runStarted)
 			<-finishRun
 			return errors.New("canceled")
@@ -59,5 +59,49 @@ func TestRunWithSignalsExitsOnSecondSignalDuringCleanup(t *testing.T) {
 	}
 	if !closed.Load() {
 		t.Fatal("signal source was not closed after cleanup")
+	}
+}
+
+func TestRunWithSignalsCanceledWithoutEventReturns(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	events := make(chan cli.SignalEvent)
+	close(events)
+	done := make(chan int, 1)
+	go func() {
+		done <- runWithSignals(func() <-chan cli.SignalEvent { return events }, func() {}, func() error {
+			<-ctx.Done()
+			return errors.New("canceled")
+		}, func(int) { t.Error("unexpected immediate exit") })
+	}()
+	select {
+	case code := <-done:
+		if code != 1 {
+			t.Fatalf("exit code without a signal event = %d, want 1", code)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("runner blocked waiting for a signal event after its source closed")
+	}
+}
+
+func TestRunWithSignalsReturnsFirstSignalCode(t *testing.T) {
+	_, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	events := make(chan cli.SignalEvent, 1)
+	done := make(chan int, 1)
+	go func() {
+		done <- runWithSignals(func() <-chan cli.SignalEvent { return events }, func() { close(events) }, func() error {
+			events <- cli.SignalEvent{Signal: os.Interrupt, ExitCode: 130}
+			cancel()
+			return errors.New("canceled")
+		}, func(int) { t.Error("unexpected immediate exit") })
+	}()
+	select {
+	case code := <-done:
+		if code != 130 {
+			t.Fatalf("first signal exit code = %d, want 130", code)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("runner did not return the first signal exit code")
 	}
 }

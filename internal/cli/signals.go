@@ -101,11 +101,9 @@ func (a *SignalAdapter) run() {
 				continue
 			}
 			event := SignalEvent{Signal: sig, ExitCode: SignalExitCode(sig)}
+			wasFirst := first
 			if first {
 				first = false
-				if a.cancel != nil {
-					a.cancel()
-				}
 			} else {
 				event.Immediate = true
 			}
@@ -113,6 +111,9 @@ func (a *SignalAdapter) run() {
 			case a.events <- event:
 			case <-a.closed:
 				return
+			}
+			if wasFirst && a.cancel != nil {
+				a.cancel()
 			}
 		}
 	}
