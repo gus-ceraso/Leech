@@ -487,7 +487,7 @@ and peer-replacement policy. **References:** DESIGN §§4.6, 12–13.
 **Acceptance:** bulk behavior still passes, streaming progresses without needless
 idle connections, and endgame cannot double-commit a block or leak request slots.
 
-- [ ] **R2 — Peer/transfer review:** one reviewer checks P1–P3 and D1–D3. Inspect
+- [x] **R2 — Peer/transfer review:** one reviewer checks P1–P3 and D1–D3. Inspect
   outbound API reachability, independent availability/Allowed Fast, terminal
   obligations, exact-endpoint races, coordinator ownership, and corruption
   attribution. Run the first-download and concurrent-state regressions.
@@ -507,8 +507,9 @@ idle connections, and endgame cannot double-commit a block or leak request slots
     endpoints after severe handshake violations (`bb0e235`).
   - [x] D3: propagate transfer-phase severe and corruption blacklists to the
     candidate dialer (`0ce6e28`).
-  - [ ] P1: bound retained peer event payload across 64 connections; unknown
-    well-framed core messages must remain ignorable without large queue memory.
+  - [x] P1: bound retained peer event payload across 64 connections; unknown
+    well-framed core messages must remain ignorable without large queue memory
+    (`1fc7fa0`).
 
 ## Group 3: Trackers and metadata discovery
 
@@ -633,7 +634,7 @@ local metadata-discovery tests. **References:** DESIGN §§6, 7.4, 15.
   tracker loops, dials, and metadata peers, then attempt bounded stopped events
   before full normalization. Return immutable metadata and bounded retained
   endpoint values, never a live network worker or cache workspace.
-- [ ] Test magnet/bare hashes, wrong sizes/hashes, refusing peers, ID changes,
+- [x] Test magnet/bare hashes, wrong sizes/hashes, refusing peers, ID changes,
   corruption strikes, repeated retry/cancellation, tracker loss, and the absence
   of file-payload requests. Assert the phase boundary under the race detector.
   Initial local fixtures cover multi-block metadata, refusal, repeated extension
@@ -654,6 +655,13 @@ serves no metadata, and is not subject to the file-transfer no-progress timeout.
   Focus on HTTP sanitization, UDP timing, transmitted-versus-successful started,
   final events, whole-torrent accounting, directional extension IDs, single-source
   metadata, and phase quiescence. Use captured local request traces as evidence.
+
+  R3 fixes to recheck:
+
+  - [x] T1: retain the standard ten-redirect HTTP limit while sanitizing every
+    redirect (`f609204`).
+  - [ ] T2: reconnect before retransmitting an announce whose BEP 15 connection
+    ID has expired; preserve the transaction retry schedule and final deadline.
 
 ## Group 4: uTP, developed alongside TCP
 
