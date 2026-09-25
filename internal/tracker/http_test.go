@@ -318,7 +318,12 @@ func FuzzParseHTTPAnnounceResponse(f *testing.F) {
 	f.Add([]byte("d8:intervali60e5:peers0:e"))
 	f.Add([]byte("d14:failure reason3:bade"))
 	f.Add([]byte("d8:intervali60e5:peers6:\x7f\x00\x00\x01\x1a\xe1e"))
-	f.Add([]byte("d8:intervali60e5:peersld2:ip9:127.0.0.14:porti6881eee"))
+	dictionaryPeer := []byte("d8:intervali60e5:peersld2:ip9:127.0.0.14:porti6881eeee")
+	parsed, err := parseHTTPAnnounceResponse(dictionaryPeer)
+	if err != nil || len(parsed.Peers) != 1 || parsed.Peers[0].Host != "127.0.0.1" || parsed.Peers[0].Port != 6881 {
+		f.Fatalf("dictionary-peer fuzz seed = %+v, %v", parsed.Peers, err)
+	}
+	f.Add(dictionaryPeer)
 	f.Fuzz(func(t *testing.T, body []byte) {
 		_, _ = parseHTTPAnnounceResponse(body)
 	})
