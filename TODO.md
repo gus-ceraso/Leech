@@ -17,13 +17,13 @@ finished CLI's promised behavior.
   prompt the user for explicit approval before implementing it. Continue
   unaffected work. Routine planning and internal implementation changes do not
   require approval.
-- **Orchestrator:** GPT-5.6 Sol, `high`. Dispatch ready tasks, settle interface
+- **Orchestrator:** GPT-6 Sol, `high`. Dispatch ready tasks, settle interface
   questions, integrate changes, keep this checklist current, and run integration
   checks. Keep implementation work with the workers when practical.
-- **Workers:** GPT-5.6 Luna, `xhigh`, one worker per task ID. A task includes its
+- **Workers:** GPT-6 Luna, `high`, one worker per task ID. A task includes its
   implementation, focused tests, and fixes. Its checkboxes are subtasks for that
   worker, not separate agent assignments.
-- **Reviewers:** GPT-5.6 Luna, `xhigh`, one separate reviewer per group, R1–R5.
+- **Reviewers:** GPT-6 Luna, `max`, one separate reviewer per group, R1–R5.
   Review the integrated group once; return fixes to the responsible workers and
   recheck affected areas. No reviewer for every small task or additional review
   hierarchy. The orchestrator accepts the small A0 bootstrap directly.
@@ -494,10 +494,10 @@ idle connections, and endgame cannot double-commit a block or leak request slots
 
   R2 findings to return to original owners:
 
-  - [ ] P1: report worker event-queue overflow to the coordinator, and make
-    concurrent `Start`/`Close` join-safe.
-  - [ ] P2: enforce initial availability message ordering, so late bitfields
-    cannot restore availability after `Have None`.
+  - [x] P1: report worker event-queue overflow to the coordinator, and make
+    concurrent `Start`/`Close` join-safe (`134d851`, `249ce31`).
+  - [x] P2: enforce initial availability message ordering, so late bitfields
+    cannot restore availability after `Have None` (`b0583b1`).
   - [x] D3: treat closed worker channels and Fast tombstone-cap choke as
     peer-local disconnects; release every initial peer on startup failure;
     preserve explicit `reqq=0`; expose received-payload accounting and a
