@@ -13,6 +13,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -386,6 +387,119 @@ func TestV1SelectiveCLIWritesOnlySelectedPathAndStopsWithoutCompletion(t *testin
 	peers.assertNoUpload(t)
 }
 
+func TestV1CLIReportsVerifiedPieceAfterLaterFailure(t *testing.T) {
+	data := bytes.Repeat([]byte("x"), 32<<10)
+	infoBytes, infoHash := v1TwoPieceInfo(t, data)
+	torrentPath := writeV1Torrent(t, v1Metainfo(t, infoBytes, ""))
+	output := t.TempDir()
+	trackerFixture := &v1Tracker{}
+	peers := newV1Peers(t, infoHash, infoBytes, data, false)
+	peers.pieceLength = 16 << 10
+	defer peers.close()
+	opts := parseV1Options(t, "--output", output, "--timeout", "150ms", torrentPath)
+	var stderr bytes.Buffer
+	err := RunWithSession(context.Background(), opts, &bytes.Buffer{}, &stderr, v1SessionConfig(t, trackerFixture, peers))
+	if err == nil {
+		t.Fatal("run unexpectedly completed despite the second piece being unavailable")
+	}
+	if !strings.Contains(stderr.String(), "verified partial output remains resumable") {
+		t.Fatalf("failure omitted resumable output status: %q", stderr.String())
+	}
+	got, readErr := os.ReadFile(filepath.Join(output, "payload.bin"))
+	if readErr != nil || !bytes.Equal(got, data[:16<<10]) {
+		t.Fatalf("verified output = %d bytes, %v; want first 16 KiB", len(got), readErr)
+	}
+}
+
+func TestV1CLIReportsVerifiedResumePieceAfterLaterFailure(t *testing.T) {
+	data := bytes.Repeat([]byte("r"), 32<<10)
+	infoBytes, infoHash := v1TwoPieceInfo(t, data)
+	torrentPath := writeV1Torrent(t, v1Metainfo(t, infoBytes, ""))
+	output := t.TempDir()
+	if err := os.WriteFile(filepath.Join(output, "payload.bin"), data[:16<<10], 0o600); err != nil {
+		t.Fatal(err)
+	}
+	trackerFixture := &v1Tracker{}
+	peers := newV1Peers(t, infoHash, infoBytes, data, false)
+	peers.pieceLength = 16 << 10
+	defer peers.close()
+	opts := parseV1Options(t, "--output", output, "--resume", "--timeout", "150ms", torrentPath)
+	var stderr bytes.Buffer
+	err := RunWithSession(context.Background(), opts, &bytes.Buffer{}, &stderr, v1SessionConfig(t, trackerFixture, peers))
+	if err == nil {
+		t.Fatal("run unexpectedly completed despite the second piece being unavailable")
+	}
+	if !strings.Contains(stderr.String(), "verified partial output remains resumable") {
+		t.Fatalf("failure omitted verified resume output status: %q", stderr.String())
+	}
+	got, readErr := os.ReadFile(filepath.Join(output, "payload.bin"))
+	if readErr != nil || !bytes.Equal(got, data[:16<<10]) {
+		t.Fatalf("resumed output = %d bytes, %v; want first 16 KiB", len(got), readErr)
+	}
+}
+
+func TestV1CLIResumePreservesVerifiedPieceAndWritesMissingPiece(t *testing.T) {
+	data := bytes.Repeat([]byte("s"), 32<<10)
+	infoBytes, infoHash := v1TwoPieceInfo(t, data)
+	torrentPath := writeV1Torrent(t, v1Metainfo(t, infoBytes, ""))
+	output := t.TempDir()
+	if err := os.WriteFile(filepath.Join(output, "payload.bin"), data[:16<<10], 0o600); err != nil {
+		t.Fatal(err)
+	}
+	trackerFixture := &v1Tracker{}
+	peers := newV1Peers(t, infoHash, infoBytes, data, false)
+	peers.pieceLength = 16 << 10
+	peers.bitfield = []byte{0xc0}
+	defer peers.close()
+	opts := parseV1Options(t, "--output", output, "--resume", torrentPath)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := RunWithSession(ctx, opts, &bytes.Buffer{}, &bytes.Buffer{}, v1SessionConfig(t, trackerFixture, peers)); err != nil {
+		t.Fatalf("CLI resume: %v", err)
+	}
+	if got, err := os.ReadFile(filepath.Join(output, "payload.bin")); err != nil || !bytes.Equal(got, data) {
+		t.Fatalf("resumed output = %d bytes, %v; want all %d bytes", len(got), err, len(data))
+	}
+	if err := peers.wait(t); err != nil {
+		t.Fatal(err)
+	}
+	peers.mu.Lock()
+	requested := append([]uint32(nil), peers.requestedPieces...)
+	peers.mu.Unlock()
+	if len(requested) == 0 {
+		t.Fatal("peer received no block requests")
+	}
+	for _, index := range requested {
+		if index != 1 {
+			t.Fatalf("requested piece indices = %v, want missing piece 1 only", requested)
+		}
+	}
+}
+
+func TestV1CLIWithoutResumeTruncatesExistingOutputBeforeTransfer(t *testing.T) {
+	data := []byte("do not retain")
+	infoBytes, infoHash := v1Info(t, data)
+	torrentPath := writeV1Torrent(t, v1Metainfo(t, infoBytes, ""))
+	output := t.TempDir()
+	outputPath := filepath.Join(output, "payload.bin")
+	if err := os.WriteFile(outputPath, []byte("old output"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	trackerFixture := &v1Tracker{}
+	peers := newV1Peers(t, infoHash, infoBytes, data, false)
+	peers.stall = true
+	defer peers.close()
+	opts := parseV1Options(t, "--output", output, "--timeout", "150ms", torrentPath)
+	err := RunWithSession(context.Background(), opts, &bytes.Buffer{}, &bytes.Buffer{}, v1SessionConfig(t, trackerFixture, peers))
+	if err == nil {
+		t.Fatal("stalled transfer unexpectedly succeeded")
+	}
+	got, readErr := os.ReadFile(outputPath)
+	if readErr != nil || len(got) != 0 {
+		t.Fatalf("output after overwrite-mode failure = %q, %v; want empty file", got, readErr)
+	}
+}
+
 func TestV1CLICompleteResumeSkipsNetwork(t *testing.T) {
 	data := []byte("already verified")
 	infoBytes, _ := v1Info(t, data)
@@ -695,6 +809,33 @@ func v1Info(t *testing.T, data []byte) ([]byte, torrent.InfoHash) {
 	return encoded, infoHash
 }
 
+func v1TwoPieceInfo(t *testing.T, data []byte) ([]byte, torrent.InfoHash) {
+	t.Helper()
+	const pieceLength = 16 << 10
+	if len(data) != 2*pieceLength {
+		t.Fatalf("two-piece fixture length = %d, want %d", len(data), 2*pieceLength)
+	}
+	pieces := make([]byte, 0, 40)
+	for begin := 0; begin < len(data); begin += pieceLength {
+		digest := sha1.Sum(data[begin : begin+pieceLength])
+		pieces = append(pieces, digest[:]...)
+	}
+	value := bencode.Value{Type: bencode.Dictionary, Dict: []bencode.Entry{
+		{Key: []byte("length"), Value: bencode.Value{Type: bencode.Integer, Int: int64(len(data))}},
+		{Key: []byte("name"), Value: bencode.Value{Type: bencode.Bytes, Bytes: []byte("payload.bin")}},
+		{Key: []byte("piece length"), Value: bencode.Value{Type: bencode.Integer, Int: pieceLength}},
+		{Key: []byte("pieces"), Value: bencode.Value{Type: bencode.Bytes, Bytes: pieces}},
+	}}
+	encoded, err := bencode.Encode(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha1.Sum(encoded)
+	var infoHash torrent.InfoHash
+	copy(infoHash[:], digest[:])
+	return encoded, infoHash
+}
+
 func v1MultiInfo(t *testing.T, data []byte) ([]byte, torrent.InfoHash) {
 	t.Helper()
 	piece := sha1.Sum(data)
@@ -757,18 +898,21 @@ func writeV1Torrent(t *testing.T, data []byte) string {
 }
 
 type v1PeerFixture struct {
-	infoHash      torrent.InfoHash
-	info          []byte
-	data          []byte
-	metadataFirst bool
-	stall         bool
-	calls         atomic.Int32
-	done          chan error
-	mu            sync.Mutex
-	outbound      []byte
-	requested     [][2]uint32
-	serverMu      sync.Mutex
-	servers       []net.Conn
+	infoHash        torrent.InfoHash
+	info            []byte
+	data            []byte
+	pieceLength     int
+	bitfield        []byte
+	metadataFirst   bool
+	stall           bool
+	calls           atomic.Int32
+	done            chan error
+	mu              sync.Mutex
+	outbound        []byte
+	requested       [][2]uint32
+	requestedPieces []uint32
+	serverMu        sync.Mutex
+	servers         []net.Conn
 }
 
 func newV1Peers(t *testing.T, infoHash torrent.InfoHash, info, data []byte, metadataFirst bool) *v1PeerFixture {
@@ -858,7 +1002,11 @@ func (f *v1PeerFixture) serveTransfer(conn net.Conn) error {
 	f.mu.Lock()
 	f.outbound = append(f.outbound, initial.ID)
 	f.mu.Unlock()
-	if err := v1WriteFrame(conn, v1RawMessage(peer.BitfieldID, []byte{0x80})); err != nil {
+	bitfield := f.bitfield
+	if len(bitfield) == 0 {
+		bitfield = []byte{0x80}
+	}
+	if err := v1WriteFrame(conn, v1RawMessage(peer.BitfieldID, bitfield)); err != nil {
 		return err
 	}
 	if f.stall {
@@ -895,11 +1043,17 @@ func (f *v1PeerFixture) serveTransfer(conn net.Conn) error {
 			}
 			index, begin := binary.BigEndian.Uint32(message.Payload[:4]), binary.BigEndian.Uint32(message.Payload[4:8])
 			length := binary.BigEndian.Uint32(message.Payload[8:])
-			if index != 0 || length == 0 || uint64(begin)+uint64(length) > uint64(len(f.data)) {
+			pieceLength := f.pieceLength
+			if pieceLength <= 0 {
+				pieceLength = len(f.data)
+			}
+			absoluteBegin := uint64(index)*uint64(pieceLength) + uint64(begin)
+			if length == 0 || absoluteBegin+uint64(length) > uint64(len(f.data)) {
 				return fmt.Errorf("request = piece %d begin %d length %d", index, begin, length)
 			}
 			f.mu.Lock()
 			f.requested = append(f.requested, [2]uint32{begin, length})
+			f.requestedPieces = append(f.requestedPieces, index)
 			f.mu.Unlock()
 			if !requested {
 				if err := peer.WriteMessage(conn, peer.Message{ID: peer.RequestID, Payload: v1BlockRequest(0, 0, 1)}); err != nil {
@@ -910,11 +1064,11 @@ func (f *v1PeerFixture) serveTransfer(conn net.Conn) error {
 			piece := make([]byte, 8+int(length))
 			binary.BigEndian.PutUint32(piece[:4], index)
 			binary.BigEndian.PutUint32(piece[4:8], begin)
-			copy(piece[8:], f.data[begin:uint32(begin+length)])
+			copy(piece[8:], f.data[int(absoluteBegin):int(absoluteBegin+uint64(length))])
 			if err := v1WriteFrame(conn, v1RawMessage(peer.PieceID, piece)); err != nil {
 				return err
 			}
-			for position := begin; position < begin+length; position++ {
+			for position := int(absoluteBegin); position < int(absoluteBegin+uint64(length)); position++ {
 				covered[position] = true
 			}
 		case peer.RejectRequestID:

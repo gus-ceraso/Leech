@@ -68,6 +68,7 @@ type MetadataConfig struct {
 	Backoff        *peer.EndpointBackoff
 	LocalHandshake peer.Handshake
 	Now            func() time.Time
+	OnSecondary    func(error)
 
 	// OnStrike observes a completed, hash-invalid candidate. It is called once
 	// per invalid candidate, after the endpoint strike count is incremented.
@@ -261,14 +262,19 @@ func (d *MetadataDiscovery) Run(ctx context.Context) (result MetadataResult, pri
 	}
 
 	var run *tracker.PhaseRun
+	finalize := func() {
+		if run == nil {
+			return
+		}
+		finalErr := run.Finalize(context.Background(), false)
+		run = nil
+		if finalErr != nil && config.OnSecondary != nil {
+			config.OnSecondary(finalErr)
+		}
+	}
 	defer func() {
 		cancel()
-		if run != nil {
-			if finalErr := run.Finalize(context.Background(), false); primary == nil && finalErr != nil {
-				// Final event errors are deliberately secondary. They are not returned
-				// when discovery has a primary result, including cancellation.
-			}
-		}
+		finalize()
 		if ownSet {
 			_ = set.Close(context.Background())
 		}
@@ -326,7 +332,7 @@ func (d *MetadataDiscovery) Run(ctx context.Context) (result MetadataResult, pri
 				// workers were active. Full v1 normalization starts only after
 				// every metadata worker and tracker loop has been joined.
 				cancel()
-				_ = run.Finalize(context.Background(), false)
+				finalize()
 				result.Endpoints = pool.Snapshot()
 				result.Strikes = strikeSnapshot(strikes)
 				result.Metainfo, err = torrent.ParseInfoDictionary(candidateData.data, config.InfoHash, set.Trackers())

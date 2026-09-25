@@ -34,6 +34,18 @@ type metadataUnansweredTracker struct {
 	once     sync.Once
 }
 
+type metadataFinalFailureTracker struct {
+	fixture *metadataFixtureTracker
+}
+
+func (f metadataFinalFailureTracker) Announce(ctx context.Context, rawURL string, request tracker.AnnounceRequest) (tracker.HTTPAnnounceResult, error) {
+	result, err := f.fixture.Announce(ctx, rawURL, request)
+	if request.Event == tracker.EventStopped {
+		return result, errors.New("stopped fixture failure")
+	}
+	return result, err
+}
+
 func (f *metadataUnansweredTracker) Announce(ctx context.Context, _ string, request tracker.AnnounceRequest) (tracker.HTTPAnnounceResult, error) {
 	f.mu.Lock()
 	f.requests = append(f.requests, request)
@@ -207,6 +219,63 @@ func TestMetadataDiscoveryObtainsAllBlocksAndFinalizesPhase(t *testing.T) {
 	}
 	if !seenDefault || !seenFixture {
 		t.Fatalf("tracker URLs = %v, want mandatory default and fixture", urls)
+	}
+}
+
+func TestRunReportsMetadataFinalEventFailureAsSecondary(t *testing.T) {
+	info := largeTestInfo(t)
+	digest := sha1.Sum(info)
+	var expected torrent.InfoHash
+	copy(expected[:], digest[:])
+	serverDone := make(chan struct{})
+	fixture := &metadataFixtureTracker{port: 51414}
+	dial := func(ctx context.Context, _, _ string) (net.Conn, error) {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		client, server := net.Pipe()
+		go serveMetadataPeer(t, server, expected, info, serverDone)
+		return client, nil
+	}
+	secondary := make(chan error, 1)
+	result, err := Run(context.Background(), RunConfig{
+		Source:    torrent.Source{Kind: torrent.SourceInfoHash, InfoHash: expected, Trackers: []string{"http://fixture.test/announce"}},
+		ListFiles: true, HTTP: metadataFinalFailureTracker{fixture: fixture}, TCPDial: dial,
+		Identity:    tracker.Identity{PeerID: [20]byte{18}, Port: 49160},
+		OnSecondary: func(err error) { secondary <- err },
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if result.Metainfo.InfoHash != expected {
+		t.Fatalf("metainfo hash = %x, want %x", result.Metainfo.InfoHash, expected)
+	}
+	select {
+	case err := <-secondary:
+		if err == nil || !strings.Contains(err.Error(), "stopped fixture failure") {
+			t.Fatalf("secondary error = %v, want stopped announce failure", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("final stopped announce failure was not reported")
+	}
+	select {
+	case <-serverDone:
+	case <-time.After(time.Second):
+		t.Fatal("metadata peer did not finish")
+	}
+	started, stopped := 0, 0
+	for _, request := range fixture.snapshot() {
+		switch request.Event {
+		case tracker.EventStarted:
+			started++
+		case tracker.EventStopped:
+			stopped++
+		case tracker.EventCompleted:
+			t.Fatal("metadata phase sent completed")
+		}
+	}
+	if started == 0 || stopped == 0 {
+		t.Fatalf("tracker events = %d started, %d stopped; want both", started, stopped)
 	}
 }
 

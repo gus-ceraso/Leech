@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -127,6 +128,21 @@ func TestRunRemoteListingCancelsWithoutNetwork(t *testing.T) {
 	}
 	if !reflect.DeepEqual(output.Bytes(), []byte(nil)) {
 		t.Fatalf("remote listing wrote output: %q", output.String())
+	}
+}
+
+func TestRunWithSessionDoesNotClaimInvalidTorrentIsResumable(t *testing.T) {
+	torrentPath := filepath.Join(t.TempDir(), "bad.torrent")
+	if err := os.WriteFile(torrentPath, []byte("not bencode"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var stderr bytes.Buffer
+	opts := Options{Source: torrentPath, Output: t.TempDir()}
+	if err := RunWithSession(context.Background(), opts, &bytes.Buffer{}, &stderr, session.RunConfig{}); err == nil {
+		t.Fatal("invalid torrent unexpectedly succeeded")
+	}
+	if strings.Contains(stderr.String(), "verified partial output remains resumable") {
+		t.Fatalf("prevalidation failure claimed resumable output: %q", stderr.String())
 	}
 }
 

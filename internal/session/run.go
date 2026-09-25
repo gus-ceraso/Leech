@@ -79,6 +79,9 @@ type RunResult struct {
 	NoTransferNeeded  bool
 	SelectionComplete bool
 	TorrentComplete   bool
+	// HasVerifiedOutput reports selected payload retained in final output,
+	// including pieces verified during resume.
+	HasVerifiedOutput bool
 }
 
 // Progress is the small callback snapshot emitted after a verified piece.
@@ -104,6 +107,9 @@ func RunSource(ctx context.Context, raw string, config RunConfig) (RunResult, er
 // discovery before selection and resume validation, and it returns only after
 // every owned network and storage worker has stopped.
 func Run(ctx context.Context, config RunConfig) (result RunResult, err error) {
+	var verifiedOutput atomic.Bool
+	defer func() { result.HasVerifiedOutput = verifiedOutput.Load() }()
+
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -144,7 +150,7 @@ func Run(ctx context.Context, config RunConfig) (result RunResult, err error) {
 		}
 	}
 
-	run := &coordinator{config: config, identity: identity, backoff: peer.NewEndpointBackoff()}
+	run := &coordinator{config: config, identity: identity, backoff: peer.NewEndpointBackoff(), verifiedOutput: &verifiedOutput}
 	run.ownSet = config.TrackerSet == nil
 	defer func() {
 		if closeErr := run.closeSet(); closeErr != nil {
@@ -236,6 +242,9 @@ func Run(ctx context.Context, config RunConfig) (result RunResult, err error) {
 	if config.Resume {
 		run.phase("resume")
 		resumeResult, err = storage.ScanResume(ctx, selection, plan)
+		if len(resumeResult.VerifiedPieces) > 0 {
+			verifiedOutput.Store(true)
+		}
 		if err != nil {
 			return RunResult{}, err
 		}
@@ -344,8 +353,9 @@ func realPieceBytes(mapping torrent.PiecePlan) int64 {
 }
 
 type coordinator struct {
-	config   RunConfig
-	identity tracker.Identity
+	config         RunConfig
+	identity       tracker.Identity
+	verifiedOutput *atomic.Bool
 
 	set        *tracker.TrackerSet
 	ownSet     bool
@@ -455,7 +465,7 @@ func (c *coordinator) discover(ctx context.Context, source torrent.Source) (torr
 		TrackerClock: c.config.TrackerClock, Resolver: c.config.Resolver,
 		TCPDial: c.tcpDial(), UTPDial: c.utpDial(), Clock: c.config.RaceClock,
 		UTPHeadStart: c.config.UTPHeadStart, Backoff: c.backoff,
-		LocalHandshake: local, OnStrike: func(endpoint peer.Endpoint, count uint8) {
+		LocalHandshake: local, OnSecondary: c.config.OnSecondary, OnStrike: func(endpoint peer.Endpoint, count uint8) {
 			strikes[endpoint] = int(count)
 		},
 	})
@@ -593,11 +603,16 @@ func (c *coordinator) startTransferPhase(ctx context.Context, source torrent.Sou
 	}
 	verifiedSelected := int64(0)
 	rate := newPayloadRate()
+	prepareMode := storage.Overwrite
+	if c.config.Resume {
+		prepareMode = storage.Resume
+	}
 	for _, span := range resume.VerifiedRanges {
 		verifiedSelected += span.Range.End - span.Range.Begin
 	}
 	transfer, err := NewTransfer(TransferConfig{
 		Selection: selection, Output: output, Stager: storage.NewStager(storage.StagerConfig{CacheRoot: c.config.CacheRoot}),
+		PrepareMode:     prepareMode,
 		SchedulerConfig: Config{Streaming: c.config.Streaming}, LocalHandshake: local,
 		PieceCount: uint32(len(meta.Pieces)), PieceLength: uint32(meta.PieceLength),
 		LastPieceLength: uint32(meta.Pieces[len(meta.Pieces)-1].Range.End - meta.Pieces[len(meta.Pieces)-1].Range.Begin),
@@ -605,6 +620,9 @@ func (c *coordinator) startTransferPhase(ctx context.Context, source torrent.Sou
 		OnEndpointBlacklisted: c.backoff.Blacklist,
 		ResumeComplete:        resume.VerifiedPieces,
 		OnPieceVerified: func(piece PieceVerified) {
+			if piece.SelectedBytes > 0 {
+				c.verifiedOutput.Store(true)
+			}
 			if mapping, ok := selection.Piece(piece.PieceIndex); ok {
 				_ = c.account.AddRetained(realPieceBytes(mapping))
 			}

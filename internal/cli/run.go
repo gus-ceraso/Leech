@@ -82,7 +82,7 @@ func RunWithSession(ctx context.Context, opts Options, stdout, stderr io.Writer,
 	}
 	result, err := session.Run(ctx, dependencies)
 	if err != nil {
-		_ = reporter.PrimaryFailure(err, !opts.ListFiles)
+		_ = reporter.PrimaryFailure(err, result.HasVerifiedOutput)
 		return err
 	}
 	if opts.ListFiles {
