@@ -58,6 +58,26 @@ func TestTrackerPeerUpdateQueueBoundsRetainedPeersAndBytes(t *testing.T) {
 	})
 }
 
+func TestTrackerPeerUpdateQueuePreservesIPOrderWithinNewestUpdate(t *testing.T) {
+	queue := newTrackerPeerUpdateQueue()
+	queue.enqueuePeers(tracker.TransferPhase, []tracker.TrackerPeer{
+		{Host: "127.0.0.1", Port: 51411},
+		{Host: "127.0.0.1", Port: 51412},
+	})
+	queue.enqueuePeers(tracker.TransferPhase, []tracker.TrackerPeer{
+		{Host: "127.0.0.1", Port: 51413},
+		{Host: "127.0.0.1", Port: 51414},
+	})
+
+	for _, want := range []uint16{51413, 51414, 51411, 51412} {
+		item := queue.takePeer(false)
+		if item == nil || item.peer.Port != want {
+			t.Fatalf("next IP = %+v, want port %d", item, want)
+		}
+		queue.releasePeer(item)
+	}
+}
+
 func TestTrackerPeerUpdateQueuePreservesStatusWithoutPeerBackingSlice(t *testing.T) {
 	queue := newTrackerPeerUpdateQueue()
 	update := tracker.Update{

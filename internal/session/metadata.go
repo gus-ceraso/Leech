@@ -121,7 +121,9 @@ func (q *trackerPeerUpdateQueue) enqueuePeers(phase tracker.Phase, peers []track
 	q.mu.Lock()
 	// Admit IP literals first, so a hostname-heavy update cannot place its
 	// usable literal peers behind any resolver work, including in later updates.
-	for i := 0; i < limit; i++ {
+	// Append IPs from the end so takePeer's back-pop preserves parser order
+	// within this update while still putting newer updates ahead of older ones.
+	for i := limit - 1; i >= 0; i-- {
 		announced := peers[i]
 		if !usableQueuedPeer(announced) || !isTrackerPeerIP(announced.Host) {
 			continue
