@@ -146,6 +146,66 @@ func TestRunWithSessionDoesNotClaimInvalidTorrentIsResumable(t *testing.T) {
 	}
 }
 
+func TestRunInvalidTorrentCreatesNoOutputOrCacheAndStartsNoNetwork(t *testing.T) {
+	const unsafeTorrent = "d4:infod6:lengthi1e4:name4:../A12:piece lengthi1e6:pieces20:" +
+		"\x6d\xcd\x4c\xe2\x3d\x88\xe2\xee\x95\x68\xba\x54\x6c\x00\x7c\x63\xd9\x13\x1c\x1bee"
+	base := t.TempDir()
+	torrentPath := filepath.Join(base, "unsafe.torrent")
+	if err := os.WriteFile(torrentPath, []byte(unsafeTorrent), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	outputPath := filepath.Join(base, "output")
+	cachePath := filepath.Join(base, "cache")
+	var httpCalls, udpCalls, resolveCalls, dialCalls int
+	var stdout, stderr bytes.Buffer
+	err := RunWithSession(context.Background(), Options{Source: torrentPath, Output: outputPath}, &stdout, &stderr, session.RunConfig{
+		HTTP:     countHTTPAnnounce{calls: &httpCalls},
+		UDP:      countUDPAnnounce{calls: &udpCalls},
+		Resolver: countingResolver{calls: &resolveCalls},
+		TCPDial: func(context.Context, string, string) (net.Conn, error) {
+			dialCalls++
+			return nil, errors.New("unexpected TCP dial")
+		},
+		UTPDial: func(context.Context, string, string) (net.Conn, error) {
+			dialCalls++
+			return nil, errors.New("unexpected uTP dial")
+		},
+		CacheRoot: cachePath,
+	})
+	if err == nil {
+		t.Fatal("unsafe torrent unexpectedly succeeded")
+	}
+	for _, path := range []string{outputPath, cachePath} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("invalid torrent created or inspected %q: %v", path, err)
+		}
+	}
+	if httpCalls != 0 || udpCalls != 0 || resolveCalls != 0 || dialCalls != 0 {
+		t.Fatalf("invalid torrent started network work: HTTP=%d UDP=%d resolve=%d dial=%d", httpCalls, udpCalls, resolveCalls, dialCalls)
+	}
+}
+
+type countHTTPAnnounce struct{ calls *int }
+
+func (s countHTTPAnnounce) Announce(context.Context, string, tracker.AnnounceRequest) (tracker.HTTPAnnounceResult, error) {
+	(*s.calls)++
+	return tracker.HTTPAnnounceResult{}, errors.New("unexpected HTTP announce")
+}
+
+type countUDPAnnounce struct{ calls *int }
+
+func (s countUDPAnnounce) Announce(context.Context, string, tracker.AnnounceRequest) (tracker.AnnounceResult, error) {
+	(*s.calls)++
+	return tracker.AnnounceResult{}, errors.New("unexpected UDP announce")
+}
+
+type countingResolver struct{ calls *int }
+
+func (s countingResolver) LookupIPAddr(context.Context, string) ([]net.IPAddr, error) {
+	(*s.calls)++
+	return nil, errors.New("unexpected resolve")
+}
+
 type noNetworkHTTP struct{}
 
 func (noNetworkHTTP) Announce(ctx context.Context, _ string, _ tracker.AnnounceRequest) (tracker.HTTPAnnounceResult, error) {

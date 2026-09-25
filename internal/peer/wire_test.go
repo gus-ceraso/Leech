@@ -205,6 +205,53 @@ func TestExtendedHandshakeRemainsAvailable(t *testing.T) {
 	}
 }
 
+func TestValidFastAndBEP10WireSequenceReachesState(t *testing.T) {
+	fast := ReadOptions{Fast: true, PieceCount: 8, ValidateIndices: true, PieceLength: 16 << 10}
+	frames := [][]byte{
+		{0, 0, 0, 2, BitfieldID, 0x80},
+		{0, 0, 0, 5, AllowedFastID, 0, 0, 0, 0},
+		{0, 0, 0, 1, HaveNoneID},
+	}
+	state, err := NewPeerStateWithConfig(PeerStateConfig{PieceCount: 8, PieceLength: 16 << 10, Fast: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, frame := range frames {
+		message, err := ReadMessageWithOptions(newChunkConn(frame, 2), fast)
+		if err != nil {
+			t.Fatalf("ReadMessageWithOptions(%x): %v", frame, err)
+		}
+		if _, err := state.ApplyMessage(message); err != nil {
+			t.Fatalf("ApplyMessage(%x): %v", frame, err)
+		}
+	}
+	if state.Availability(0) || !state.AllowedFast(0) || state.CanRequest(0) {
+		t.Fatalf("Fast sequence state availability=%v allowed=%v canRequest=%v", state.Availability(0), state.AllowedFast(0), state.CanRequest(0))
+	}
+
+	// Canonical BEP 10 handshake advertising remote ut_metadata ID 9.
+	body := []byte("d1:md11:ut_metadatai9ee13:metadata_sizei32769ee")
+	frame := extensionFrame(ExtensionHandshakeID, body)
+	message, err := ReadMessage(newChunkConn(frame, 3))
+	if err != nil {
+		t.Fatalf("ReadMessage(BEP 10): %v", err)
+	}
+	extensions := NewExtensionStateWithLocalID(7)
+	if _, err := extensions.ApplyMessage(message); err != nil {
+		t.Fatalf("ApplyMessage(BEP 10): %v", err)
+	}
+	if local, ok := extensions.LocalExtensionID(UtMetadataExtension); !ok || local != 7 {
+		t.Fatalf("local ut_metadata ID = %d, %t", local, ok)
+	}
+	if remote, ok := extensions.RemoteExtensionID(UtMetadataExtension); !ok || remote != 9 {
+		t.Fatalf("remote ut_metadata ID = %d, %t", remote, ok)
+	}
+	request, err := extensions.EncodeMetadataRequest(0)
+	if err != nil || request[5] != 9 {
+		t.Fatalf("metadata request = %x, %v; want remote ID 9", request, err)
+	}
+}
+
 func TestUnknownExtendedPayloadIsDrainedWithoutRetention(t *testing.T) {
 	body := bytes.Repeat([]byte{0x7b}, MaxPeerFrameBytes-2)
 	wire := extensionFrame(99, body)
@@ -298,6 +345,10 @@ func TestShortWritesAreJoined(t *testing.T) {
 func FuzzReadMessage(f *testing.F) {
 	f.Add([]byte{0, 0, 0, 0})
 	f.Add([]byte{0, 0, 0, 1, ChokeID})
+	f.Add([]byte{0, 0, 0, 2, BitfieldID, 0x80})
+	f.Add([]byte{0, 0, 0, 5, AllowedFastID, 0, 0, 0, 3})
+	f.Add([]byte{0, 0, 0, 1, HaveNoneID})
+	f.Add(extensionFrame(ExtensionHandshakeID, []byte("d1:md11:ut_metadatai9ee13:metadata_sizei32769ee")))
 	f.Fuzz(func(t *testing.T, wire []byte) {
 		_, _ = ReadMessage(newChunkConn(wire, 3))
 	})
@@ -305,6 +356,11 @@ func FuzzReadMessage(f *testing.F) {
 
 func FuzzReadHandshake(f *testing.F) {
 	f.Add(make([]byte, HandshakeBytes))
+	valid := &chunkConn{}
+	if err := WriteHandshake(valid, [20]byte{1, 2, 3}, [20]byte{4, 5, 6}, [8]byte{7: FastExtensionBit}); err != nil {
+		f.Fatal(err)
+	}
+	f.Add(valid.writes.Bytes())
 	f.Fuzz(func(t *testing.T, wire []byte) {
 		_, _ = ReadHandshake(newChunkConn(wire, 3), nil, nil)
 	})

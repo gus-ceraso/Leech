@@ -48,6 +48,42 @@ func TestParseMetainfoSingleFileExactHashAndRanges(t *testing.T) {
 	}
 }
 
+func TestIndependentOneByteInfoGoldenAndMutations(t *testing.T) {
+	// This wire value is intentionally literal: the info hash is over these
+	// exact canonical bytes, including the binary SHA-1 digest in pieces.
+	const canonicalInfo = "d6:lengthi1e4:name1:A12:piece lengthi1e6:pieces20:" +
+		"\x6d\xcd\x4c\xe2\x3d\x88\xe2\xee\x95\x68\xba\x54\x6c\x00\x7c\x63\xd9\x13\x1c\x1be"
+	wantInfoHash := [20]byte{0x1d, 0xb2, 0xe0, 0xa5, 0xd9, 0x6e, 0x3e, 0xf5, 0x2f, 0x80, 0x4b, 0x92, 0x8b, 0x28, 0xa1, 0x9f, 0x90, 0xe3, 0xf9, 0x2e}
+	if got := sha1.Sum([]byte(canonicalInfo)); got != wantInfoHash {
+		t.Fatalf("literal info hash = %x, want %x", got, wantInfoHash)
+	}
+	metainfo := append([]byte("d4:info"), []byte(canonicalInfo)...)
+	metainfo = append(metainfo, 'e')
+	parsed, err := ParseMetainfo(metainfo)
+	if err != nil {
+		t.Fatalf("ParseMetainfo(canonical vector): %v", err)
+	}
+	if parsed.InfoHash != wantInfoHash || parsed.TotalLength != 1 || len(parsed.Pieces) != 1 || parsed.Pieces[0].Hash != [20]byte{0x6d, 0xcd, 0x4c, 0xe2, 0x3d, 0x88, 0xe2, 0xee, 0x95, 0x68, 0xba, 0x54, 0x6c, 0x00, 0x7c, 0x63, 0xd9, 0x13, 0x1c, 0x1b} {
+		t.Fatalf("parsed vector = %#v", parsed)
+	}
+
+	mutations := map[string]string{
+		"duplicate key":     "d6:lengthi1e4:name1:A4:name1:A12:piece lengthi1e6:pieces20:" + strings.TrimPrefix(canonicalInfo, "d6:lengthi1e4:name1:A12:piece lengthi1e6:pieces20:"),
+		"unordered keys":    "d4:name1:A6:lengthi1e12:piece lengthi1e6:pieces20:" + strings.TrimPrefix(canonicalInfo, "d6:lengthi1e4:name1:A12:piece lengthi1e6:pieces20:"),
+		"wrong piece count": "d6:lengthi2e4:name1:A12:piece lengthi1e6:pieces20:" + strings.TrimPrefix(canonicalInfo, "d6:lengthi1e4:name1:A12:piece lengthi1e6:pieces20:"),
+		"unsafe path":       "d6:lengthi1e4:name4:../A12:piece lengthi1e6:pieces20:" + strings.TrimPrefix(canonicalInfo, "d6:lengthi1e4:name1:A12:piece lengthi1e6:pieces20:"),
+	}
+	for name, info := range mutations {
+		t.Run(name, func(t *testing.T) {
+			data := append([]byte("d4:info"), []byte(info)...)
+			data = append(data, 'e')
+			if _, err := ParseMetainfo(data); err == nil {
+				t.Fatal("invalid metainfo succeeded")
+			}
+		})
+	}
+}
+
 func TestParseMetainfoMultiFilePaddingSymlinkAndFlattenedTrackers(t *testing.T) {
 	files := metaList(
 		metaDict(metaEntry("length", metaInteger(3)), metaEntry("path", metaPath("dir", "a"))),

@@ -317,6 +317,8 @@ func TestHTTPAnnounceTLSUsesConfiguredVerifiedRoots(t *testing.T) {
 func FuzzParseHTTPAnnounceResponse(f *testing.F) {
 	f.Add([]byte("d8:intervali60e5:peers0:e"))
 	f.Add([]byte("d14:failure reason3:bade"))
+	f.Add([]byte("d8:intervali60e5:peers6:\x7f\x00\x00\x01\x1a\xe1e"))
+	f.Add([]byte("d8:intervali60e5:peersld2:ip9:127.0.0.14:porti6881eee"))
 	f.Fuzz(func(t *testing.T, body []byte) {
 		_, _ = parseHTTPAnnounceResponse(body)
 	})

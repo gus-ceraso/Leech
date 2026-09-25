@@ -1,11 +1,14 @@
 package torrent
 
 import (
+	"bytes"
 	"encoding/base32"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
 
+	"github.com/gus-ceraso/Leech/internal/bencode"
 	"github.com/gus-ceraso/Leech/internal/limits"
 )
 
@@ -62,6 +65,39 @@ func TestParseMagnetFieldsAndBounds(t *testing.T) {
 	}
 	if len(magnet.Trackers) != 3 || magnet.Trackers[0] != DefaultTracker {
 		t.Fatalf("trackers = %#v", magnet.Trackers)
+	}
+}
+
+func TestRepeatedMagnetSelectionUnionKeepsOriginalFileIndices(t *testing.T) {
+	magnet, err := ParseMagnet("magnet:?xt=urn:btih:" + testHashHex + "&so=2-4&so=1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	files := make([]bencode.Value, 6)
+	for i := range files {
+		files[i] = metaDict(
+			metaEntry("length", metaInteger(1)),
+			metaEntry("path", metaPath("file-"+strconv.Itoa(i))),
+		)
+	}
+	info := metaDict(
+		metaEntry("files", metaList(files...)),
+		metaEntry("name", metaStringValue("root")),
+		metaEntry("piece length", metaInteger(1)),
+		metaEntry("pieces", metaStringBytes(bytes.Repeat([]byte{0x44}, 20*len(files)))),
+	)
+	meta, err := ParseMetainfo(metaEncode(metaDict(metaEntry("info", info))))
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := Select(meta, nil, magnet.Selection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The ranges are inclusive and refer to the original BEP 53 file table.
+	// This expected slice is fixed independently of the selection parser.
+	if got, want := plan.SelectedIndices(), []int{1, 2, 3, 4}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("selected original indices = %v, want %v", got, want)
 	}
 }
 

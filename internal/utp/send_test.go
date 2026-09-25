@@ -195,7 +195,7 @@ func TestCongestionDelayBucketsAndRTT(t *testing.T) {
 
 func FuzzSendStateBounded(f *testing.F) {
 	f.Add(uint16(0), []byte("hello"), uint32(1))
-	f.Add(uint16(65535), []byte("payload"), uint32(64))
+	f.Add(uint16(65535), []byte("0123456789abcdef"), uint32(64))
 	f.Fuzz(func(t *testing.T, initial uint16, payload []byte, window uint32) {
 		if len(payload) > 256 {
 			payload = payload[:256]
@@ -203,21 +203,44 @@ func FuzzSendStateBounded(f *testing.F) {
 		if window > 4096 {
 			window = 4096
 		}
-		s := testSendState(t, 1_200, 64)
+		s, err := NewSendStateWithConfig(Sequence(initial), SendConfig{
+			MaxQueueBytes: 64,
+			MaxUnacked:    16,
+			RemoteWindow:  64,
+			Congestion: CongestionConfig{
+				InitialWindow: 64,
+				InitialPacket: 1,
+				MinPacket:     1,
+				MaxPacket:     1,
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
 		s.SetRemoteWindow(window)
 		_, _ = s.Queue(payload)
 		now := time.Unix(50, 0)
-		_ = initial
-		for _, action := range s.Produce(now) {
+		actions := s.Produce(now)
+		wantSeq := Sequence(initial)
+		var producedBytes uint32
+		for _, action := range actions {
 			if action.Kind != ActionSend {
 				t.Fatalf("production action kind = %d", action.Kind)
 			}
 			if err := action.Packet.Validate(); err != nil {
 				t.Fatalf("production packet = %v", err)
 			}
+			if action.Packet.SeqNr != wantSeq {
+				t.Fatalf("production sequence = %d, want %d", action.Packet.SeqNr, wantSeq)
+			}
+			wantSeq = wantSeq.Add(1)
+			producedBytes += uint32(len(action.Packet.Payload))
 		}
-		if s.PendingBytes() < 0 || s.PendingBytes() > 64 || s.UnackedPackets() > 16 || s.InFlightBytes() > 4096 {
+		if s.PendingBytes() < 0 || s.PendingBytes() > 64 || s.UnackedPackets() > 16 || s.InFlightBytes() > 64 || s.InFlightBytes() != producedBytes || s.InFlightBytes()+uint32(s.PendingBytes()) > 64 {
 			t.Fatalf("send bounds pending=%d unacked=%d in-flight=%d", s.PendingBytes(), s.UnackedPackets(), s.InFlightBytes())
+		}
+		if window == 0 && len(actions) != 0 {
+			t.Fatalf("zero remote window produced %d packets", len(actions))
 		}
 	})
 }
