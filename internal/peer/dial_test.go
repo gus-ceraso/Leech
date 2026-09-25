@@ -57,6 +57,15 @@ func pipeServer(t *testing.T, conn net.Conn, local Handshake, remote Handshake, 
 	return done
 }
 
+func handshakePipeDial(t *testing.T, local, remote Handshake) DialFunc {
+	t.Helper()
+	return func(context.Context, string, string) (net.Conn, error) {
+		client, server := net.Pipe()
+		pipeServer(t, server, local, remote, 0)
+		return client, nil
+	}
+}
+
 func TestRaceEndpointUTPWinsAndUsesExactEndpoint(t *testing.T) {
 	local := testHandshake()
 	remote := Handshake{InfoHash: local.InfoHash, PeerID: [20]byte{9}}
@@ -275,6 +284,132 @@ func TestRaceEndpointStartsTCPAfterHeadStartWhenUTPFailsEarly(t *testing.T) {
 		t.Fatalf("race result = %+v, want valid TCP handshake", out.result)
 	}
 	_ = out.result.Conn.Close()
+}
+
+func TestDialManagerExpectedPeerIDMismatchDoesNotBlacklistAndCanBeRefreshed(t *testing.T) {
+	local := testHandshake()
+	actual := Handshake{InfoHash: local.InfoHash, PeerID: [20]byte{8}}
+	falseID := [20]byte{9}
+	endpoint := Endpoint{Addr: netip.MustParseAddr("192.0.2.9"), Port: 51413}
+	now := time.Unix(100, 0)
+	backoff := NewEndpointBackoff()
+	clock := &fakeRaceClock{created: make(chan struct{})}
+	manager, err := NewDialManager(DialManagerConfig{
+		Race: RaceConfig{
+			LocalHandshake: local,
+			UTPDial:        handshakePipeDial(t, local, actual),
+			TCPDial: func(context.Context, string, string) (net.Conn, error) {
+				return nil, errors.New("TCP connection refused")
+			},
+			Clock:        clock,
+			UTPHeadStart: time.Second,
+		},
+		Backoff: backoff,
+		Now:     func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatalf("NewDialManager: %v", err)
+	}
+
+	pool, err := NewCandidatePool(CandidatePoolConfig{MaxCandidates: 2})
+	if err != nil {
+		t.Fatalf("NewCandidatePool: %v", err)
+	}
+	if _, err := pool.Add(ResolvedCandidate{Endpoint: endpoint, ExpectedPeerID: falseID, HasExpectedID: true}); err != nil {
+		t.Fatalf("add tracker candidate: %v", err)
+	}
+	result := make(chan error, 1)
+	go func() {
+		_, raceErr := manager.Race(context.Background(), pool.Snapshot()[0])
+		result <- raceErr
+	}()
+	select {
+	case <-clock.created:
+	case <-time.After(time.Second):
+		t.Fatal("race did not start its controlled uTP head-start timer")
+	}
+	clock.Fire()
+	raceErr := <-result
+	var raceFailure *RaceError
+	if !errors.As(raceErr, &raceFailure) || len(raceFailure.Attempts) != 2 {
+		t.Fatalf("mixed uTP/TCP failure = %v, want two attempts", raceErr)
+	}
+	if !errors.Is(raceErr, ErrExpectedPeerIDMismatch) || IsProtocolViolation(raceErr) {
+		t.Fatalf("false tracker ID error = %v, want a non-violation mismatch", raceErr)
+	}
+	if backoff.IsBlacklisted(endpoint) || backoff.Ready(endpoint, now) {
+		t.Fatalf("mismatch health: blacklisted=%t ready=%t, want bounded ordinary backoff", backoff.IsBlacklisted(endpoint), backoff.Ready(endpoint, now))
+	}
+
+	// A later tracker response without an ID clears the stale assertion. The
+	// same resolved endpoint can then complete a normal TCP handshake.
+	if _, err := pool.Admit(context.Background(), Candidate{Host: endpoint.Addr.String(), Port: endpoint.Port}); err != nil {
+		t.Fatalf("refresh without expected ID: %v", err)
+	}
+	candidate := pool.Snapshot()[0]
+	if candidate.HasExpectedID {
+		t.Fatalf("refreshed candidate retained stale expected ID: %+v", candidate)
+	}
+	now = now.Add(time.Second)
+	retryManager, err := NewDialManager(DialManagerConfig{
+		Race:    RaceConfig{LocalHandshake: local, TCPDial: handshakePipeDial(t, local, actual)},
+		Backoff: backoff,
+		Now:     func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatalf("NewDialManager for retry: %v", err)
+	}
+	connected, err := retryManager.Race(context.Background(), candidate)
+	if err != nil {
+		t.Fatalf("retry after unpoisoned announcement: %v", err)
+	}
+	_ = connected.Conn.Close()
+	if backoff.IsBlacklisted(endpoint) {
+		t.Fatal("successful retry left endpoint blacklisted")
+	}
+}
+
+func TestDialManagerCanAcceptWinnerAfterOtherTransportExpectedIDMismatch(t *testing.T) {
+	local := testHandshake()
+	expected := Handshake{InfoHash: local.InfoHash, PeerID: [20]byte{9}}
+	actual := Handshake{InfoHash: local.InfoHash, PeerID: [20]byte{8}}
+	endpoint := Endpoint{Addr: netip.MustParseAddr("127.0.0.1"), Port: 6881}
+	clock := &fakeRaceClock{created: make(chan struct{})}
+	manager, err := NewDialManager(DialManagerConfig{Race: RaceConfig{
+		LocalHandshake: local,
+		UTPDial:        handshakePipeDial(t, local, actual),
+		TCPDial:        handshakePipeDial(t, local, expected),
+		Clock:          clock,
+		UTPHeadStart:   time.Second,
+	}})
+	if err != nil {
+		t.Fatalf("NewDialManager: %v", err)
+	}
+	result := make(chan struct {
+		peer HandshakeResult
+		err  error
+	}, 1)
+	go func() {
+		peer, raceErr := manager.Race(context.Background(), ResolvedCandidate{Endpoint: endpoint, ExpectedPeerID: expected.PeerID, HasExpectedID: true})
+		result <- struct {
+			peer HandshakeResult
+			err  error
+		}{peer: peer, err: raceErr}
+	}()
+	select {
+	case <-clock.created:
+	case <-time.After(time.Second):
+		t.Fatal("race did not start its controlled uTP head-start timer")
+	}
+	clock.Fire()
+	out := <-result
+	if out.err != nil || out.peer.Transport != TransportTCP || out.peer.Handshake.PeerID != expected.PeerID {
+		t.Fatalf("TCP winner after uTP mismatch = %+v, %v", out.peer, out.err)
+	}
+	_ = out.peer.Conn.Close()
+	if manager.backoff.IsBlacklisted(endpoint) {
+		t.Fatal("non-winning expected-ID mismatch blacklisted endpoint")
+	}
 }
 
 func TestDialManagerBlacklistsProtocolViolationsAndBacksOffOrdinaryFailures(t *testing.T) {

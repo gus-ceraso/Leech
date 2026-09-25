@@ -18,6 +18,9 @@ var (
 	ErrRaceLimit       = errors.New("concurrent endpoint race limit reached")
 	ErrPeerIDCollision = errors.New("peer ID is already connected")
 	ErrLivePeerLimit   = errors.New("live peer limit reached")
+	// ErrExpectedPeerIDMismatch means a tracker assertion did not match the
+	// handshake. It is candidate metadata failure, not peer-origin misconduct.
+	ErrExpectedPeerIDMismatch = errors.New("tracker-supplied peer ID does not match handshake")
 )
 
 const defaultUTPHeadStart = 100 * time.Millisecond
@@ -439,12 +442,18 @@ func runRaceAttempt(ctx context.Context, transport Transport, network, address s
 		_ = conn.Close()
 		return raceAttemptResult{transport: transport, err: err}
 	}
-	remote, err := ReadHandshake(conn, &config.LocalHandshake.InfoHash, config.ExpectedPeerID)
+	remote, err := ReadHandshake(conn, &config.LocalHandshake.InfoHash, nil)
 	close(stopWatch)
 	watch.Wait()
 	if err != nil {
 		_ = conn.Close()
 		return raceAttemptResult{transport: transport, err: err}
+	}
+	// The peer ID came from an untrusted tracker, so its mismatch is a
+	// candidate metadata failure rather than a peer protocol violation.
+	if config.ExpectedPeerID != nil && remote.PeerID != *config.ExpectedPeerID {
+		_ = conn.Close()
+		return raceAttemptResult{transport: transport, err: ErrExpectedPeerIDMismatch}
 	}
 	select {
 	case <-ctx.Done():

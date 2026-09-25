@@ -1,12 +1,12 @@
 package peer
 
 import (
+	"container/list"
 	"context"
 	"errors"
 	"fmt"
 	"net"
 	"net/netip"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -18,8 +18,10 @@ import (
 var (
 	ErrCandidateConfig = errors.New("invalid candidate configuration")
 	ErrCandidate       = errors.New("invalid peer candidate")
-	ErrCandidateLimit  = errors.New("peer candidate limit reached")
-	ErrCandidateDNS    = errors.New("peer candidate resolution failed")
+	// ErrCandidateLimit is retained for source compatibility; a full pool now
+	// replaces its least-recently announced endpoint instead of returning it.
+	ErrCandidateLimit = errors.New("peer candidate limit reached")
+	ErrCandidateDNS   = errors.New("peer candidate resolution failed")
 )
 
 // Candidate is an endpoint received from a tracker or a magnet. Host may be
@@ -72,7 +74,8 @@ type CandidatePool struct {
 	maxDNSAnswers int
 
 	mu         sync.Mutex
-	candidates map[Endpoint]ResolvedCandidate
+	candidates map[Endpoint]*list.Element
+	order      list.List
 }
 
 // NewCandidatePool validates bounds and returns an empty candidate set.
@@ -96,7 +99,7 @@ func NewCandidatePool(config CandidatePoolConfig) (*CandidatePool, error) {
 		resolver:      resolver,
 		maxCandidates: maxCandidates,
 		maxDNSAnswers: maxDNSAnswers,
-		candidates:    make(map[Endpoint]ResolvedCandidate),
+		candidates:    make(map[Endpoint]*list.Element),
 	}, nil
 }
 
@@ -204,9 +207,8 @@ func withExpected(endpoint Endpoint, candidate Candidate) ResolvedCandidate {
 	return ResolvedCandidate{Endpoint: endpoint, ExpectedPeerID: candidate.ExpectedPeerID, HasExpectedID: candidate.HasExpectedID}
 }
 
-// Admit resolves and adds one candidate. Duplicate endpoints are harmless and
-// return false. If a duplicate first arrived without an expected ID, a later
-// copy with one supplies that optional validation value.
+// Admit resolves and adds one candidate. Duplicate endpoints are refreshed
+// with the newest optional expected ID and return false.
 func (p *CandidatePool) Admit(ctx context.Context, candidate Candidate) ([]ResolvedCandidate, error) {
 	if p == nil {
 		return nil, ErrCandidateConfig
@@ -228,9 +230,12 @@ func (p *CandidatePool) Admit(ctx context.Context, candidate Candidate) ([]Resol
 	return added, nil
 }
 
-// Add inserts one already-resolved candidate. It performs the same endpoint
-// normalization as NormalizeEndpoint, so callers cannot bypass admission
-// filtering by skipping DNS.
+// Add inserts or refreshes one already-resolved candidate. It performs the
+// same endpoint normalization as NormalizeEndpoint, so callers cannot bypass
+// admission filtering by skipping DNS. A duplicate refreshes its optional
+// expected ID and moves to the newest position. At capacity, the least
+// recently announced endpoint is evicted. Endpoint health and live-connection
+// state are owned elsewhere and are not changed.
 func (p *CandidatePool) Add(candidate ResolvedCandidate) (bool, error) {
 	if p == nil {
 		return false, ErrCandidateConfig
@@ -243,33 +248,40 @@ func (p *CandidatePool) Add(candidate ResolvedCandidate) (bool, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if current, exists := p.candidates[endpoint]; exists {
-		if !current.HasExpectedID && candidate.HasExpectedID {
-			p.candidates[endpoint] = candidate
-		}
+		entry := current.Value.(*candidatePoolEntry)
+		entry.candidate.ExpectedPeerID = candidate.ExpectedPeerID
+		entry.candidate.HasExpectedID = candidate.HasExpectedID
+		p.order.MoveToBack(current)
 		return false, nil
 	}
 	if len(p.candidates) >= p.maxCandidates {
-		return false, ErrCandidateLimit
+		oldest := p.order.Front()
+		entry := oldest.Value.(*candidatePoolEntry)
+		delete(p.candidates, entry.candidate.Endpoint)
+		p.order.Remove(oldest)
 	}
-	p.candidates[endpoint] = candidate
+	element := p.order.PushBack(&candidatePoolEntry{candidate: candidate})
+	p.candidates[endpoint] = element
 	return true, nil
 }
 
-// Snapshot returns candidates in stable endpoint order. The returned slice is
-// independent of the pool and can be handed to a dial manager.
+type candidatePoolEntry struct {
+	candidate ResolvedCandidate
+}
+
+// Snapshot returns an independent newest-announcement-first candidate slice.
+// The order is deterministic for a given admission sequence and lets fresh
+// tracker responses be attempted before older candidates.
 func (p *CandidatePool) Snapshot() []ResolvedCandidate {
 	if p == nil {
 		return nil
 	}
 	p.mu.Lock()
 	result := make([]ResolvedCandidate, 0, len(p.candidates))
-	for _, candidate := range p.candidates {
-		result = append(result, candidate)
+	for element := p.order.Back(); element != nil; element = element.Prev() {
+		result = append(result, element.Value.(*candidatePoolEntry).candidate)
 	}
 	p.mu.Unlock()
-	sort.Slice(result, func(i, j int) bool {
-		return endpointLess(result[i].Endpoint, result[j].Endpoint)
-	})
 	return result
 }
 
@@ -281,13 +293,6 @@ func (p *CandidatePool) Len() int {
 	n := len(p.candidates)
 	p.mu.Unlock()
 	return n
-}
-
-func endpointLess(a, b Endpoint) bool {
-	if order := a.Addr.Compare(b.Addr); order != 0 {
-		return order < 0
-	}
-	return a.Port < b.Port
 }
 
 // EndpointBackoff tracks ordinary dial failures independently of transport,
