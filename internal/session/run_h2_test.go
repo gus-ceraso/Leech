@@ -32,16 +32,14 @@ func TestRunReassignsDisconnectedBlockAndSendsFinalTrackerEvents(t *testing.T) {
 	}
 	trackerFixture := &h2Tracker{ports: []uint16{45101}}
 	firstBlock, secondBlock := make(chan peer.Block, 1), make(chan peer.Block, 1)
-	dial, joined := h2Dialer(t, infoHash, 45101, func(conn net.Conn, ordinal int) error {
+	replacementHandshake := make(chan struct{})
+	dial, joined := h2Dialer(t, infoHash, 45101, replacementHandshake, func(conn net.Conn, ordinal int) error {
 		block, err := h2Request(conn)
 		if err != nil {
 			return err
 		}
 		if ordinal == 1 {
-			select {
-			case firstBlock <- block:
-			default:
-			}
+			firstBlock <- block
 			return nil
 		}
 		select {
@@ -66,7 +64,15 @@ func TestRunReassignsDisconnectedBlockAndSendsFinalTrackerEvents(t *testing.T) {
 	if !result.TorrentComplete {
 		t.Fatalf("result = %#v, want complete torrent", result)
 	}
-	if first, second := <-firstBlock, <-secondBlock; first != second {
+	first, ok := h2ReceivedBlock(t, firstBlock, "first peer")
+	if !ok {
+		return
+	}
+	second, ok := h2ReceivedBlock(t, secondBlock, "replacement peer")
+	if !ok {
+		return
+	}
+	if first != second {
 		t.Fatalf("reassigned block %v differs from disconnected request %v", second, first)
 	}
 	if got, err := os.ReadFile(filepath.Join(output, "payload")); err != nil || !bytes.Equal(got, data) {
@@ -111,7 +117,18 @@ func (f *h2Tracker) snapshot() map[string][]tracker.AnnounceRequest {
 
 type h2PeerScript func(net.Conn, int) error
 
-func h2Dialer(t *testing.T, hash torrent.InfoHash, wantPort uint16, script h2PeerScript) (peer.DialFunc, func(*testing.T)) {
+func h2ReceivedBlock(t *testing.T, blocks <-chan peer.Block, name string) (peer.Block, bool) {
+	t.Helper()
+	select {
+	case block := <-blocks:
+		return block, true
+	default:
+		t.Errorf("%s did not receive a request before Run returned", name)
+		return peer.Block{}, false
+	}
+}
+
+func h2Dialer(t *testing.T, hash torrent.InfoHash, wantPort uint16, replacementHandshake chan struct{}, script h2PeerScript) (peer.DialFunc, func(*testing.T)) {
 	t.Helper()
 	var wg sync.WaitGroup
 	var mu sync.Mutex
@@ -138,7 +155,15 @@ func h2Dialer(t *testing.T, hash torrent.InfoHash, wantPort uint16, script h2Pee
 		client, server := net.Pipe()
 		go func() {
 			defer wg.Done()
-			defer server.Close()
+			defer func() {
+				server.Close()
+				if attempt == 1 {
+					close(replacementHandshake)
+				}
+			}()
+			if attempt != 1 {
+				<-replacementHandshake
+			}
 			if _, err := peer.ReadHandshake(server, (*[20]byte)(&hash), nil); err != nil {
 				return
 			}
