@@ -231,6 +231,115 @@ func TestRaceEndpointReportsBothFailuresWithoutStrike(t *testing.T) {
 	}
 }
 
+func TestRaceEndpointStartsTCPAfterHeadStartWhenUTPFailsEarly(t *testing.T) {
+	local := testHandshake()
+	remote := Handshake{InfoHash: local.InfoHash, PeerID: [20]byte{10}}
+	clock := &fakeRaceClock{created: make(chan struct{})}
+	tcpStarted := make(chan struct{})
+	done := make(chan struct {
+		result HandshakeResult
+		err    error
+	}, 1)
+	go func() {
+		result, err := RaceEndpoint(context.Background(), Endpoint{Addr: netip.MustParseAddr("127.0.0.1"), Port: 6881}, RaceConfig{
+			LocalHandshake: local,
+			UTPDial: func(context.Context, string, string) (net.Conn, error) {
+				return nil, errors.New("uTP unavailable")
+			},
+			TCPDial: func(context.Context, string, string) (net.Conn, error) {
+				close(tcpStarted)
+				client, server := net.Pipe()
+				pipeServer(t, server, local, remote, 0)
+				return client, nil
+			},
+			Clock:        clock,
+			UTPHeadStart: time.Second,
+		})
+		done <- struct {
+			result HandshakeResult
+			err    error
+		}{result: result, err: err}
+	}()
+	<-clock.created
+	clock.Fire()
+	select {
+	case <-tcpStarted:
+	case <-time.After(time.Second):
+		t.Fatal("TCP did not start after the controlled head start")
+	}
+	out := <-done
+	if out.err != nil {
+		t.Fatalf("RaceEndpoint: %v", out.err)
+	}
+	if out.result.Transport != TransportTCP || out.result.Handshake.PeerID != remote.PeerID {
+		t.Fatalf("race result = %+v, want valid TCP handshake", out.result)
+	}
+	_ = out.result.Conn.Close()
+}
+
+func TestDialManagerBlacklistsProtocolViolationsAndBacksOffOrdinaryFailures(t *testing.T) {
+	now := time.Unix(100, 0)
+	endpoint := Endpoint{Addr: netip.MustParseAddr("127.0.0.1"), Port: 6881}
+	t.Run("invalid handshake is blacklisted", func(t *testing.T) {
+		var calls atomic.Int32
+		local := testHandshake()
+		manager, err := NewDialManager(DialManagerConfig{
+			Race: RaceConfig{
+				LocalHandshake: local,
+				TCPDial: func(context.Context, string, string) (net.Conn, error) {
+					calls.Add(1)
+					client, server := net.Pipe()
+					go func() {
+						defer server.Close()
+						_, _ = ReadHandshake(server, nil, nil)
+						wrong := Handshake{InfoHash: [20]byte{99}, PeerID: [20]byte{11}}
+						_ = WriteHandshake(server, wrong.InfoHash, wrong.PeerID, wrong.Reserved)
+					}()
+					return client, nil
+				},
+			},
+			Now: func() time.Time { return now },
+		})
+		if err != nil {
+			t.Fatalf("NewDialManager: %v", err)
+		}
+		if _, err := manager.Race(context.Background(), ResolvedCandidate{Endpoint: endpoint}); !IsProtocolViolation(err) {
+			t.Fatalf("first Race error = %v, want protocol violation", err)
+		}
+		now = now.Add(24 * time.Hour)
+		if _, err := manager.Race(context.Background(), ResolvedCandidate{Endpoint: endpoint}); err == nil || calls.Load() != 1 {
+			t.Fatalf("Race after time advance = %v, calls=%d; endpoint should remain blacklisted", err, calls.Load())
+		}
+	})
+
+	t.Run("transport failure uses ordinary backoff", func(t *testing.T) {
+		var calls atomic.Int32
+		manager, err := NewDialManager(DialManagerConfig{
+			Race: RaceConfig{
+				LocalHandshake: testHandshake(),
+				TCPDial: func(context.Context, string, string) (net.Conn, error) {
+					calls.Add(1)
+					return nil, errors.New("connection refused")
+				},
+			},
+			Now: func() time.Time { return now },
+		})
+		if err != nil {
+			t.Fatalf("NewDialManager: %v", err)
+		}
+		if _, err := manager.Race(context.Background(), ResolvedCandidate{Endpoint: endpoint}); err == nil {
+			t.Fatal("Race unexpectedly succeeded")
+		}
+		if _, err := manager.Race(context.Background(), ResolvedCandidate{Endpoint: endpoint}); err == nil || calls.Load() != 1 {
+			t.Fatalf("Race during backoff = %v, calls=%d", err, calls.Load())
+		}
+		now = now.Add(time.Second)
+		if _, err := manager.Race(context.Background(), ResolvedCandidate{Endpoint: endpoint}); err == nil || calls.Load() != 2 {
+			t.Fatalf("Race after backoff = %v, calls=%d; ordinary failure should be retryable", err, calls.Load())
+		}
+	})
+}
+
 type closeSpy struct {
 	net.Conn
 	closed atomic.Bool

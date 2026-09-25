@@ -179,7 +179,11 @@ func (m *DialManager) Race(ctx context.Context, candidate ResolvedCandidate) (Ha
 	result, err := RaceEndpoint(ctx, endpoint, config)
 	if err != nil {
 		if !errors.Is(err, context.Canceled) {
-			m.backoff.RecordFailure(endpoint, m.now())
+			if IsProtocolViolation(err) {
+				m.backoff.Blacklist(endpoint)
+			} else {
+				m.backoff.RecordFailure(endpoint, m.now())
+			}
 		}
 		return HandshakeResult{}, err
 	}
@@ -352,7 +356,8 @@ func RaceEndpoint(ctx context.Context, endpoint Endpoint, config RaceConfig) (Ha
 
 	attemptErrors := make([]AttemptError, 0, 2)
 	var winner *raceAttemptResult
-	for completed := 0; completed < started; {
+	completed := 0
+	for completed < started || (!startTCP && timer != nil) {
 		select {
 		case <-ctx.Done():
 			cancel()
