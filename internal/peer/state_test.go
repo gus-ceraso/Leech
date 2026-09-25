@@ -357,6 +357,80 @@ func TestPeerStateSparseAvailabilityDeltasHaveStableOrder(t *testing.T) {
 	}
 }
 
+func TestPeerStateReverseSparseAvailabilitySortsWordsOnce(t *testing.T) {
+	state, err := NewPeerStateWithConfig(PeerStateConfig{PieceCount: limits.Pieces, Fast: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wordCount := int((limits.Pieces + 63) / 64)
+	wanted := make([]int, 0, wordCount)
+	for word := 0; word < wordCount; word++ {
+		wanted = append(wanted, word*64)
+	}
+	if err := state.SetWantedPieces(wanted); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := state.ApplyMessage(Message{ID: UnchokeID}); err != nil {
+		t.Fatal(err)
+	}
+
+	for word := int(wordCount) - 1; word >= 0; word-- {
+		index := uint32(word * 64)
+		if _, err := state.ApplyMessage(Message{ID: HaveID, Payload: uint32Payload(index)}); err != nil {
+			t.Fatalf("Have %d: %v", index, err)
+		}
+	}
+	if got := state.RequestableCount(); got != uint32(wordCount) {
+		t.Fatalf("requestable count after reverse Haves = %d, want %d", got, wordCount)
+	}
+	if !state.availabilityWordsDirty || state.availabilityWordSorts != 0 {
+		t.Fatalf("reverse Haves left dirty=%v, word sorts=%d; want dirty index and no sort", state.availabilityWordsDirty, state.availabilityWordSorts)
+	}
+
+	checkDelta := func(effect StateEffect, added bool, wantCount int) {
+		t.Helper()
+		delta := effect.AvailabilityRemoved
+		if added {
+			delta = effect.AvailabilityAdded
+		}
+		if len(delta) != wantCount {
+			t.Fatalf("availability delta has %d pieces, want %d", len(delta), wantCount)
+		}
+		for i, index := range delta {
+			want := uint32(i * 64)
+			if index != want {
+				t.Fatalf("availability delta[%d] = %d, want %d", i, index, want)
+			}
+		}
+	}
+
+	for cycle := 0; cycle < 4; cycle++ {
+		effect, err := state.ApplyMessage(Message{ID: ChokeID})
+		if err != nil {
+			t.Fatalf("Choke %d: %v", cycle, err)
+		}
+		checkDelta(effect, false, int(wordCount))
+		if got := state.RequestableCount(); got != 0 {
+			t.Fatalf("requestable count after Choke %d = %d, want 0", cycle, got)
+		}
+		if got := state.availabilityWordSorts; got != 1 {
+			t.Fatalf("word sorts after Choke %d = %d, want one lazy sort", cycle, got)
+		}
+
+		effect, err = state.ApplyMessage(Message{ID: UnchokeID})
+		if err != nil {
+			t.Fatalf("Unchoke %d: %v", cycle, err)
+		}
+		checkDelta(effect, true, int(wordCount))
+		if got := state.RequestableCount(); got != uint32(wordCount) {
+			t.Fatalf("requestable count after Unchoke %d = %d, want %d", cycle, got, wordCount)
+		}
+		if got := state.availabilityWordSorts; got != 1 {
+			t.Fatalf("word sorts after Unchoke %d = %d, want one lazy sort", cycle, got)
+		}
+	}
+}
+
 func TestPeerStateIncomingRequestsNeverProducePayload(t *testing.T) {
 	state, err := NewPeerState(3, true)
 	if err != nil {

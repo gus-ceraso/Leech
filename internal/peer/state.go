@@ -69,7 +69,7 @@ type PeerState struct {
 	reqQ                   int
 	availability           bitSet
 	availabilityWords      []uint32
-	availabilityWordsOrder bool
+	availabilityWordsDirty bool
 	allowedFast            bitSet
 	wanted                 bitSet
 	availabilityCount      uint32
@@ -77,9 +77,11 @@ type PeerState struct {
 	requestableCount       uint32
 	// availabilityWordVisits exposes sparse traversal work to package tests.
 	availabilityWordVisits uint64
-	suggestions            []uint32
-	seenIncoming           map[Block]struct{}
-	requests               *RequestTable
+	// availabilityWordSorts exposes lazy index sorting to package tests.
+	availabilityWordSorts uint64
+	suggestions           []uint32
+	seenIncoming          map[Block]struct{}
+	requests              *RequestTable
 }
 
 // NewPeerState creates coordinator-owned state with the supported request and
@@ -104,18 +106,17 @@ func NewPeerStateWithConfig(config PeerStateConfig) (*PeerState, error) {
 		reqq = limits.PeerRequests
 	}
 	return &PeerState{
-		pieceCount:             config.PieceCount,
-		pieceLength:            config.PieceLength,
-		lastPieceLength:        config.LastPieceLength,
-		fast:                   config.Fast,
-		choked:                 true,
-		reqQ:                   reqq,
-		availability:           newBitSet(config.PieceCount),
-		availabilityWordsOrder: true,
-		allowedFast:            newBitSet(config.PieceCount),
-		wanted:                 newBitSet(config.PieceCount),
-		seenIncoming:           make(map[Block]struct{}, limits.PeerRequests),
-		requests:               requests,
+		pieceCount:      config.PieceCount,
+		pieceLength:     config.PieceLength,
+		lastPieceLength: config.LastPieceLength,
+		fast:            config.Fast,
+		choked:          true,
+		reqQ:            reqq,
+		availability:    newBitSet(config.PieceCount),
+		allowedFast:     newBitSet(config.PieceCount),
+		wanted:          newBitSet(config.PieceCount),
+		seenIncoming:    make(map[Block]struct{}, limits.PeerRequests),
+		requests:        requests,
 	}, nil
 }
 
@@ -339,7 +340,7 @@ func (s *PeerState) ApplyMessage(message Message) (StateEffect, error) {
 			break
 		}
 		s.availabilityWords = s.availabilityWords[:0]
-		s.availabilityWordsOrder = true
+		s.availabilityWordsDirty = false
 		for word := range s.availability {
 			s.availability[word] = ^uint64(0)
 			s.availabilityWords = append(s.availabilityWords, uint32(word))
@@ -369,7 +370,7 @@ func (s *PeerState) ApplyMessage(message Message) (StateEffect, error) {
 				s.availability[word] = 0
 			}
 			s.availabilityWords = s.availabilityWords[:0]
-			s.availabilityWordsOrder = true
+			s.availabilityWordsDirty = false
 			s.availabilityCount = 0
 			s.wantedAvailable = 0
 			s.requestableCount = 0
@@ -510,6 +511,8 @@ func (s *PeerState) applyBitfield(payload []byte) error {
 	}
 	// ValidateMessage applies the shared wire bitfield rule before this state
 	// transition. This parser only needs to translate its valid bits.
+	s.availabilityWords = s.availabilityWords[:0]
+	s.availabilityWordsDirty = false
 	for index := uint32(0); index < s.pieceCount; index++ {
 		if payload[index/8]&(1<<(7-index%8)) != 0 {
 			s.setAvailability(index)
@@ -539,6 +542,7 @@ func (s *PeerState) appendCurrentAvailability(effect *StateEffect, available boo
 	if s.wantedAvailable == 0 {
 		return
 	}
+	s.ensureAvailabilityWordsSorted()
 	for _, wordIndex := range s.availabilityWords {
 		s.availabilityWordVisits++
 		word := int(wordIndex)
@@ -549,7 +553,6 @@ func (s *PeerState) appendCurrentAvailability(effect *StateEffect, available boo
 		}
 		s.appendAvailabilityWord(effect, word, value, available)
 	}
-	s.sortAvailabilityChanges(effect, available)
 }
 
 // Choking removes non-Allowed-Fast availability from the scheduler; unchoking
@@ -559,6 +562,7 @@ func (s *PeerState) appendChokeAvailabilityChanges(effect *StateEffect, availabl
 	if s.wantedAvailable == 0 {
 		return
 	}
+	s.ensureAvailabilityWordsSorted()
 	for _, wordIndex := range s.availabilityWords {
 		s.availabilityWordVisits++
 		word := int(wordIndex)
@@ -566,18 +570,17 @@ func (s *PeerState) appendChokeAvailabilityChanges(effect *StateEffect, availabl
 		value &= s.wanted[word] &^ s.allowedFast[word]
 		s.appendAvailabilityWord(effect, word, value, available)
 	}
-	s.sortAvailabilityChanges(effect, available)
 }
 
-func (s *PeerState) sortAvailabilityChanges(effect *StateEffect, available bool) {
-	if s.availabilityWordsOrder {
+func (s *PeerState) ensureAvailabilityWordsSorted() {
+	if !s.availabilityWordsDirty {
 		return
 	}
-	changes := effect.AvailabilityRemoved
-	if available {
-		changes = effect.AvailabilityAdded
-	}
-	sort.Slice(changes, func(i, j int) bool { return changes[i] < changes[j] })
+	sort.Slice(s.availabilityWords, func(i, j int) bool {
+		return s.availabilityWords[i] < s.availabilityWords[j]
+	})
+	s.availabilityWordsDirty = false
+	s.availabilityWordSorts++
 }
 
 func (s *PeerState) appendAvailabilityWord(effect *StateEffect, word int, value uint64, available bool) {
@@ -605,7 +608,7 @@ func (s *PeerState) setAvailability(index uint32) {
 	word := index / 64
 	if s.availability[word] == 0 {
 		if len(s.availabilityWords) != 0 && s.availabilityWords[len(s.availabilityWords)-1] > word {
-			s.availabilityWordsOrder = false
+			s.availabilityWordsDirty = true
 		}
 		s.availabilityWords = append(s.availabilityWords, word)
 	}
