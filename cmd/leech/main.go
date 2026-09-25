@@ -27,21 +27,46 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	adapter := cli.NewSignalAdapter(cancel)
-	err = cli.RunContext(ctx, opts, os.Stdout, os.Stderr)
-	var signalEvent cli.SignalEvent
+	code := runWithSignals(ctx, adapter.Events, adapter.Close, func() error {
+		return cli.RunContext(ctx, opts, os.Stdout, os.Stderr)
+	}, os.Exit)
+	if code != 0 {
+		os.Exit(code)
+	}
+}
+
+func runWithSignals(ctx context.Context, events func() <-chan cli.SignalEvent, closeSignals func(), run func() error, exit func(int)) int {
+	received := make(chan cli.SignalEvent, 2)
+	listenerDone := make(chan struct{})
+	go func() {
+		defer close(listenerDone)
+		for event := range events() {
+			if event.Immediate {
+				exit(event.ExitCode)
+				return
+			}
+			received <- event
+		}
+	}()
+
+	err := run()
+	closeSignals()
+	<-listenerDone
+
+	var event cli.SignalEvent
 	if ctx.Err() != nil {
-		signalEvent, _ = adapter.Wait()
+		event = <-received
 	} else {
 		select {
-		case signalEvent = <-adapter.Events():
+		case event = <-received:
 		default:
 		}
 	}
-	adapter.Close()
-	if signalEvent.Signal != nil {
-		os.Exit(signalEvent.ExitCode)
+	if event.Signal != nil {
+		return event.ExitCode
 	}
 	if err != nil {
-		os.Exit(1)
+		return 1
 	}
+	return 0
 }
