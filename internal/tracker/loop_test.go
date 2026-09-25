@@ -412,12 +412,19 @@ func TestTransmittedStartedWithoutActivationStillGetsStopped(t *testing.T) {
 
 type contextCheckingHTTP struct {
 	base    *loopHTTP
-	stopped chan error
+	stopped chan finalContextObservation
+}
+
+type finalContextObservation struct {
+	err       error
+	deadline time.Time
+	has       bool
 }
 
 func (f *contextCheckingHTTP) Announce(ctx context.Context, tracker string, request AnnounceRequest) (HTTPAnnounceResult, error) {
 	if request.Event == EventStopped {
-		f.stopped <- ctx.Err()
+		deadline, has := ctx.Deadline()
+		f.stopped <- finalContextObservation{err: ctx.Err(), deadline: deadline, has: has}
 	}
 	return f.base.Announce(ctx, tracker, request)
 }
@@ -425,7 +432,7 @@ func (f *contextCheckingHTTP) Announce(ctx context.Context, tracker string, requ
 func TestFinalEventsUseIndependentBoundedContext(t *testing.T) {
 	phaseCtx, cancelPhase := context.WithCancel(context.Background())
 	defer cancelPhase()
-	fake := &contextCheckingHTTP{base: &loopHTTP{}, stopped: make(chan error, 1)}
+	fake := &contextCheckingHTTP{base: &loopHTTP{}, stopped: make(chan finalContextObservation, 1)}
 	started := make(chan Update, 1)
 	set, err := NewTrackerSet(TrackerSetConfig{
 		Trackers: []string{"http://independent-final.test/announce"},
@@ -455,9 +462,12 @@ func TestFinalEventsUseIndependentBoundedContext(t *testing.T) {
 		t.Fatalf("finalize with canceled phase context: %v", err)
 	}
 	select {
-	case err := <-fake.stopped:
-		if err != nil {
-			t.Fatalf("stopped used canceled phase context: %v", err)
+	case observed := <-fake.stopped:
+		if observed.err != nil {
+			t.Fatalf("stopped used canceled phase context: %v", observed.err)
+		}
+		if remaining := time.Until(observed.deadline); !observed.has || remaining <= 0 || remaining > finalAnnounceTimeout {
+			t.Fatalf("stopped deadline = %v, has=%v, remaining=%v; want bounded live deadline", observed.deadline, observed.has, remaining)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for stopped announce")
