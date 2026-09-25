@@ -1026,13 +1026,13 @@ SEC5 follows SEC4, and R7 follows all six fixes.
 **Depends on:** I1, T1. **Owns:** `internal/tracker/http.go` and focused tracker
 tests. **References:** DESIGN §§10.2, 16–17; SECURITY F-05, F-09.
 
-- [ ] Deduplicate compact IPv4, compact IPv6, and dictionary peers with one map
+- [x] Deduplicate compact IPv4, compact IPv6, and dictionary peers with one map
   per response instead of rebuilding it for each entry. Preserve first-endpoint
   ordering and the existing optional peer-ID behavior.
-- [ ] Apply tracker-specific decoded-node and container limits that still admit
+- [x] Apply tracker-specific decoded-node and container limits that still admit
   valid responses with 20,000 dictionary peers. Reject tracker responses with
   large unused trees before they cause disproportionate allocation.
-- [ ] Add bounded local fixtures for unique and duplicate peers, and for small
+- [x] Add bounded local fixtures for unique and duplicate peers, and for small
   wire bodies containing many decoded nodes. Check work and memory bounds
   without relying on live trackers.
 
@@ -1044,13 +1044,13 @@ work, and ignored tracker fields cannot expand into excessive decoded memory.
 **Depends on:** P3. **Owns:** `internal/peer/candidates.go`, `dial.go`, and focused
 peer tests. **References:** DESIGN §§11, 16–17; SECURITY F-02, F-07.
 
-- [ ] Keep a supplied tracker peer ID as an expected handshake value, but do
+- [x] Keep a supplied tracker peer ID as an expected handshake value, but do
   not classify its mismatch as a peer-origin protocol violation or blacklist
   the endpoint. Let a later unpoisoned announcement retry that endpoint.
-- [ ] Keep the 20,000-endpoint cap and resolved IP/port deduplication while
+- [x] Keep the 20,000-endpoint cap and resolved IP/port deduplication while
   allowing later tracker responses to replace stale or repeatedly failed
   candidates. One tracker must not permanently occupy every slot.
-- [ ] Cover false tracker IDs, mixed TCP/uTP race outcomes, a full pool from one
+- [x] Cover false tracker IDs, mixed TCP/uTP race outcomes, a full pool from one
   tracker, and later usable peers from another tracker with deterministic inputs.
 
 **Acceptance:** a tracker cannot blacklist an honest endpoint or exclude all
@@ -1061,12 +1061,12 @@ later candidates; peer-origin severe handshake violations still blacklist it.
 **Depends on:** SEC1, SEC2. **Owns:** `internal/session/metadata.go`, `run.go`,
 and focused session tests. **References:** DESIGN §§10–11, 15–17; SECURITY F-03.
 
-- [ ] Bound the total peer data retained in pending tracker updates, not just
+- [x] Bound the total peer data retained in pending tracker updates, not just
   the update count. Keep each tracker loop independent and cancellation safe.
-- [ ] Resolve tracker-supplied hostnames under a small concurrency limit and
+- [x] Resolve tracker-supplied hostnames under a small concurrency limit and
   per-lookup deadline. Interleave admission with dialing so a large hostname
   batch cannot block already available peers or phase shutdown.
-- [ ] Use a local tracker and controlled resolver to cover slow names, later
+- [x] Use a local tracker and controlled resolver to cover slow names, later
   usable IP peers, queue pressure, cancellation, and both discovery phases.
 
 **Acceptance:** malicious hostname lists cannot stall discovery or cause large
@@ -1078,12 +1078,12 @@ queued-memory growth; valid private and loopback endpoints remain supported.
 `internal/session/transfer.go`, and focused tests. **References:** DESIGN
 §§12–13, 16–17; SECURITY F-01, F-06.
 
-- [ ] Initialize the wanted set in one pass and update interest and scheduler
+- [x] Initialize the wanted set in one pass and update interest and scheduler
   availability from changed bits. Repeated `Have` and empty `Have None`
   messages must not trigger whole-torrent scans.
-- [ ] Reject every nonzero spare bit in an initial Bitfield through one shared
+- [x] Reject every nonzero spare bit in an initial Bitfield through one shared
   validation rule. Preserve Fast `Have None` and Allowed Fast semantics.
-- [ ] Cover large piece counts, repeated small availability messages, and each
+- [x] Cover large piece counts, repeated small availability messages, and each
   spare-bit position with deterministic peer-state and transfer checks.
 
 **Acceptance:** peer startup is not quadratic in piece count, small repeated
@@ -1096,12 +1096,12 @@ protocol rejection.
 `scheduler.go`, `internal/peer/requests.go` if needed, and focused tests.
 **References:** DESIGN §§12–13, 15; SECURITY F-04.
 
-- [ ] Give active block requests a bounded timeout, release or reassign expired
+- [x] Give active block requests a bounded timeout, release or reassign expired
   blocks, and rotate peers based on recent useful activity rather than one
   lifetime `productive` flag. Free connection slots for later candidates.
-- [ ] Preserve exact Fast terminal obligations and bounded tombstones for late
+- [x] Preserve exact Fast terminal obligations and bounded tombstones for late
   responses. Ordinary stalls must not create corruption strikes.
-- [ ] Script a peer that sends one valid block and then idles while later peers
+- [x] Script a peer that sends one valid block and then idles while later peers
   can finish, including the active-peer cap and default indefinite retry.
 
 **Acceptance:** a stalled peer cannot hold requests or a slot indefinitely,
@@ -1112,10 +1112,10 @@ and late Fast responses remain correctly attributed.
 **Depends on:** U2, U4. **Owns:** `internal/utp/receive.go`, `conn.go`, and
 focused uTP tests. **References:** DESIGN §§14, 16–17; SECURITY F-08.
 
-- [ ] Send the ACK returned by the receive state instead of rebuilding it in
+- [x] Send the ACK returned by the receive state instead of rebuilding it in
   the socket adapter. Reuse the selective-ACK mask for duplicate packets when
   the receive window has not changed.
-- [ ] Cover a nearly full reorder window followed by repeated duplicates,
+- [x] Cover a nearly full reorder window followed by repeated duplicates,
   checking ACK fields, bounded work, and recovery when the gap closes.
 
 **Acceptance:** duplicate packets cannot force repeated full reorder-map scans,
