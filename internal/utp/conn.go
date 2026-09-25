@@ -468,7 +468,7 @@ func (c *Conn) handleDatagram(wire []byte) {
 	}
 	for _, action := range received.Actions {
 		if action.Kind == ActionSend {
-			ack := c.receiveACKLocked(now)
+			ack := c.stampReceiveACKLocked(action.Packet, now)
 			if err := c.writeActionLocked(ack); err != nil {
 				c.setTerminalLocked(err)
 				return
@@ -540,7 +540,10 @@ func (c *Conn) syncSendStateLocked(now time.Time, received *Packet) {
 }
 
 func (c *Conn) receiveACKLocked(now time.Time) Packet {
-	ack := c.recv.AckPacket()
+	return c.stampReceiveACKLocked(c.recv.AckPacket(), now)
+}
+
+func (c *Conn) stampReceiveACKLocked(ack Packet, now time.Time) Packet {
 	ack.ConnectionID = c.sendID
 	ack.SeqNr = c.send.nextSeq
 	ack.Timestamp = timestamp(now)

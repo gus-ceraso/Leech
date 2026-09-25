@@ -60,6 +60,8 @@ type ReceiveState struct {
 	pending      map[Sequence]receivePacket
 	stream       []byte
 	bufferedByte int
+	sack         []byte
+	sackDirty    bool
 
 	finSeen  bool
 	finSeq   Sequence
@@ -138,6 +140,7 @@ func (r *ReceiveState) Receive(packet Packet) ReceiveResult {
 		// reset cannot leave a large hidden allocation alive.
 		r.pending = make(map[Sequence]receivePacket)
 		r.bufferedByte = len(r.stream)
+		r.sackDirty = true
 		return ReceiveResult{Actions: []PacketAction{{Kind: ActionClose, Err: ErrReceiveReset}}}
 	case Data, Fin:
 		return r.receiveData(packet)
@@ -199,6 +202,7 @@ func (r *ReceiveState) receiveData(packet Packet) ReceiveResult {
 
 	r.pending[packet.SeqNr] = receivePacket{payload: cloneBytes(packet.Payload), fin: packet.Type == Fin}
 	r.bufferedByte += len(packet.Payload)
+	r.sackDirty = true
 	if packet.Type == Fin {
 		r.finSeen = true
 		r.finSeq = packet.SeqNr
@@ -214,6 +218,7 @@ func (r *ReceiveState) acceptContiguous(packet Packet) {
 	}
 	r.ack = packet.SeqNr
 	r.next = packet.SeqNr.Add(1)
+	r.sackDirty = true
 	if packet.Type == Fin {
 		r.finReady = true
 	}
@@ -229,6 +234,7 @@ func (r *ReceiveState) drainPending() {
 			return
 		}
 		delete(r.pending, r.next)
+		r.sackDirty = true
 		if len(packet.payload) != 0 {
 			r.appendStream(packet.payload)
 		}
@@ -254,6 +260,7 @@ func (r *ReceiveState) discardPostFIN() {
 			continue
 		}
 		delete(r.pending, sequence)
+		r.sackDirty = true
 		r.bufferedByte -= len(packet.payload)
 	}
 }
@@ -277,7 +284,8 @@ func (r *ReceiveState) ackAction() PacketAction {
 
 // AckPacket returns a fresh STATE packet describing the current cumulative
 // ACK, selective ACK mask, and byte receive window. U4 fills connection and
-// local sequence fields before encoding it.
+// local sequence fields before encoding it. The SACK mask changes only when
+// the reorder state changes; a caller cannot mutate the cached copy.
 func (r *ReceiveState) AckPacket() Packet {
 	if r == nil {
 		return Packet{Type: State}
@@ -287,10 +295,21 @@ func (r *ReceiveState) AckPacket() Packet {
 		AckNr:      r.ack,
 		WindowSize: r.WindowSize(),
 	}
-	if len(r.pending) == 0 {
-		return packet
+	if r.sackDirty {
+		r.rebuildSACK()
 	}
+	if len(r.sack) != 0 {
+		packet.Extensions = []Extension{{Type: SelectiveACKExtension, Data: cloneBytes(r.sack)}}
+	}
+	return packet
+}
 
+func (r *ReceiveState) rebuildSACK() {
+	r.sackDirty = false
+	r.sack = nil
+	if len(r.pending) == 0 {
+		return
+	}
 	maxDistance := 0
 	for sequence := range r.pending {
 		distance, ok := SequenceDistance(r.ack, sequence)
@@ -302,25 +321,23 @@ func (r *ReceiveState) AckPacket() Packet {
 		}
 	}
 	if maxDistance == 0 {
-		return packet
+		return
 	}
 	length := ((maxDistance-2)/8 + 1 + 3) / 4 * 4
 	if length > maxSACKBytes {
 		length = maxSACKBytes
 	}
-	mask := make([]byte, length)
+	r.sack = make([]byte, length)
 	for sequence := range r.pending {
 		distance, ok := SequenceDistance(r.ack, sequence)
 		if !ok || distance < 2 || int(distance) > maxReceiveOffset {
 			continue
 		}
 		bit := int(distance) - 2
-		if bit/8 < len(mask) {
-			mask[bit/8] |= 1 << uint(bit%8)
+		if bit/8 < len(r.sack) {
+			r.sack[bit/8] |= 1 << uint(bit%8)
 		}
 	}
-	packet.Extensions = []Extension{{Type: SelectiveACKExtension, Data: mask}}
-	return packet
 }
 
 // Read consumes ordered bytes. Buffered bytes are returned before a terminal
@@ -359,6 +376,7 @@ func (r *ReceiveState) Cancel(err error) PacketAction {
 	}
 	r.pending = make(map[Sequence]receivePacket)
 	r.bufferedByte = len(r.stream)
+	r.sackDirty = true
 	return PacketAction{Kind: ActionClose, Err: err}
 }
 

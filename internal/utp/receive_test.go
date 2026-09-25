@@ -1,6 +1,7 @@
 package utp
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -278,6 +279,58 @@ func TestReceiveCapsAndSACKBounds(t *testing.T) {
 	}
 	if err := result.Actions[0].Packet.Validate(); err != nil {
 		t.Fatalf("generated ACK invalid: %v", err)
+	}
+}
+
+func TestReceiveDuplicateUsesCachedSACK(t *testing.T) {
+	receiver := NewReceiveState(1)
+	var result ReceiveResult
+	for sequence := Sequence(2); sequence <= Sequence(maxReceiveOffset); sequence++ {
+		result = receiver.Receive(receiveData(sequence, "x"))
+		if !result.Accepted {
+			t.Fatalf("sequence %d was not accepted: %+v", sequence, result)
+		}
+	}
+	mask, ok := result.Actions[0].Packet.SelectiveACK()
+	if !ok || len(mask) != maxSACKBytes {
+		t.Fatalf("full reorder SACK = %d bytes, present=%t", len(mask), ok)
+	}
+	for index, value := range mask {
+		if value != 0xff {
+			t.Fatalf("SACK byte %d = %02x, want ff", index, value)
+		}
+	}
+	if receiver.sackDirty {
+		t.Fatal("SACK cache remained dirty after ACK")
+	}
+	cachedMask := &receiver.sack[0]
+	wantWindow := result.Actions[0].Packet.WindowSize
+	for attempt := 0; attempt < 1000; attempt++ {
+		duplicate := receiver.Receive(receiveData(1000, "x"))
+		if !duplicate.Duplicate || len(duplicate.Actions) != 1 {
+			t.Fatalf("duplicate %d = %+v", attempt, duplicate)
+		}
+		ack := duplicate.Actions[0].Packet
+		gotMask, ok := ack.SelectiveACK()
+		if ack.AckNr != 0 || ack.WindowSize != wantWindow || !ok || !bytes.Equal(gotMask, mask) {
+			t.Fatalf("duplicate %d ACK differs from cached receive state", attempt)
+		}
+		if receiver.sackDirty || &receiver.sack[0] != cachedMask {
+			t.Fatalf("duplicate %d rebuilt the SACK mask", attempt)
+		}
+	}
+
+	// Callers own the returned packet, including its extension data.
+	mask[0] = 0
+	if next, ok := receiver.AckPacket().SelectiveACK(); !ok || next[0] != 0xff {
+		t.Fatal("caller mutated the receive state's cached SACK")
+	}
+	filled := receiver.Receive(receiveData(1, "x"))
+	if !filled.Accepted || filled.Actions[0].Packet.AckNr != Sequence(maxReceiveOffset) {
+		t.Fatalf("gap fill = %+v", filled)
+	}
+	if _, ok := filled.Actions[0].Packet.SelectiveACK(); ok {
+		t.Fatal("SACK remained after the gap closed")
 	}
 }
 
