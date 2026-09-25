@@ -425,10 +425,17 @@ func TestMetadataWrongAdvertisedSizeRotatesWithoutStrikeOrMixedBlocks(t *testing
 	digest := sha1.Sum(info)
 	var expected torrent.InfoHash
 	copy(expected[:], digest[:])
-	fixture := &metadataFixtureTracker{ports: []uint16{51419, 51420}}
+	// Candidate snapshots are newest-first, so announce the good peer first to
+	// make the wrong-size peer the newest candidate and exercise rotation.
+	fixture := &metadataFixtureTracker{ports: []uint16{51420, 51419}}
 	wrongPeerDone := make(chan struct{})
 	goodPeerDone := make(chan struct{})
+	var attemptMu sync.Mutex
+	var attempts []string
 	dial := func(_ context.Context, _, address string) (net.Conn, error) {
+		attemptMu.Lock()
+		attempts = append(attempts, address)
+		attemptMu.Unlock()
 		client, server := net.Pipe()
 		if strings.HasSuffix(address, ":51419") {
 			go serveWrongSizeMetadataPeer(t, server, expected, info, wrongPeerDone)
@@ -462,6 +469,12 @@ func TestMetadataWrongAdvertisedSizeRotatesWithoutStrikeOrMixedBlocks(t *testing
 			t.Fatalf("%s did not finish", name)
 		}
 	}
+	attemptMu.Lock()
+	gotAttempts := append([]string(nil), attempts...)
+	attemptMu.Unlock()
+	if len(gotAttempts) != 2 || !strings.HasSuffix(gotAttempts[0], ":51419") || !strings.HasSuffix(gotAttempts[1], ":51420") {
+		t.Fatalf("metadata dial order = %v, want wrong-size peer then complete supplier", gotAttempts)
+	}
 }
 
 func TestMetadataRefusalUsesOrdinaryBackoffThenRotates(t *testing.T) {
@@ -469,9 +482,16 @@ func TestMetadataRefusalUsesOrdinaryBackoffThenRotates(t *testing.T) {
 	digest := sha1.Sum(info)
 	var expected torrent.InfoHash
 	copy(expected[:], digest[:])
-	fixture := &metadataFixtureTracker{ports: []uint16{51421, 51422}}
+	// Put the successful peer first so newest-first snapshots try the refusing
+	// peer first and prove ordinary-failure rotation still works.
+	fixture := &metadataFixtureTracker{ports: []uint16{51422, 51421}}
 	backoff := peer.NewEndpointBackoff()
+	var attemptMu sync.Mutex
+	var attempts []string
 	dial := func(_ context.Context, _, address string) (net.Conn, error) {
+		attemptMu.Lock()
+		attempts = append(attempts, address)
+		attemptMu.Unlock()
 		client, server := net.Pipe()
 		if strings.HasSuffix(address, ":51421") {
 			go serveRefusingMetadataPeer(t, server, expected)
@@ -500,6 +520,12 @@ func TestMetadataRefusalUsesOrdinaryBackoffThenRotates(t *testing.T) {
 	}
 	if len(result.Strikes) != 0 {
 		t.Fatalf("ordinary metadata refusal caused a corruption strike: %v", result.Strikes)
+	}
+	attemptMu.Lock()
+	gotAttempts := append([]string(nil), attempts...)
+	attemptMu.Unlock()
+	if len(gotAttempts) != 2 || !strings.HasSuffix(gotAttempts[0], ":51421") || !strings.HasSuffix(gotAttempts[1], ":51422") {
+		t.Fatalf("metadata dial order = %v, want refusing peer then complete supplier", gotAttempts)
 	}
 }
 
