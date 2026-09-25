@@ -19,6 +19,22 @@ type loopHTTPResponse struct {
 	err    error
 }
 
+type gatedStartedHTTP struct {
+	gate <-chan struct{}
+	base *loopHTTP
+}
+
+func (f gatedStartedHTTP) Announce(ctx context.Context, tracker string, request AnnounceRequest) (HTTPAnnounceResult, error) {
+	if request.Event == EventStarted {
+		select {
+		case <-f.gate:
+		case <-ctx.Done():
+			return HTTPAnnounceResult{}, ctx.Err()
+		}
+	}
+	return f.base.Announce(ctx, tracker, request)
+}
+
 type loopUDP struct {
 	mu       sync.Mutex
 	requests []AnnounceRequest
@@ -410,15 +426,55 @@ func TestTransmittedStartedWithoutActivationStillGetsStopped(t *testing.T) {
 	}
 }
 
+func TestStartedTransmissionRecordedBeforeUpdate(t *testing.T) {
+	gate := make(chan struct{})
+	observed := make(chan bool, 1)
+	base := &loopHTTP{}
+	var run *PhaseRun
+	set, err := NewTrackerSet(TrackerSetConfig{
+		Trackers: []string{"http://tracker.test/announce"},
+		Identity: Identity{Port: 49152},
+		HTTP:     gatedStartedHTTP{gate: gate, base: base},
+		OnUpdate: func(update Update) {
+			if update.Request.Event == EventStarted {
+				observed <- run.state[0].startedTransmitted
+			}
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err = set.Start(context.Background(), MetadataPhase)
+	if err != nil {
+		t.Fatal(err)
+	}
+	close(gate)
+	select {
+	case recorded := <-observed:
+		if !recorded {
+			t.Fatal("started update reached discovery before transmission was recorded")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for started update")
+	}
+	if err := run.Finalize(context.Background(), false); err != nil {
+		t.Fatal(err)
+	}
+	requests := base.snapshot()
+	if len(requests) != 2 || requests[0].Event != EventStarted || requests[1].Event != EventStopped {
+		t.Fatalf("tracker events = %+v, want started then stopped", requests)
+	}
+}
+
 type contextCheckingHTTP struct {
 	base    *loopHTTP
 	stopped chan finalContextObservation
 }
 
 type finalContextObservation struct {
-	err       error
+	err      error
 	deadline time.Time
-	has       bool
+	has      bool
 }
 
 func (f *contextCheckingHTTP) Announce(ctx context.Context, tracker string, request AnnounceRequest) (HTTPAnnounceResult, error) {

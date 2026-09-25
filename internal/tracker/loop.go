@@ -498,12 +498,12 @@ func (r *PhaseRun) loop(state *trackerState) {
 		} else {
 			update = r.announce(r.ctx, state, request)
 		}
-		r.endNormal()
-		r.notify(update)
 		if event == EventStarted && update.Transmitted {
 			startedSent = true
 			state.startedTransmitted = true
 		}
+		r.endNormal()
+		r.notify(update)
 		if reqErr != nil {
 			return
 		}
