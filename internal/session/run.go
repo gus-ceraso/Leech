@@ -587,6 +587,9 @@ func (c *coordinator) startTransferPhase(ctx context.Context, source torrent.Sou
 	initialStrikes := make(map[peer.Endpoint]int, len(c.strikes))
 	for endpoint, count := range c.strikes {
 		initialStrikes[endpoint] = count
+		if count >= 3 {
+			c.backoff.Blacklist(endpoint)
+		}
 	}
 	verifiedSelected := int64(0)
 	rate := newPayloadRate()
@@ -599,7 +602,8 @@ func (c *coordinator) startTransferPhase(ctx context.Context, source torrent.Sou
 		PieceCount: uint32(len(meta.Pieces)), PieceLength: uint32(meta.PieceLength),
 		LastPieceLength: uint32(meta.Pieces[len(meta.Pieces)-1].Range.End - meta.Pieces[len(meta.Pieces)-1].Range.Begin),
 		AcquirePeer:     acquire, ReleasePeer: release, InitialStrikes: initialStrikes,
-		ResumeComplete: resume.VerifiedPieces,
+		OnEndpointBlacklisted: c.backoff.Blacklist,
+		ResumeComplete:        resume.VerifiedPieces,
 		OnPieceVerified: func(piece PieceVerified) {
 			if mapping, ok := selection.Piece(piece.PieceIndex); ok {
 				_ = c.account.AddRetained(realPieceBytes(mapping))

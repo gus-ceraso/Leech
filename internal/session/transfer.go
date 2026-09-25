@@ -84,6 +84,9 @@ type TransferConfig struct {
 	ReleasePeer func(ConnectedPeer)
 	// InitialStrikes carries endpoint penalties from metadata discovery.
 	InitialStrikes map[peer.Endpoint]int
+	// OnEndpointBlacklisted propagates a new transfer-phase blacklist to the
+	// candidate dialer. It is called by the transfer coordinator goroutine.
+	OnEndpointBlacklisted func(peer.Endpoint)
 	// ResumeComplete contains selected piece indices verified by the resume
 	// phase. They are marked complete before any network worker starts.
 	ResumeComplete []int
@@ -117,6 +120,7 @@ type Transfer struct {
 	releasePeer            func(ConnectedPeer)
 	onPieceVerified        func(PieceVerified)
 	onPayloadReceived      func(int64) error
+	onEndpointBlacklisted  func(peer.Endpoint)
 	beforePeerShutdown     func() error
 	shutdownCallbackCalled bool
 	now                    func() time.Time
@@ -222,22 +226,23 @@ func NewTransfer(config TransferConfig) (*Transfer, error) {
 		}
 	}
 	return &Transfer{
-		selection:          config.Selection,
-		output:             config.Output,
-		stager:             stager,
-		scheduler:          scheduler,
-		local:              config.LocalHandshake,
-		peers:              peers,
-		mode:               config.PrepareMode,
-		pieceCount:         config.PieceCount,
-		pieceLength:        config.PieceLength,
-		lastPieceLength:    config.LastPieceLength,
-		acquirePeer:        config.AcquirePeer,
-		releasePeer:        config.ReleasePeer,
-		onPieceVerified:    config.OnPieceVerified,
-		onPayloadReceived:  config.OnPayloadReceived,
-		beforePeerShutdown: config.BeforePeerShutdown,
-		now:                config.Now,
+		selection:             config.Selection,
+		output:                config.Output,
+		stager:                stager,
+		scheduler:             scheduler,
+		local:                 config.LocalHandshake,
+		peers:                 peers,
+		mode:                  config.PrepareMode,
+		pieceCount:            config.PieceCount,
+		pieceLength:           config.PieceLength,
+		lastPieceLength:       config.LastPieceLength,
+		acquirePeer:           config.AcquirePeer,
+		releasePeer:           config.ReleasePeer,
+		onPieceVerified:       config.OnPieceVerified,
+		onPayloadReceived:     config.OnPayloadReceived,
+		onEndpointBlacklisted: config.OnEndpointBlacklisted,
+		beforePeerShutdown:    config.BeforePeerShutdown,
+		now:                   config.Now,
 	}, nil
 }
 
@@ -749,7 +754,7 @@ func (t *Transfer) handleEventWithPeers(ctx context.Context, peers []*transferPe
 	}
 	if event.Err != nil {
 		if peer.IsProtocolViolation(event.Err) {
-			t.scheduler.SevereViolation(p.input.Endpoint)
+			t.blacklistEndpoint(p.input.Endpoint)
 		}
 		return t.disconnectPeer(p, event.Err)
 	}
@@ -774,7 +779,7 @@ func (t *Transfer) handleEventWithPeers(ctx context.Context, peers []*transferPe
 			return t.disconnectPeer(p, err)
 		}
 		if peer.IsProtocolViolation(err) {
-			t.scheduler.SevereViolation(p.input.Endpoint)
+			t.blacklistEndpoint(p.input.Endpoint)
 			_ = p.worker.Close()
 			return t.disconnectPeer(p, err)
 		}
@@ -931,7 +936,10 @@ func (t *Transfer) finalizePiece(ctx context.Context, index int) error {
 	if err != nil {
 		if errors.Is(err, storage.ErrPieceHashMismatch) {
 			delete(t.stages, index)
-			_, verifyErr := t.scheduler.VerifyPiece(index, false)
+			verification, verifyErr := t.scheduler.VerifyPiece(index, false)
+			for _, endpoint := range verification.Blacklisted {
+				t.notifyBlacklisted(endpoint)
+			}
 			return verifyErr
 		}
 		return err
@@ -967,9 +975,21 @@ func (t *Transfer) workerCause(p *transferPeer, fallback error) error {
 		cause = p.worker.Err()
 	}
 	if peer.IsProtocolViolation(cause) {
-		t.scheduler.SevereViolation(p.input.Endpoint)
+		t.blacklistEndpoint(p.input.Endpoint)
 	}
 	return cause
+}
+
+func (t *Transfer) blacklistEndpoint(endpoint peer.Endpoint) {
+	if t.scheduler.SevereViolation(endpoint) {
+		t.notifyBlacklisted(endpoint)
+	}
+}
+
+func (t *Transfer) notifyBlacklisted(endpoint peer.Endpoint) {
+	if t.onEndpointBlacklisted != nil {
+		t.onEndpointBlacklisted(endpoint)
+	}
 }
 
 func (t *Transfer) disconnectWorker(p *transferPeer) error {

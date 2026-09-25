@@ -490,6 +490,43 @@ func TestTransferTombstoneLimitClosesPeerWithoutStrike(t *testing.T) {
 	}
 }
 
+func TestTransferSeverePeerBlacklistsSharedDialState(t *testing.T) {
+	data := []byte("payload")
+	selection, err := torrent.Select(singleFileMeta(data), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	local, remote := net.Pipe()
+	defer remote.Close()
+	endpoint := endpoint(65)
+	backoff := peer.NewEndpointBackoff()
+	transfer, err := NewTransfer(TransferConfig{
+		Selection: selection, Output: &storage.Plan{},
+		Peers:      []ConnectedPeer{{ID: "severe-peer", Endpoint: endpoint, Conn: local}},
+		PieceCount: 1, PieceLength: uint32(len(data)), LastPieceLength: uint32(len(data)),
+		OnEndpointBlacklisted: backoff.Blacklist,
+	})
+	if err != nil {
+		local.Close()
+		t.Fatal(err)
+	}
+	p, err := transfer.startPeer(context.Background(), transfer.peers[0])
+	if err != nil {
+		local.Close()
+		t.Fatal(err)
+	}
+	violation := fmt.Errorf("invalid bitfield: %w", peer.ErrProtocolViolation)
+	if err := transfer.handleEvent(context.Background(), p, peer.PeerEvent{Err: violation}); !errors.Is(err, peer.ErrProtocolViolation) {
+		t.Fatalf("severe peer error = %v", err)
+	}
+	if !transfer.scheduler.IsBlacklisted(endpoint) || !backoff.IsBlacklisted(endpoint) {
+		t.Fatal("severe endpoint was not blacklisted by both transfer and dialer")
+	}
+	if backoff.Ready(endpoint, time.Now().Add(24*time.Hour)) {
+		t.Fatal("candidate acquisition may redial severe endpoint")
+	}
+}
+
 func TestTransferPayloadCallbackCountsLatePiece(t *testing.T) {
 	data := make([]byte, 32)
 	selection, err := torrent.Select(singleFileMeta(data), nil, nil)
