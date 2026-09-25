@@ -250,6 +250,35 @@ func TestMetadataDiscoveryRejectsInvalidCompleteCandidateAndReportsStrike(t *tes
 	}
 }
 
+func TestFetchMetadataRejectUsesLocalExtensionID(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	serverDone := make(chan error, 1)
+	go func() {
+		defer server.Close()
+		if _, err := peer.ReadMessage(server); err != nil {
+			serverDone <- err
+			return
+		}
+		if err := writeTestFrame(server, extensionHandshakeFrame(7, 1)); err != nil {
+			serverDone <- err
+			return
+		}
+		if _, err := readMetadataPeerMessage(server, 7); err != nil {
+			serverDone <- err
+			return
+		}
+		serverDone <- writeTestFrame(server, metadataControlFrame(1, peer.MetadataReject, 0))
+	}()
+	_, err := fetchMetadata(context.Background(), client, time.Second)
+	if !errors.Is(err, ErrMetadataRejected) {
+		t.Fatalf("metadata reject error = %v, want ErrMetadataRejected", err)
+	}
+	if err := <-serverDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestMetadataDiscoveryRotatesRefusalAndAcceptsRepeatedExtensionID(t *testing.T) {
 	info := largeTestInfo(t)
 	digest := sha1.Sum(info)
@@ -621,7 +650,7 @@ func serveRefusingMetadataPeer(t *testing.T, conn net.Conn, infoHash torrent.Inf
 		return
 	}
 	_, _ = readMetadataPeerMessage(conn, 7)
-	_ = writeTestFrame(conn, metadataControlFrame(7, peer.MetadataReject, 0))
+	_ = writeTestFrame(conn, metadataControlFrame(1, peer.MetadataReject, 0))
 }
 
 func serveWrongSizeMetadataPeer(t *testing.T, conn net.Conn, infoHash torrent.InfoHash, metadata []byte, done chan struct{}) {
