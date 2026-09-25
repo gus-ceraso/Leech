@@ -651,7 +651,7 @@ local metadata-discovery tests. **References:** DESIGN §§6, 7.4, 15.
 and returns only after workers stop. It creates no piece workspace/output,
 serves no metadata, and is not subject to the file-transfer no-progress timeout.
 
-- [ ] **R3 — Discovery review:** one reviewer checks T1–T3 and M1–M2 together.
+- [x] **R3 — Discovery review:** one reviewer checks T1–T3 and M1–M2 together.
   Focus on HTTP sanitization, UDP timing, transmitted-versus-successful started,
   final events, whole-torrent accounting, directional extension IDs, single-source
   metadata, and phase quiescence. Use captured local request traces as evidence.
@@ -660,8 +660,9 @@ serves no metadata, and is not subject to the file-transfer no-progress timeout.
 
   - [x] T1: retain the standard ten-redirect HTTP limit while sanitizing every
     redirect (`f609204`).
-  - [ ] T2: reconnect before retransmitting an announce whose BEP 15 connection
-    ID has expired; preserve the transaction retry schedule and final deadline.
+  - [x] T2: reconnect before retransmitting an announce whose BEP 15 connection
+    ID has expired; preserve the transaction retry schedule and final deadline
+    (`67b2a4b`).
 
 ## Group 4: uTP, developed alongside TCP
 
@@ -863,6 +864,10 @@ regressions, and final usage/build documentation. Reuse the earlier local fixtur
 **Acceptance:** every promised design behavior has implementation and local
 evidence. Remaining follow-ups concern measured tuning or out-of-scope ideas,
 not silently omitted requirements.
+
+- [ ] U4/P3 integration fix: a uTP connection returned by `DialContext` must
+  remain live when P3 cancels the winning dial attempt's context; V1's local
+  complete-session uTP fixture currently exposes premature connection closure.
 
 - [ ] **R5 — Final integration review:** one reviewer checks L1, L2, and V1,
   plus the interfaces between already reviewed groups. Verify phase ordering,
