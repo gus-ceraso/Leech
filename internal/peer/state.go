@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math/bits"
+	"sort"
 
 	"github.com/gus-ceraso/Leech/internal/limits"
 )
@@ -58,23 +59,27 @@ const (
 // PeerState is one peer's protocol state. All methods must be called by the
 // coordinator goroutine; no method starts a goroutine or touches a net.Conn.
 type PeerState struct {
-	pieceCount        uint32
-	pieceLength       uint32
-	lastPieceLength   uint32
-	fast              bool
-	choked            bool
-	interested        bool
-	initialSeen       bool
-	reqQ              int
-	availability      bitSet
-	allowedFast       bitSet
-	wanted            bitSet
-	availabilityCount uint32
-	wantedAvailable   uint32
-	requestableCount  uint32
-	suggestions       []uint32
-	seenIncoming      map[Block]struct{}
-	requests          *RequestTable
+	pieceCount             uint32
+	pieceLength            uint32
+	lastPieceLength        uint32
+	fast                   bool
+	choked                 bool
+	interested             bool
+	initialSeen            bool
+	reqQ                   int
+	availability           bitSet
+	availabilityWords      []uint32
+	availabilityWordsOrder bool
+	allowedFast            bitSet
+	wanted                 bitSet
+	availabilityCount      uint32
+	wantedAvailable        uint32
+	requestableCount       uint32
+	// availabilityWordVisits exposes sparse traversal work to package tests.
+	availabilityWordVisits uint64
+	suggestions            []uint32
+	seenIncoming           map[Block]struct{}
+	requests               *RequestTable
 }
 
 // NewPeerState creates coordinator-owned state with the supported request and
@@ -99,17 +104,18 @@ func NewPeerStateWithConfig(config PeerStateConfig) (*PeerState, error) {
 		reqq = limits.PeerRequests
 	}
 	return &PeerState{
-		pieceCount:      config.PieceCount,
-		pieceLength:     config.PieceLength,
-		lastPieceLength: config.LastPieceLength,
-		fast:            config.Fast,
-		choked:          true,
-		reqQ:            reqq,
-		availability:    newBitSet(config.PieceCount),
-		allowedFast:     newBitSet(config.PieceCount),
-		wanted:          newBitSet(config.PieceCount),
-		seenIncoming:    make(map[Block]struct{}, limits.PeerRequests),
-		requests:        requests,
+		pieceCount:             config.PieceCount,
+		pieceLength:            config.PieceLength,
+		lastPieceLength:        config.LastPieceLength,
+		fast:                   config.Fast,
+		choked:                 true,
+		reqQ:                   reqq,
+		availability:           newBitSet(config.PieceCount),
+		availabilityWordsOrder: true,
+		allowedFast:            newBitSet(config.PieceCount),
+		wanted:                 newBitSet(config.PieceCount),
+		seenIncoming:           make(map[Block]struct{}, limits.PeerRequests),
+		requests:               requests,
 	}, nil
 }
 
@@ -218,7 +224,7 @@ func (s *PeerState) SetWantedPieces(indices []int) error {
 	s.wantedAvailable = wantedAvailable
 	s.interested = wantedAvailable != 0
 	if s.choked {
-		s.requestableCount = bitAndCount(s.availability, s.allowedFast, wanted)
+		s.requestableCount = s.allowedFastWantedCount(wanted)
 	} else {
 		s.requestableCount = wantedAvailable
 	}
@@ -233,7 +239,7 @@ func (s *PeerState) SetChoked(choked bool) error {
 	}
 	if s.choked != choked {
 		if choked {
-			s.requestableCount = bitAndCount(s.availability, s.allowedFast, s.wanted)
+			s.requestableCount = s.allowedFastWantedCount(s.wanted)
 		} else {
 			s.requestableCount = s.wantedAvailable
 		}
@@ -312,7 +318,7 @@ func (s *PeerState) ApplyMessage(message Message) (StateEffect, error) {
 	case HaveID:
 		index := binary.BigEndian.Uint32(message.Payload)
 		if !s.availability.has(index) {
-			s.availability.set(index, true)
+			s.setAvailability(index)
 			s.availabilityCount++
 			if s.wanted.has(index) {
 				s.wantedAvailable++
@@ -332,11 +338,16 @@ func (s *PeerState) ApplyMessage(message Message) (StateEffect, error) {
 			// Ignore a repeated Have All rather than restoring stale state.
 			break
 		}
-		s.availability.fill()
+		s.availabilityWords = s.availabilityWords[:0]
+		s.availabilityWordsOrder = true
+		for word := range s.availability {
+			s.availability[word] = ^uint64(0)
+			s.availabilityWords = append(s.availabilityWords, uint32(word))
+		}
 		s.availabilityCount = s.pieceCount
 		s.wantedAvailable = bitCount(s.wanted)
 		if s.choked {
-			s.requestableCount = bitAndCount(s.availability, s.allowedFast, s.wanted)
+			s.requestableCount = s.allowedFastWantedCount(s.wanted)
 		} else {
 			s.requestableCount = s.wantedAvailable
 		}
@@ -353,7 +364,12 @@ func (s *PeerState) ApplyMessage(message Message) (StateEffect, error) {
 		// availability set is a constant-time no-op.
 		if s.availabilityCount != 0 {
 			s.appendCurrentAvailability(&effect, false)
-			s.availability.clear()
+			for _, word := range s.availabilityWords {
+				s.availabilityWordVisits++
+				s.availability[word] = 0
+			}
+			s.availabilityWords = s.availabilityWords[:0]
+			s.availabilityWordsOrder = true
 			s.availabilityCount = 0
 			s.wantedAvailable = 0
 			s.requestableCount = 0
@@ -496,7 +512,7 @@ func (s *PeerState) applyBitfield(payload []byte) error {
 	// transition. This parser only needs to translate its valid bits.
 	for index := uint32(0); index < s.pieceCount; index++ {
 		if payload[index/8]&(1<<(7-index%8)) != 0 {
-			s.availability.set(index, true)
+			s.setAvailability(index)
 			s.availabilityCount++
 			if s.wanted.has(index) {
 				s.wantedAvailable++
@@ -523,13 +539,17 @@ func (s *PeerState) appendCurrentAvailability(effect *StateEffect, available boo
 	if s.wantedAvailable == 0 {
 		return
 	}
-	for word, value := range s.availability {
+	for _, wordIndex := range s.availabilityWords {
+		s.availabilityWordVisits++
+		word := int(wordIndex)
+		value := s.availability[word]
 		value &= s.wanted[word]
 		if s.choked {
 			value &= s.allowedFast[word]
 		}
 		s.appendAvailabilityWord(effect, word, value, available)
 	}
+	s.sortAvailabilityChanges(effect, available)
 }
 
 // Choking removes non-Allowed-Fast availability from the scheduler; unchoking
@@ -539,10 +559,25 @@ func (s *PeerState) appendChokeAvailabilityChanges(effect *StateEffect, availabl
 	if s.wantedAvailable == 0 {
 		return
 	}
-	for word, value := range s.availability {
+	for _, wordIndex := range s.availabilityWords {
+		s.availabilityWordVisits++
+		word := int(wordIndex)
+		value := s.availability[word]
 		value &= s.wanted[word] &^ s.allowedFast[word]
 		s.appendAvailabilityWord(effect, word, value, available)
 	}
+	s.sortAvailabilityChanges(effect, available)
+}
+
+func (s *PeerState) sortAvailabilityChanges(effect *StateEffect, available bool) {
+	if s.availabilityWordsOrder {
+		return
+	}
+	changes := effect.AvailabilityRemoved
+	if available {
+		changes = effect.AvailabilityAdded
+	}
+	sort.Slice(changes, func(i, j int) bool { return changes[i] < changes[j] })
 }
 
 func (s *PeerState) appendAvailabilityWord(effect *StateEffect, word int, value uint64, available bool) {
@@ -566,10 +601,23 @@ func bitCount(set bitSet) uint32 {
 	return count
 }
 
-func bitAndCount(a, b, c bitSet) uint32 {
+func (s *PeerState) setAvailability(index uint32) {
+	word := index / 64
+	if s.availability[word] == 0 {
+		if len(s.availabilityWords) != 0 && s.availabilityWords[len(s.availabilityWords)-1] > word {
+			s.availabilityWordsOrder = false
+		}
+		s.availabilityWords = append(s.availabilityWords, word)
+	}
+	s.availability.set(index, true)
+}
+
+func (s *PeerState) allowedFastWantedCount(wanted bitSet) uint32 {
 	var count uint32
-	for word, value := range a {
-		count += uint32(bits.OnesCount64(value & b[word] & c[word]))
+	for _, wordIndex := range s.availabilityWords {
+		s.availabilityWordVisits++
+		word := int(wordIndex)
+		count += uint32(bits.OnesCount64(s.availability[word] & s.allowedFast[word] & wanted[word]))
 	}
 	return count
 }
@@ -597,18 +645,6 @@ func (b bitSet) has(index uint32) bool {
 		return false
 	}
 	return b[word]&(uint64(1)<<uint(index%64)) != 0
-}
-
-func (b bitSet) clear() {
-	for i := range b {
-		b[i] = 0
-	}
-}
-
-func (b bitSet) fill() {
-	for i := range b {
-		b[i] = ^uint64(0)
-	}
 }
 
 func containsUint32(values []uint32, wanted uint32) bool {

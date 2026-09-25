@@ -220,18 +220,18 @@ func TestPeerStateLargeWantedAvailabilityUsesChangedBits(t *testing.T) {
 }
 
 func TestPeerStateRequestableCountAcrossBulkAndChokeTransitions(t *testing.T) {
-	state, err := NewPeerState(4, true)
+	state, err := NewPeerState(130, true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := state.SetWantedPieces([]int{0, 1, 2}); err != nil {
+	if err := state.SetWantedPieces([]int{0, 65, 129}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := state.ApplyMessage(Message{ID: AllowedFastID, Payload: uint32Payload(2)}); err != nil {
+	if _, err := state.ApplyMessage(Message{ID: AllowedFastID, Payload: uint32Payload(65)}); err != nil {
 		t.Fatal(err)
 	}
 	effect, err := state.ApplyMessage(Message{ID: HaveAllID})
-	if err != nil || state.RequestableCount() != 1 || len(effect.AvailabilityAdded) != 1 || effect.AvailabilityAdded[0] != 2 {
+	if err != nil || state.RequestableCount() != 1 || len(state.availabilityWords) != 3 || len(effect.AvailabilityAdded) != 1 || effect.AvailabilityAdded[0] != 65 {
 		t.Fatalf("Have All requestable state = %#v, count %d, err %v", effect, state.RequestableCount(), err)
 	}
 	effect, err = state.ApplyMessage(Message{ID: UnchokeID})
@@ -243,23 +243,117 @@ func TestPeerStateRequestableCountAcrossBulkAndChokeTransitions(t *testing.T) {
 		t.Fatalf("Choke requestable state = %#v, count %d, err %v", effect, state.RequestableCount(), err)
 	}
 	effect, err = state.ApplyMessage(Message{ID: HaveNoneID})
-	if err != nil || state.RequestableCount() != 0 || len(effect.AvailabilityRemoved) != 1 || effect.AvailabilityRemoved[0] != 2 || !state.AllowedFast(2) {
+	if err != nil || state.RequestableCount() != 0 || len(state.availabilityWords) != 0 || len(effect.AvailabilityRemoved) != 1 || effect.AvailabilityRemoved[0] != 65 || !state.AllowedFast(65) {
 		t.Fatalf("Have None requestable state = %#v, count %d, err %v", effect, state.RequestableCount(), err)
 	}
 
-	bitfield, err := NewPeerState(16, true)
+	bitfield, err := NewPeerState(130, true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := bitfield.SetWantedPieces([]int{0, 3, 8}); err != nil {
+	if err := bitfield.SetWantedPieces([]int{0, 64, 128}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := bitfield.ApplyMessage(Message{ID: UnchokeID}); err != nil {
 		t.Fatal(err)
 	}
-	effect, err = bitfield.ApplyMessage(Message{ID: BitfieldID, Payload: []byte{0x90, 0x80}})
-	if err != nil || bitfield.RequestableCount() != 3 || len(effect.AvailabilityAdded) != 3 {
+	payload := make([]byte, 17)
+	payload[0], payload[8], payload[16] = 0x80, 0x80, 0x80
+	effect, err = bitfield.ApplyMessage(Message{ID: BitfieldID, Payload: payload})
+	if err != nil || bitfield.RequestableCount() != 3 || len(bitfield.availabilityWords) != 3 || len(effect.AvailabilityAdded) != 3 {
 		t.Fatalf("Bitfield requestable state = %#v, count %d, err %v", effect, bitfield.RequestableCount(), err)
+	}
+}
+
+func TestPeerStateSparseAvailabilityScansOnlyActiveWords(t *testing.T) {
+	state, err := NewPeerStateWithConfig(PeerStateConfig{PieceCount: limits.Pieces, Fast: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	last := uint32(limits.Pieces - 1)
+	if err := state.SetWantedPieces([]int{int(last)}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := state.ApplyMessage(Message{ID: UnchokeID}); err != nil {
+		t.Fatal(err)
+	}
+	state.availabilityWordVisits = 0
+
+	for i := 0; i < 32; i++ {
+		effect, err := state.ApplyMessage(Message{ID: HaveID, Payload: uint32Payload(last)})
+		if err != nil || state.RequestableCount() != 1 || len(effect.AvailabilityAdded) != 1 || effect.AvailabilityAdded[0] != last {
+			t.Fatalf("Have %d = %#v, requestable=%d, err=%v", i, effect, state.RequestableCount(), err)
+		}
+		visits := state.availabilityWordVisits
+		effect, err = state.ApplyMessage(Message{ID: HaveID, Payload: uint32Payload(last)})
+		if err != nil || state.RequestableCount() != 1 || len(effect.AvailabilityAdded) != 0 || len(effect.AvailabilityRemoved) != 0 || state.availabilityWordVisits != visits {
+			t.Fatalf("duplicate Have %d = %#v, requestable=%d, visits=%d (before %d), err=%v", i, effect, state.RequestableCount(), state.availabilityWordVisits, visits, err)
+		}
+		effect, err = state.ApplyMessage(Message{ID: HaveNoneID})
+		if err != nil || state.RequestableCount() != 0 || len(effect.AvailabilityRemoved) != 1 || effect.AvailabilityRemoved[0] != last || len(state.availabilityWords) != 0 {
+			t.Fatalf("Have None %d = %#v, requestable=%d, active words=%d, err=%v", i, effect, state.RequestableCount(), len(state.availabilityWords), err)
+		}
+	}
+	if got, want := state.availabilityWordVisits, uint64(64); got != want {
+		t.Fatalf("sparse Have/Have None visits = %d, want %d for %d transitions", got, want, limits.Pieces)
+	}
+	for i := 0; i < 32; i++ {
+		visits := state.availabilityWordVisits
+		effect, err := state.ApplyMessage(Message{ID: HaveNoneID})
+		if err != nil || effect.InterestChanged || effect.Interested || len(effect.AvailabilityAdded) != 0 || len(effect.AvailabilityRemoved) != 0 || state.availabilityWordVisits != visits {
+			t.Fatalf("empty Have None %d = %#v, visits=%d (before %d), err=%v", i, effect, state.availabilityWordVisits, visits, err)
+		}
+	}
+
+	effect, err := state.ApplyMessage(Message{ID: HaveID, Payload: uint32Payload(last)})
+	if err != nil || len(effect.AvailabilityAdded) != 1 || state.RequestableCount() != 1 {
+		t.Fatalf("Have before choke = %#v, requestable=%d, err=%v", effect, state.RequestableCount(), err)
+	}
+	effect, err = state.ApplyMessage(Message{ID: ChokeID})
+	if err != nil || state.RequestableCount() != 0 || len(effect.AvailabilityRemoved) != 1 || effect.AvailabilityRemoved[0] != last {
+		t.Fatalf("Choke = %#v, requestable=%d, err=%v", effect, state.RequestableCount(), err)
+	}
+	effect, err = state.ApplyMessage(Message{ID: UnchokeID})
+	if err != nil || state.RequestableCount() != 1 || len(effect.AvailabilityAdded) != 1 || effect.AvailabilityAdded[0] != last {
+		t.Fatalf("Unchoke = %#v, requestable=%d, err=%v", effect, state.RequestableCount(), err)
+	}
+	effect, err = state.ApplyMessage(Message{ID: HaveNoneID})
+	if err != nil || state.RequestableCount() != 0 || len(effect.AvailabilityRemoved) != 1 || effect.AvailabilityRemoved[0] != last {
+		t.Fatalf("final Have None = %#v, requestable=%d, err=%v", effect, state.RequestableCount(), err)
+	}
+	if got, want := state.availabilityWordVisits, uint64(69); got != want {
+		t.Fatalf("sparse transition visits = %d, want %d across Have/Have None and Choke/Unchoke", got, want)
+	}
+}
+
+func TestPeerStateSparseAvailabilityDeltasHaveStableOrder(t *testing.T) {
+	state, err := NewPeerState(130, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := state.SetWantedPieces([]int{1, 65, 129}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := state.ApplyMessage(Message{ID: UnchokeID}); err != nil {
+		t.Fatal(err)
+	}
+	for _, index := range []uint32{129, 65, 1} {
+		if _, err := state.ApplyMessage(Message{ID: HaveID, Payload: uint32Payload(index)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	effect, err := state.ApplyMessage(Message{ID: ChokeID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []uint32{1, 65, 129}
+	if len(effect.AvailabilityRemoved) != len(want) {
+		t.Fatalf("Choke removals = %v, want %v", effect.AvailabilityRemoved, want)
+	}
+	for index := range want {
+		if effect.AvailabilityRemoved[index] != want[index] {
+			t.Fatalf("Choke removals = %v, want %v", effect.AvailabilityRemoved, want)
+		}
 	}
 }
 
