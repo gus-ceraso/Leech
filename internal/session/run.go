@@ -24,7 +24,8 @@ import (
 )
 
 var (
-	ErrRunConfig = errors.New("invalid session configuration")
+	ErrRunConfig         = errors.New("invalid session configuration")
+	ErrNoProgressTimeout = errors.New("no verified file pieces before timeout")
 )
 
 // RunConfig contains command-independent session options and test seams.  A
@@ -588,6 +589,7 @@ func (c *coordinator) startTransferPhase(ctx context.Context, source torrent.Sou
 		initialStrikes[endpoint] = count
 	}
 	verifiedSelected := int64(0)
+	rate := newPayloadRate()
 	for _, span := range resume.VerifiedRanges {
 		verifiedSelected += span.Range.End - span.Range.Begin
 	}
@@ -604,11 +606,15 @@ func (c *coordinator) startTransferPhase(ctx context.Context, source torrent.Sou
 			}
 			verifiedSelected += piece.SelectedBytes
 			if c.config.OnProgress != nil {
-				progress := RunProgress{VerifiedSelectedBytes: verifiedSelected, SelectedBytes: runSelectedBytes(selection)}
+				liveMu.Lock()
+				activePeers := len(live)
+				liveMu.Unlock()
+				progress := RunProgress{VerifiedSelectedBytes: verifiedSelected, SelectedBytes: runSelectedBytes(selection), ActivePeers: activePeers, RecentRateBytesPerSec: rate.perSecond(time.Now())}
 				c.config.OnProgress(progress)
 			}
 		},
 		OnPayloadReceived: func(n int64) error {
+			rate.add(time.Now(), n)
 			return c.account.AddReceived(n)
 		},
 		BeforePeerShutdown: func() error {
@@ -625,6 +631,7 @@ func (c *coordinator) startTransferPhase(ctx context.Context, source torrent.Sou
 	}
 	transferCtx := runCtx
 	var stopTimeout func()
+	var timeoutFired atomic.Bool
 	if c.config.Timeout > 0 {
 		var timerMu sync.Mutex
 		timer := time.NewTimer(c.config.Timeout)
@@ -646,6 +653,7 @@ func (c *coordinator) startTransferPhase(ctx context.Context, source torrent.Sou
 		go func() {
 			select {
 			case <-timer.C:
+				timeoutFired.Store(true)
 				timeoutCancel()
 			case <-timeoutDone:
 			case <-runCtx.Done():
@@ -683,6 +691,9 @@ func (c *coordinator) startTransferPhase(ctx context.Context, source torrent.Sou
 		stopTimeout()
 	}
 	err = transferErr
+	if errors.Is(err, context.Canceled) && ctx.Err() == nil && timeoutFired.Load() {
+		err = fmt.Errorf("%w: %s", ErrNoProgressTimeout, c.config.Timeout)
+	}
 	if err == nil {
 		for _, pending := range resume.PendingTruncations {
 			if truncateErr := output.TruncateSelected(pending.Index, pending.Size); truncateErr != nil {
@@ -703,6 +714,55 @@ func (c *coordinator) startTransferPhase(ctx context.Context, source torrent.Sou
 		return err
 	}
 	return nil
+}
+
+type payloadRateBucket struct {
+	second int64
+	bytes  uint64
+}
+
+// payloadRate keeps a bounded rolling window for interactive status.
+type payloadRate struct {
+	buckets [5]payloadRateBucket
+}
+
+func newPayloadRate() *payloadRate { return &payloadRate{} }
+
+func (r *payloadRate) add(now time.Time, n int64) {
+	if r == nil || n <= 0 {
+		return
+	}
+	second := now.Unix()
+	index := second % int64(len(r.buckets))
+	if index < 0 {
+		index += int64(len(r.buckets))
+	}
+	bucket := &r.buckets[index]
+	if bucket.second != second {
+		bucket.second = second
+		bucket.bytes = 0
+	}
+	if uint64(n) <= ^uint64(0)-bucket.bytes {
+		bucket.bytes += uint64(n)
+	}
+}
+
+func (r *payloadRate) perSecond(now time.Time) uint64 {
+	if r == nil {
+		return 0
+	}
+	current := now.Unix()
+	var total uint64
+	for i := range r.buckets {
+		bucket := r.buckets[i]
+		if bucket.second <= current && current-bucket.second < int64(len(r.buckets)) {
+			if bucket.bytes > ^uint64(0)-total {
+				return ^uint64(0) / uint64(len(r.buckets))
+			}
+			total += bucket.bytes
+		}
+	}
+	return total / uint64(len(r.buckets))
 }
 
 func runSelectedBytes(selection *torrent.SelectionPlan) int64 {

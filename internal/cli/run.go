@@ -66,7 +66,7 @@ func RunWithSession(ctx context.Context, opts Options, stdout, stderr io.Writer,
 		if oldProgress != nil {
 			oldProgress(progress)
 		}
-		_ = reporter.Status(Status{Phase: "transfer", VerifiedSelectedBytes: uint64(maxInt64(0, progress.VerifiedSelectedBytes)), SelectedBytes: uint64(maxInt64(0, progress.SelectedBytes))})
+		_ = reporter.Status(Status{Phase: "transfer", VerifiedSelectedBytes: uint64(maxInt64(0, progress.VerifiedSelectedBytes)), SelectedBytes: uint64(maxInt64(0, progress.SelectedBytes)), ActivePeers: progress.ActivePeers, RecentRateBytesPerSec: progress.RecentRateBytesPerSec})
 	}
 	dependencies.OnWarning = func(message string) {
 		if oldWarning != nil {
