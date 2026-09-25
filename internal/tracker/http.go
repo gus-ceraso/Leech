@@ -20,6 +20,16 @@ import (
 
 const defaultHTTPTimeout = 30 * time.Second
 
+// These limits admit 20,000 dictionary peers with an optional peer ID:
+// 80,000 peer values and 60,000 peer dictionary entries, plus response fields.
+// Smaller tracker bounds keep ignored response trees from using the much
+// larger metainfo decoding budget.
+const (
+	trackerBencodeValues            = 100_000
+	trackerBencodeDictionaryEntries = 64_000
+	trackerBencodeContainerEntries  = limits.Candidates
+)
+
 // HTTPFailureClass tells the tracker lifecycle how to handle an HTTP
 // transaction failure. A transient failure can be retried, while the other
 // classes disable the tracker for the current run.
@@ -362,7 +372,13 @@ func httpTransportError(err error, transmitted bool, ctx context.Context) *HTTPE
 
 func parseHTTPAnnounceResponse(body []byte) (HTTPAnnounceResult, error) {
 	var result HTTPAnnounceResult
-	value, err := bencode.DecodeWithLimits(body, bencode.Limits{MaxBytes: limits.HTTPResponseBytes})
+	value, err := bencode.DecodeWithLimits(body, bencode.Limits{
+		MaxBytes:             limits.HTTPResponseBytes,
+		MaxValues:            trackerBencodeValues,
+		MaxDictionaryEntries: trackerBencodeDictionaryEntries,
+		MaxContainerEntries:  trackerBencodeContainerEntries,
+		MaxDepth:             limits.BencodeDepth,
+	})
 	if err != nil {
 		return result, &HTTPError{Code: HTTPErrorMalformed, Class: HTTPFailureTransient, Err: err}
 	}
@@ -394,22 +410,20 @@ func parseHTTPAnnounceResponse(body []byte) (HTTPAnnounceResult, error) {
 	if !ok {
 		return result, &HTTPError{Code: HTTPErrorMalformed, Class: HTTPFailureTransient, Err: errors.New("tracker response has no peers")}
 	}
-	peers, err := parseHTTPPeers(peersValue)
-	if err != nil {
+	peers := newHTTPPeerSet(httpPeerCapacity(peersValue))
+	if err := parseHTTPPeers(peersValue, peers); err != nil {
 		return result, err
 	}
 	if peers6, ok := dictionaryValue(value, "peers6"); ok {
 		if peers6.Type != bencode.Bytes {
 			return result, &HTTPError{Code: HTTPErrorMalformed, Class: HTTPFailureTransient, Err: errors.New("tracker peers6 is not compact")}
 		}
-		more, parseErr := parseCompactPeers(peers6.Bytes, 16)
-		if parseErr != nil {
-			return result, parseErr
+		if err := parseCompactPeers(peers6.Bytes, 16, peers); err != nil {
+			return result, err
 		}
-		peers = appendUniqueHTTPPeers(peers, more...)
 	}
 	result.Interval = time.Duration(intervalValue.Int) * time.Second
-	result.Peers = peers
+	result.Peers = peers.peers
 	if leechers, ok := dictionaryValue(value, "leechers"); ok {
 		result.Leechers, err = parseCounter(leechers)
 		if err != nil {
@@ -482,57 +496,105 @@ func dictionaryValue(value bencode.Value, key string) (bencode.Value, bool) {
 	return bencode.Value{}, false
 }
 
-func parseHTTPPeers(value bencode.Value) ([]HTTPPeer, error) {
+type httpPeerEndpoint struct {
+	host string
+	port uint16
+}
+
+// httpPeerSet deduplicates every peer representation in one tracker response.
+type httpPeerSet struct {
+	peers []HTTPPeer
+	seen  map[httpPeerEndpoint]int
+}
+
+func newHTTPPeerSet(capacity int) *httpPeerSet {
+	if capacity > limits.Candidates {
+		capacity = limits.Candidates
+	}
+	return &httpPeerSet{
+		peers: make([]HTTPPeer, 0, capacity),
+		seen:  make(map[httpPeerEndpoint]int, capacity),
+	}
+}
+
+func (set *httpPeerSet) append(peer HTTPPeer) {
+	key := httpPeerEndpoint{host: peer.Host, port: peer.Port}
+	if index, ok := set.seen[key]; ok {
+		// Preserve the first endpoint while retaining an ID learned from a
+		// later dictionary record if the first record omitted it.
+		if !set.peers[index].HasID && peer.HasID {
+			set.peers[index].PeerID = peer.PeerID
+			set.peers[index].HasID = true
+		}
+		return
+	}
+	if len(set.peers) >= limits.Candidates {
+		return
+	}
+	set.seen[key] = len(set.peers)
+	set.peers = append(set.peers, peer)
+}
+
+func httpPeerCapacity(value bencode.Value) int {
+	var count int
 	switch value.Type {
 	case bencode.Bytes:
-		return parseCompactPeers(value.Bytes, 4)
+		count = len(value.Bytes) / 6
 	case bencode.List:
-		peers := make([]HTTPPeer, 0, min(len(value.List), limits.Candidates))
+		count = len(value.List)
+	}
+	return min(count, limits.Candidates)
+}
+
+func parseHTTPPeers(value bencode.Value, peers *httpPeerSet) error {
+	switch value.Type {
+	case bencode.Bytes:
+		return parseCompactPeers(value.Bytes, 4, peers)
+	case bencode.List:
 		for _, item := range value.List {
-			if len(peers) >= limits.Candidates {
+			if len(peers.peers) >= limits.Candidates {
 				break
 			}
 			if item.Type != bencode.Dictionary {
-				return nil, &HTTPError{Code: HTTPErrorMalformed, Class: HTTPFailureTransient, Err: errors.New("tracker peer is not a dictionary")}
+				return &HTTPError{Code: HTTPErrorMalformed, Class: HTTPFailureTransient, Err: errors.New("tracker peer is not a dictionary")}
 			}
 			ipValue, ok := dictionaryValue(item, "ip")
 			if !ok || ipValue.Type != bencode.Bytes {
-				return nil, &HTTPError{Code: HTTPErrorMalformed, Class: HTTPFailureTransient, Err: errors.New("tracker peer has no IP")}
+				return &HTTPError{Code: HTTPErrorMalformed, Class: HTTPFailureTransient, Err: errors.New("tracker peer has no IP")}
 			}
 			portValue, ok := dictionaryValue(item, "port")
 			if !ok || portValue.Type != bencode.Integer || portValue.Int < 1 || portValue.Int > math.MaxUint16 {
-				return nil, &HTTPError{Code: HTTPErrorMalformed, Class: HTTPFailureTransient, Err: errors.New("tracker peer has invalid port")}
+				return &HTTPError{Code: HTTPErrorMalformed, Class: HTTPFailureTransient, Err: errors.New("tracker peer has invalid port")}
 			}
 			host := string(ipValue.Bytes)
 			if !validDictionaryPeerHost(host) {
-				return nil, &HTTPError{Code: HTTPErrorMalformed, Class: HTTPFailureTransient, Err: errors.New("tracker peer has invalid IP")}
+				return &HTTPError{Code: HTTPErrorMalformed, Class: HTTPFailureTransient, Err: errors.New("tracker peer has invalid IP")}
 			}
 			peer := HTTPPeer{Host: host, Port: uint16(portValue.Int)}
 			if idValue, hasID := dictionaryValue(item, "peer id"); hasID {
 				if idValue.Type != bencode.Bytes || len(idValue.Bytes) != len(peer.PeerID) {
-					return nil, &HTTPError{Code: HTTPErrorMalformed, Class: HTTPFailureTransient, Err: errors.New("tracker peer has invalid peer ID")}
+					return &HTTPError{Code: HTTPErrorMalformed, Class: HTTPFailureTransient, Err: errors.New("tracker peer has invalid peer ID")}
 				}
 				copy(peer.PeerID[:], idValue.Bytes)
 				peer.HasID = true
 			}
-			peers = appendUniqueHTTPPeers(peers, peer)
+			peers.append(peer)
 		}
-		return peers, nil
+		return nil
 	default:
-		return nil, &HTTPError{Code: HTTPErrorMalformed, Class: HTTPFailureTransient, Err: errors.New("tracker peers has invalid type")}
+		return &HTTPError{Code: HTTPErrorMalformed, Class: HTTPFailureTransient, Err: errors.New("tracker peers has invalid type")}
 	}
 }
 
-func parseCompactPeers(value []byte, addressBytes int) ([]HTTPPeer, error) {
+func parseCompactPeers(value []byte, addressBytes int, peers *httpPeerSet) error {
 	stride := addressBytes + 2
 	if len(value)%stride != 0 {
-		return nil, &HTTPError{Code: HTTPErrorMalformed, Class: HTTPFailureTransient, Err: errors.New("compact peer list has incomplete endpoint")}
+		return &HTTPError{Code: HTTPErrorMalformed, Class: HTTPFailureTransient, Err: errors.New("compact peer list has incomplete endpoint")}
 	}
 	count := len(value) / stride
 	if count > limits.Candidates {
 		count = limits.Candidates
 	}
-	peers := make([]HTTPPeer, 0, count)
 	for offset, retained := 0, 0; offset < len(value) && retained < count; offset, retained = offset+stride, retained+1 {
 		var addr netip.Addr
 		if addressBytes == 4 {
@@ -546,33 +608,11 @@ func parseCompactPeers(value []byte, addressBytes int) ([]HTTPPeer, error) {
 		}
 		port := int(value[offset+addressBytes])<<8 | int(value[offset+addressBytes+1])
 		if port == 0 || addr.IsUnspecified() || addr.IsMulticast() {
-			return nil, &HTTPError{Code: HTTPErrorMalformed, Class: HTTPFailureTransient, Err: errors.New("invalid compact peer endpoint")}
+			return &HTTPError{Code: HTTPErrorMalformed, Class: HTTPFailureTransient, Err: errors.New("invalid compact peer endpoint")}
 		}
-		peers = appendUniqueHTTPPeers(peers, HTTPPeer{Host: addr.String(), Port: uint16(port)})
+		peers.append(HTTPPeer{Host: addr.String(), Port: uint16(port)})
 	}
-	return peers, nil
-}
-
-func appendUniqueHTTPPeers(dst []HTTPPeer, src ...HTTPPeer) []HTTPPeer {
-	seen := make(map[string]int, len(dst)+len(src))
-	for i, peer := range dst {
-		seen[peer.Host+"\x00"+strconv.Itoa(int(peer.Port))] = i
-	}
-	for _, peer := range src {
-		key := peer.Host + "\x00" + strconv.Itoa(int(peer.Port))
-		if index, ok := seen[key]; ok {
-			// Preserve the first endpoint while retaining an ID learned from a
-			// later dictionary record if the first record omitted it.
-			if !dst[index].HasID && peer.HasID {
-				dst[index].PeerID = peer.PeerID
-				dst[index].HasID = true
-			}
-			continue
-		}
-		seen[key] = len(dst)
-		dst = append(dst, peer)
-	}
-	return dst
+	return nil
 }
 
 func validDictionaryPeerHost(host string) bool {

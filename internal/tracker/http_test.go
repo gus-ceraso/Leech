@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gus-ceraso/Leech/internal/bencode"
 	"github.com/gus-ceraso/Leech/internal/limits"
 )
 
@@ -173,6 +174,140 @@ func TestHTTPAnnounceParsesCompactFamiliesAndDictionaryPeers(t *testing.T) {
 	if err != nil || len(got.Peers) != 1 || got.Peers[0].Host != "seed.example" || !got.Peers[0].HasID {
 		t.Fatalf("hostname dictionary peer = %+v, err=%v", got.Peers, err)
 	}
+}
+
+func TestHTTPAnnounceParsesTwentyThousandDictionaryPeers(t *testing.T) {
+	const peerCount = 20_000
+	peerID := strings.Repeat("a", 20)
+	body := []byte("d8:intervali60e5:peersl")
+	for i := 0; i < peerCount; i++ {
+		host := "peer-" + strconv.Itoa(i) + ".example"
+		body = append(body, 'd')
+		body = appendBencodeString(body, []byte("ip"))
+		body = appendBencodeString(body, []byte(host))
+		body = appendBencodeString(body, []byte("peer id"))
+		body = appendBencodeString(body, []byte(peerID))
+		body = appendBencodeString(body, []byte("port"))
+		body = append(body, "i6881ee"...)
+	}
+	body = append(body, 'e', 'e')
+	if len(body) >= 2<<20 {
+		t.Fatalf("fixture unexpectedly large: %d bytes", len(body))
+	}
+
+	got, err := parseHTTPAnnounceResponse(body)
+	if err != nil {
+		t.Fatalf("parse maximum peer list: %v", err)
+	}
+	if len(got.Peers) != peerCount {
+		t.Fatalf("parsed %d peers, want %d", len(got.Peers), peerCount)
+	}
+	if got.Peers[0].Host != "peer-0.example" || got.Peers[peerCount-1].Host != "peer-19999.example" {
+		t.Fatalf("peer order = %q ... %q", got.Peers[0].Host, got.Peers[peerCount-1].Host)
+	}
+	var wantPeerID [20]byte
+	copy(wantPeerID[:], peerID)
+	if !got.Peers[0].HasID || got.Peers[0].PeerID != wantPeerID {
+		t.Fatalf("peer ID was not retained: %+v", got.Peers[0])
+	}
+}
+
+func TestHTTPAnnounceDeduplicatesPeerRepresentationsInOrder(t *testing.T) {
+	v4a := netip.MustParseAddrPort("127.0.0.1:6881")
+	v4b := netip.MustParseAddrPort("127.0.0.2:6882")
+	v6 := netip.MustParseAddrPort("[2001:db8::1]:6883")
+	compact := []byte("d8:intervali60e5:peers")
+	compact4 := append(compactPeer(v4a), compactPeer(v4b)...)
+	compact4 = append(compact4, compactPeer(v4a)...)
+	compact = appendBencodeString(compact, compact4)
+	compact = append(compact, "6:peers6"...)
+	compact6 := append(compactPeer(v6), compactPeer(v6)...)
+	compact = appendBencodeString(compact, compact6)
+	compact = append(compact, 'e')
+
+	got, err := parseHTTPAnnounceResponse(compact)
+	if err != nil {
+		t.Fatalf("parse compact peers: %v", err)
+	}
+	wantCompact := []string{"127.0.0.1", "127.0.0.2", "2001:db8::1"}
+	if len(got.Peers) != len(wantCompact) {
+		t.Fatalf("compact peers = %+v", got.Peers)
+	}
+	for i, host := range wantCompact {
+		if got.Peers[i].Host != host {
+			t.Fatalf("compact peer %d = %q, want %q", i, got.Peers[i].Host, host)
+		}
+	}
+
+	var dictionary []byte
+	dictionary = append(dictionary, "d8:intervali60e5:peersl"...)
+	appendDictionaryPeer := func(host string, peerID string) {
+		dictionary = append(dictionary, 'd')
+		dictionary = appendBencodeString(dictionary, []byte("ip"))
+		dictionary = appendBencodeString(dictionary, []byte(host))
+		if peerID != "" {
+			dictionary = appendBencodeString(dictionary, []byte("peer id"))
+			dictionary = appendBencodeString(dictionary, []byte(peerID))
+		}
+		dictionary = appendBencodeString(dictionary, []byte("port"))
+		dictionary = append(dictionary, "i6883ee"...)
+	}
+	appendDictionaryPeer("seed.example", "")
+	appendDictionaryPeer("seed.example", strings.Repeat("a", 20))
+	appendDictionaryPeer("seed.example", strings.Repeat("b", 20))
+	appendDictionaryPeer("2001:db8::1", "")
+	dictionary = append(dictionary, 'e')
+	dictionary = append(dictionary, "6:peers6"...)
+	dictionary = appendBencodeString(dictionary, compactPeer(v6))
+	dictionary = append(dictionary, 'e')
+
+	got, err = parseHTTPAnnounceResponse(dictionary)
+	if err != nil {
+		t.Fatalf("parse dictionary and compact duplicates: %v", err)
+	}
+	if len(got.Peers) != 2 || got.Peers[0].Host != "seed.example" || got.Peers[1].Host != "2001:db8::1" {
+		t.Fatalf("dictionary peer order = %+v", got.Peers)
+	}
+	var wantPeerID [20]byte
+	copy(wantPeerID[:], strings.Repeat("a", 20))
+	if !got.Peers[0].HasID || got.Peers[0].PeerID != wantPeerID {
+		t.Fatalf("duplicate changed optional peer ID semantics: %+v", got.Peers[0])
+	}
+}
+
+func TestHTTPAnnounceRejectsExcessiveIgnoredTrees(t *testing.T) {
+	tests := []struct {
+		name  string
+		count int
+		item  string
+	}{
+		{name: "container entries", count: trackerBencodeContainerEntries + 1, item: "le"},
+		{name: "decoded values", count: 20_000, item: "li0ei0ei0ei0ei0ee"},
+		{name: "dictionary entries", count: 17_000, item: "d1:ai0e1:bi0e1:ci0e1:di0ee"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			body := []byte("d8:intervali60e5:peers0:5:zzzzzl")
+			for i := 0; i < test.count; i++ {
+				body = append(body, test.item...)
+			}
+			body = append(body, 'e', 'e')
+			if len(body) >= 1<<20 {
+				t.Fatalf("fixture unexpectedly large: %d bytes", len(body))
+			}
+			_, err := parseHTTPAnnounceResponse(body)
+			var httpErr *HTTPError
+			if !errors.As(err, &httpErr) || httpErr.Code != HTTPErrorMalformed || !errors.Is(err, bencode.ErrLimit) {
+				t.Fatalf("parse ignored tree error = %v, want malformed", err)
+			}
+		})
+	}
+}
+
+func appendBencodeString(dst, value []byte) []byte {
+	dst = strconv.AppendInt(dst, int64(len(value)), 10)
+	dst = append(dst, ':')
+	return append(dst, value...)
 }
 
 func TestHTTPAnnounceRejectsMalformedCompactStrideAndEndpoint(t *testing.T) {
