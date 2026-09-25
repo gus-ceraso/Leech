@@ -939,19 +939,19 @@ existing packages. **References:** DESIGN §§7, 11–14, 19; libtorrent's
 and Transmission's
 [fixed-hash metainfo tests](https://github.com/transmission/transmission/blob/48835c6660a7a3730b5a122bb7b88909997addbe/tests/libtransmission/torrent-metainfo-test.cc#L214-L294).
 
-- [ ] Add a literal canonical v1 `info` golden, independent of Leech's bencoder:
+- [x] Add a literal canonical v1 `info` golden, independent of Leech's bencoder:
   one-byte payload `A`, piece hash
   `6dcd4ce23d88e2ee9568ba546c007c63d9131c1b`, and exact info hash
   `1db2e0a5d96e3ef52f804b928b28a19f90e3f92e`. Derive small mutations
   for duplicate or unordered keys, wrong piece count, and an unsafe path;
   assert parser rejection, then use one representative invalid fixture to
   check that the CLI creates no output or cache and starts no network work.
-- [ ] Add `so=2-4&so=1` as a repeated-parameter magnet vector; assert the
+- [x] Add `so=2-4&so=1` as a repeated-parameter magnet vector; assert the
   union selects original file indices 1–4 after metadata acquisition. Seed
   valid Fast and BEP 10 wire frames, including Bitfield, Allowed Fast, and
   Have None, and assert their state transitions and bounded parsing.
-- [ ] Make `FuzzSendStateBounded` use its `initial` sequence argument; its
-  current `65535` seed never exercises send-side wrap. Seed `FuzzReadHandshake`
+- [x] Make `FuzzSendStateBounded` use its `initial` sequence argument; its
+  previous `65535` seed never exercised send-side wrap. Seed `FuzzReadHandshake`
   with a valid handshake and `FuzzReadMessage` with valid Fast and BEP 10
   frames. Add useful compact and dictionary peer responses to tracker fuzz
   seeds. Keep minimized failures as named regression inputs.
