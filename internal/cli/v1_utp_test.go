@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -31,7 +32,7 @@ func TestV1UTPWinnerCompletesCLITransfer(t *testing.T) {
 	output := t.TempDir()
 	trackerFixture := &v1Tracker{port: uint16(server.LocalAddr().(*net.UDPAddr).Port)}
 	serverDone := make(chan error, 1)
-	go func() { serverDone <- serveV1UTPPeer(server, [20]byte(infoHash), data) }()
+	go func() { serverDone <- serveV1UTPPeer(server, [20]byte(infoHash), data, nil, nil, false) }()
 	config := session.RunConfig{
 		HTTP:    trackerFixture,
 		UTPDial: utp.DialContext,
@@ -68,7 +69,82 @@ func TestV1UTPWinnerCompletesCLITransfer(t *testing.T) {
 	assertV1TrackerTrace(t, urls, requests, []string{torrent.DefaultTracker}, int64(len(data)), false)
 }
 
-func serveV1UTPPeer(socket *net.UDPConn, infoHash [20]byte, payload []byte) error {
+func TestV1UTPIPv6WinnerCompletesCLITransfer(t *testing.T) {
+	server, err := net.ListenUDP("udp6", &net.UDPAddr{IP: net.IPv6loopback})
+	if err != nil {
+		t.Skipf("IPv6 loopback unavailable: %v", err)
+	}
+	defer server.Close()
+	port := uint16(server.LocalAddr().(*net.UDPAddr).Port)
+	data := []byte("IPv6 uTP path")
+	infoBytes, infoHash := v1Info(t, data)
+	torrentPath := writeV1Torrent(t, v1Metainfo(t, infoBytes, ""))
+	output := t.TempDir()
+	trackerFixture := &v1Tracker{host: "::1", port: port}
+	tcpAttempted := make(chan struct{})
+	var tcpAttemptOnce sync.Once
+	tcpAttempts := make(chan [2]string, 8)
+	outbound := make(chan peer.Message, 16)
+	serverDone := make(chan error, 1)
+	go func() {
+		serverDone <- serveV1UTPPeer(server, [20]byte(infoHash), data, outbound, tcpAttempted, true)
+	}()
+	config := session.RunConfig{
+		HTTP:    trackerFixture,
+		UTPDial: utp.DialContext,
+		TCPDial: func(_ context.Context, network, address string) (net.Conn, error) {
+			tcpAttempts <- [2]string{network, address}
+			tcpAttemptOnce.Do(func() { close(tcpAttempted) })
+			return nil, errors.New("scripted TCP loser")
+		},
+		UTPHeadStart: 20 * time.Millisecond,
+		Identity:     tracker.Identity{PeerID: [20]byte{0x51, 0x33}, Port: 49152},
+		CacheRoot:    filepath.Join(t.TempDir(), "cache"),
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	opts := parseV1Options(t, "--output", output, torrentPath)
+	if err := RunWithSession(ctx, opts, &bytes.Buffer{}, &bytes.Buffer{}, config); err != nil {
+		select {
+		case serverErr := <-serverDone:
+			t.Fatalf("IPv6 uTP transfer: %v; fixture: %v", err, serverErr)
+		default:
+			t.Fatalf("IPv6 uTP transfer: %v; server still waiting", err)
+		}
+	}
+	select {
+	case err := <-serverDone:
+		if err != nil {
+			t.Fatalf("IPv6 uTP fixture: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("IPv6 uTP peer fixture did not finish")
+	}
+	var sawTCP6 bool
+	for len(tcpAttempts) != 0 {
+		attempt := <-tcpAttempts
+		if attempt[0] == "tcp6" && attempt[1] == net.JoinHostPort("::1", fmt.Sprint(port)) {
+			sawTCP6 = true
+		}
+	}
+	if !sawTCP6 {
+		t.Fatalf("scripted TCP attempts did not include tcp6 [::1]:%d", port)
+	}
+	for len(outbound) != 0 {
+		message := <-outbound
+		switch message.ID {
+		case peer.UnchokeID, peer.HaveID, peer.BitfieldID, peer.HaveAllID, peer.PieceID:
+			t.Errorf("client emitted upload/availability message ID %d over IPv6 uTP", message.ID)
+		}
+	}
+	if got, err := os.ReadFile(filepath.Join(output, "payload.bin")); err != nil || !bytes.Equal(got, data) {
+		t.Fatalf("IPv6 uTP output=%q err=%v", got, err)
+	}
+	urls, requests := trackerFixture.snapshot()
+	assertV1TrackerTrace(t, urls, requests, []string{torrent.DefaultTracker}, int64(len(data)), false)
+}
+
+func serveV1UTPPeer(socket *net.UDPConn, infoHash [20]byte, payload []byte, outbound chan<- peer.Message, tcpAttempted <-chan struct{}, expectIPv6 bool) error {
 	_ = socket.SetReadDeadline(time.Now().Add(6 * time.Second))
 	syn, address, err := readV1UTPPacket(socket)
 	if err != nil {
@@ -76,6 +152,16 @@ func serveV1UTPPeer(socket *net.UDPConn, infoHash [20]byte, payload []byte) erro
 	}
 	if syn.Type != utp.Syn {
 		return fmt.Errorf("first uTP packet type %v, want SYN", syn.Type)
+	}
+	if gotIPv6 := address.IP.To4() == nil; gotIPv6 != expectIPv6 {
+		return fmt.Errorf("uTP peer address %s IPv6=%v, want IPv6=%v", address, gotIPv6, expectIPv6)
+	}
+	if tcpAttempted != nil {
+		select {
+		case <-tcpAttempted:
+		case <-time.After(2 * time.Second):
+			return errors.New("scripted TCP loser was not started")
+		}
 	}
 	recvID := syn.ConnectionID
 	serverSeq := utp.Sequence(700)
@@ -98,6 +184,7 @@ func serveV1UTPPeer(socket *net.UDPConn, infoHash [20]byte, payload []byte) erro
 	}
 	peerWire := append(v1RawMessage(peer.BitfieldID, []byte{0x80}), v1RawMessage(peer.UnchokeID, nil)...)
 	var stream []byte
+	pieceSent := false
 	for {
 		packet, source, err := readV1UTPPacket(socket)
 		if err != nil {
@@ -123,7 +210,10 @@ func serveV1UTPPeer(socket *net.UDPConn, infoHash [20]byte, payload []byte) erro
 			}
 			stream = rest
 			for _, message := range messages {
-				if message.ID == peer.RequestID {
+				if outbound != nil {
+					outbound <- message
+				}
+				if message.ID == peer.RequestID && !pieceSent {
 					if len(message.Payload) != 12 {
 						return errors.New("invalid uTP piece request")
 					}
@@ -137,7 +227,10 @@ func serveV1UTPPeer(socket *net.UDPConn, infoHash [20]byte, payload []byte) erro
 					binary.BigEndian.PutUint32(piece[:4], index)
 					binary.BigEndian.PutUint32(piece[4:8], begin)
 					copy(piece[8:], payload[begin:begin+length])
-					return writeV1UTPPacket(socket, address, utp.Packet{Type: utp.Data, ConnectionID: recvID, SeqNr: serverSeq, AckNr: clientAck, WindowSize: 4 << 20, Payload: v1RawMessage(peer.PieceID, piece)})
+					if err := writeV1UTPPacket(socket, address, utp.Packet{Type: utp.Data, ConnectionID: recvID, SeqNr: serverSeq, AckNr: clientAck, WindowSize: 4 << 20, Payload: v1RawMessage(peer.PieceID, piece)}); err != nil {
+						return err
+					}
+					pieceSent = true
 				}
 			}
 			if len(peerWire) != 0 {

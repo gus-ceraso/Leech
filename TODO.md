@@ -991,11 +991,11 @@ and worker lifetime. Reuse the existing fixture seams.
 **Owns:** `internal/cli/v1_utp_test.go`, the existing UDP wire fixture in
 `internal/cli/v1_test.go`, and focused uTP tests as needed.
 
-- [ ] Complete one real IPv6 uTP loopback transfer through a BEP 3 handshake,
+- [x] Complete one real IPv6 uTP loopback transfer through a BEP 3 handshake,
   with a scripted TCP loser and outbound no-upload assertions. Keep the
   existing deterministic uTP loss, reordering, SACK, and wrap tests; this
   test covers the `utp6` socket and address-family path only.
-- [ ] Remove the timing dependence behind the observed intermittent
+- [x] Remove the timing dependence behind the observed intermittent
   `TestV1UDPTrackerWirePathCompletesCLITransfer` fixture-join failure. Use a
   deterministic barrier or explicit event trace so the test knows whether
   `started` was transmitted before requiring `stopped`. Do not mask the race

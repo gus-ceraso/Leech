@@ -77,13 +77,14 @@ func (v1TrackerResolver) LookupIPAddr(context.Context, string) ([]net.IPAddr, er
 	return []net.IPAddr{{IP: net.IPv4(127, 0, 0, 1)}}, nil
 }
 
-func serveV1UDPTracker(socket *net.UDPConn, requests chan<- tracker.AnnounceRequest) error {
+func serveV1UDPTracker(socket *net.UDPConn, requests chan<- tracker.AnnounceRequest, started chan<- struct{}) error {
 	if err := socket.SetReadDeadline(time.Now().Add(7 * time.Second)); err != nil {
 		return err
 	}
 	buffer := make([]byte, 2048)
 	var connectionID uint64
 	var address *net.UDPAddr
+	startedReceived := false
 	for {
 		n, from, err := socket.ReadFromUDP(buffer)
 		if err != nil {
@@ -110,12 +111,17 @@ func serveV1UDPTracker(socket *net.UDPConn, requests chan<- tracker.AnnounceRequ
 				return errors.New("invalid UDP tracker announce")
 			}
 			port := binary.BigEndian.Uint16(packet[96:98])
+			event := tracker.Event(binary.BigEndian.Uint32(packet[80:84]))
 			requests <- tracker.AnnounceRequest{
 				Downloaded: int64(binary.BigEndian.Uint64(packet[56:64])),
 				Left:       int64(binary.BigEndian.Uint64(packet[64:72])),
 				Uploaded:   int64(binary.BigEndian.Uint64(packet[72:80])),
-				Event:      tracker.Event(binary.BigEndian.Uint32(packet[80:84])),
+				Event:      event,
 				Port:       port,
+			}
+			if event == tracker.EventStarted && !startedReceived {
+				close(started)
+				startedReceived = true
 			}
 			response := make([]byte, 26)
 			binary.BigEndian.PutUint32(response[:4], 1)
@@ -239,9 +245,18 @@ func TestV1UDPTrackerWirePathCompletesCLITransfer(t *testing.T) {
 	defer peers.close()
 	serverDone := make(chan error, 1)
 	udpRequests := make(chan tracker.AnnounceRequest, 8)
-	go func() { serverDone <- serveV1UDPTracker(trackerSocket, udpRequests) }()
+	started := make(chan struct{})
+	go func() { serverDone <- serveV1UDPTracker(trackerSocket, udpRequests, started) }()
 	config := v1SessionConfig(t, httpFixture, peers)
 	config.UDP = tracker.NewUDPClient(tracker.Config{Resolver: v1TrackerResolver{}})
+	config.TCPDial = func(ctx context.Context, network, address string) (net.Conn, error) {
+		select {
+		case <-started:
+			return peers.dial(ctx, network, address)
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
 	opts := parseV1Options(t, "--output", output, torrentPath)
@@ -250,6 +265,11 @@ func TestV1UDPTrackerWirePathCompletesCLITransfer(t *testing.T) {
 	}
 	if err := peers.wait(t); err != nil {
 		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	default:
+		t.Fatal("UDP tracker did not receive started before peer transfer")
 	}
 	if got, err := os.ReadFile(filepath.Join(output, "payload.bin")); err != nil || !bytes.Equal(got, data) {
 		t.Fatalf("output=%q err=%v", got, err)
