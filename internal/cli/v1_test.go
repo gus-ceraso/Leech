@@ -22,6 +22,7 @@ import (
 	"github.com/gus-ceraso/Leech/internal/bencode"
 	"github.com/gus-ceraso/Leech/internal/peer"
 	"github.com/gus-ceraso/Leech/internal/session"
+	"github.com/gus-ceraso/Leech/internal/storage"
 	"github.com/gus-ceraso/Leech/internal/torrent"
 	"github.com/gus-ceraso/Leech/internal/tracker"
 )
@@ -551,6 +552,63 @@ func TestV1CLIResumeRedownloadsIncompletePiece(t *testing.T) {
 	peers.assertNoUpload(t)
 }
 
+func TestV1CLIMixedPieceResumeRequestsWholePieceAndRetainsSelectedBytes(t *testing.T) {
+	data := []byte("ABCD")
+	infoBytes, infoHash := v1TwoFilePieceInfo(t, data)
+	torrentPath := writeV1Torrent(t, v1Metainfo(t, infoBytes, ""))
+	output := t.TempDir()
+	if err := os.Mkdir(filepath.Join(output, "release"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(output, "release", "A"), []byte("AB"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	trackerFixture := &v1Tracker{}
+	peers := newV1Peers(t, infoHash, infoBytes, data, false)
+	defer peers.close()
+	opts := parseV1Options(t, "--output", output, "--file", "A", "--resume", torrentPath)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := RunWithSession(ctx, opts, &bytes.Buffer{}, &bytes.Buffer{}, v1SessionConfig(t, trackerFixture, peers)); err != nil {
+		t.Fatalf("CLI mixed-piece resume: %v", err)
+	}
+	if err := peers.wait(t); err != nil {
+		t.Fatal(err)
+	}
+	peers.mu.Lock()
+	requested := append([][2]uint32(nil), peers.requested...)
+	peers.mu.Unlock()
+	var requestedBytes uint32
+	for _, block := range requested {
+		requestedBytes += block[1]
+	}
+	if requestedBytes != uint32(len(data)) {
+		t.Fatalf("requested block ranges %v cover %d bytes, want full %d-byte piece", requested, requestedBytes, len(data))
+	}
+	if got, err := os.ReadFile(filepath.Join(output, "release", "A")); err != nil || string(got) != "AB" {
+		t.Fatalf("selected A = %q, %v; want AB", got, err)
+	}
+	if _, err := os.Stat(filepath.Join(output, "release", "B")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("unselected B exists: %v", err)
+	}
+	urls, requests := trackerFixture.snapshot()
+	if len(urls) != len(requests) || len(requests) != 2 {
+		t.Fatalf("tracker trace lengths = %d/%d, want one started and one stopped", len(urls), len(requests))
+	}
+	if requests[0].Event != tracker.EventStarted || requests[0].Left != 4 || requests[1].Event != tracker.EventStopped || requests[1].Left != 2 {
+		t.Fatalf("tracker requests = %+v, want started left=4 then stopped left=2", requests)
+	}
+	for _, request := range requests {
+		if request.Event == tracker.EventCompleted {
+			t.Fatal("partial selection sent completed")
+		}
+		if request.Uploaded != 0 {
+			t.Fatalf("tracker reported uploaded=%d", request.Uploaded)
+		}
+	}
+	peers.assertNoUpload(t)
+}
+
 func TestV1CLITimeoutCleansPieceWorkspace(t *testing.T) {
 	data := []byte("must remain incomplete")
 	infoBytes, infoHash := v1Info(t, data)
@@ -588,6 +646,58 @@ func TestV1CLITimeoutCleansPieceWorkspace(t *testing.T) {
 	urls, requests := trackerFixture.snapshot()
 	assertV1StoppedTrace(t, urls, requests, torrent.DefaultTracker, int64(len(data)))
 }
+
+func TestV1CLIStagedReadFailureStopsAndCleansSession(t *testing.T) {
+	data := []byte("fail staged read")
+	infoBytes, infoHash := v1Info(t, data)
+	torrentPath := writeV1Torrent(t, v1Metainfo(t, infoBytes, ""))
+	output, cacheRoot := t.TempDir(), filepath.Join(t.TempDir(), "cache")
+	trackerFixture := &v1Tracker{}
+	peers := newV1Peers(t, infoHash, infoBytes, data, false)
+	defer peers.close()
+	readErr := errors.New("injected staged read failure")
+	config := v1SessionConfig(t, trackerFixture, peers)
+	config.CacheRoot = cacheRoot
+	config.StageFileOpener = func(path string, flag int, mode os.FileMode) (storage.StagingFile, error) {
+		file, err := os.OpenFile(path, flag, mode)
+		if err != nil {
+			return nil, err
+		}
+		return v1ReadFailureStageFile{File: file, err: readErr}, nil
+	}
+	opts := parseV1Options(t, "--output", output, torrentPath)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	err := RunWithSession(ctx, opts, &bytes.Buffer{}, &bytes.Buffer{}, config)
+	if !errors.Is(err, readErr) {
+		t.Fatalf("session error = %v, want staged read failure", err)
+	}
+	if err := peers.wait(t); err != nil {
+		t.Fatal(err)
+	}
+	urls, requests := trackerFixture.snapshot()
+	assertV1StoppedTrace(t, urls, requests, torrent.DefaultTracker, int64(len(data)))
+	for _, request := range requests {
+		if request.Event == tracker.EventCompleted {
+			t.Fatal("staged read failure sent completed")
+		}
+	}
+	entries, err := os.ReadDir(cacheRoot)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("staged read failure left cache workspace: %v", entries)
+	}
+	peers.assertNoUpload(t)
+}
+
+type v1ReadFailureStageFile struct {
+	*os.File
+	err error
+}
+
+func (f v1ReadFailureStageFile) ReadAt([]byte, int64) (int, error) { return 0, f.err }
 
 func assertV1StoppedTrace(t *testing.T, urls []string, requests []tracker.AnnounceRequest, wantURL string, fullLeft int64) {
 	t.Helper()
@@ -849,6 +959,34 @@ func v1MultiInfo(t *testing.T, data []byte) ([]byte, torrent.InfoHash) {
 		{Key: []byte("files"), Value: bencode.Value{Type: bencode.List, List: []bencode.Value{file("one.bin", 3), file("two.bin", int64(len(data)-3))}}},
 		{Key: []byte("name"), Value: bencode.Value{Type: bencode.Bytes, Bytes: []byte("release")}},
 		{Key: []byte("piece length"), Value: bencode.Value{Type: bencode.Integer, Int: int64(len(data))}},
+		{Key: []byte("pieces"), Value: bencode.Value{Type: bencode.Bytes, Bytes: piece[:]}},
+	}}
+	encoded, err := bencode.Encode(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha1.Sum(encoded)
+	var infoHash torrent.InfoHash
+	copy(infoHash[:], digest[:])
+	return encoded, infoHash
+}
+
+func v1TwoFilePieceInfo(t *testing.T, data []byte) ([]byte, torrent.InfoHash) {
+	t.Helper()
+	if len(data) != 4 {
+		t.Fatalf("two-file fixture length = %d, want 4", len(data))
+	}
+	piece := sha1.Sum(data)
+	file := func(name string) bencode.Value {
+		return bencode.Value{Type: bencode.Dictionary, Dict: []bencode.Entry{
+			{Key: []byte("length"), Value: bencode.Value{Type: bencode.Integer, Int: 2}},
+			{Key: []byte("path"), Value: bencode.Value{Type: bencode.List, List: []bencode.Value{{Type: bencode.Bytes, Bytes: []byte(name)}}}},
+		}}
+	}
+	value := bencode.Value{Type: bencode.Dictionary, Dict: []bencode.Entry{
+		{Key: []byte("files"), Value: bencode.Value{Type: bencode.List, List: []bencode.Value{file("A"), file("B")}}},
+		{Key: []byte("name"), Value: bencode.Value{Type: bencode.Bytes, Bytes: []byte("release")}},
+		{Key: []byte("piece length"), Value: bencode.Value{Type: bencode.Integer, Int: 4}},
 		{Key: []byte("pieces"), Value: bencode.Value{Type: bencode.Bytes, Bytes: piece[:]}},
 	}}
 	encoded, err := bencode.Encode(value)

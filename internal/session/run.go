@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -48,15 +49,16 @@ type RunConfig struct {
 	Identity tracker.Identity
 	Random   io.Reader
 
-	HTTP         tracker.TrackerHTTP
-	UDP          tracker.TrackerUDP
-	TrackerClock tracker.Clock
-	Resolver     peer.Resolver
-	TCPDial      peer.DialFunc
-	UTPDial      peer.DialFunc
-	RaceClock    peer.RaceClock
-	UTPHeadStart time.Duration
-	CacheRoot    string
+	HTTP            tracker.TrackerHTTP
+	UDP             tracker.TrackerUDP
+	TrackerClock    tracker.Clock
+	Resolver        peer.Resolver
+	TCPDial         peer.DialFunc
+	UTPDial         peer.DialFunc
+	RaceClock       peer.RaceClock
+	UTPHeadStart    time.Duration
+	CacheRoot       string
+	StageFileOpener func(path string, flag int, mode os.FileMode) (storage.StagingFile, error)
 
 	// TrackerSet and Updates are an optional complete tracker seam.  When they
 	// are nil Run builds the production set and bounded update queue itself.
@@ -611,7 +613,10 @@ func (c *coordinator) startTransferPhase(ctx context.Context, source torrent.Sou
 		verifiedSelected += span.Range.End - span.Range.Begin
 	}
 	transfer, err := NewTransfer(TransferConfig{
-		Selection: selection, Output: output, Stager: storage.NewStager(storage.StagerConfig{CacheRoot: c.config.CacheRoot}),
+		Selection: selection, Output: output, Stager: storage.NewStager(storage.StagerConfig{
+			CacheRoot: c.config.CacheRoot,
+			OpenFile:  c.config.StageFileOpener,
+		}),
 		PrepareMode:     prepareMode,
 		SchedulerConfig: Config{Streaming: c.config.Streaming}, LocalHandshake: local,
 		PieceCount: uint32(len(meta.Pieces)), PieceLength: uint32(meta.PieceLength),

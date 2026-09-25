@@ -34,15 +34,16 @@ var (
 	ErrStagingFatal = errors.New("storage: staging failed")
 )
 
-// stagingFile is the narrow file contract used by a piece. The package-level
-// seams are intentionally unexported: production uses *os.File, while local
-// tests can deterministically exercise short and failed I/O paths.
-type stagingFile interface {
+// StagingFile is the narrow file contract used by a staged piece. RunConfig
+// can provide an opener for deterministic session-level storage failures.
+type StagingFile interface {
 	WriteAt([]byte, int64) (int, error)
 	ReadAt([]byte, int64) (int, error)
 	Truncate(int64) error
 	Close() error
 }
+
+type stagingFile = StagingFile
 
 var (
 	openStagingFile = func(path string, flag int, mode os.FileMode) (stagingFile, error) {
@@ -59,6 +60,9 @@ type StagerConfig struct {
 	CacheRoot string
 	MaxPieces int
 	MaxBytes  int64
+	// OpenFile optionally opens staged piece files. A nil opener uses the
+	// package's standard file opener.
+	OpenFile func(path string, flag int, mode os.FileMode) (StagingFile, error)
 }
 
 func (c StagerConfig) normalized() (StagerConfig, error) {
@@ -250,7 +254,11 @@ func (s *Stager) AdmitPiece(piece torrent.Piece) (*PieceStage, error) {
 		return nil, s.rememberFatalLocked(fmt.Errorf("storage: random piece name: %w", err))
 	}
 	path := filepath.Join(s.root, name+".piece")
-	f, err := openStagingFile(path, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
+	open := s.config.OpenFile
+	if open == nil {
+		open = openStagingFile
+	}
+	f, err := open(path, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, s.rememberFatalLocked(fmt.Errorf("storage: create staged piece: %w", err))
 	}

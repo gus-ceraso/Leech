@@ -1,6 +1,7 @@
 package session
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha1"
 	"encoding/binary"
@@ -810,6 +811,64 @@ func TestTransferCorruptPieceRetriesWithoutOutput(t *testing.T) {
 	}
 }
 
+func TestTransferMixedSourceCorruptPieceStrikesContributorsThenRetriesCleanly(t *testing.T) {
+	data := bytes.Repeat([]byte("h"), 32<<10)
+	meta := singleFileMeta(data)
+	selection, err := torrent.Select(meta, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	plan, err := storage.Validate(root, meta, selection.SelectedIndices())
+	if err != nil {
+		t.Fatal(err)
+	}
+	infoHash := [20]byte{1, 7, 3}
+	firstEndpoint, secondEndpoint := endpoint(31), endpoint(32)
+	firstRequest := make(chan peer.Block, 1)
+	firstRequestForSecond := make(chan peer.Block, 1)
+	firstConn, firstDone := startFixturePeerMode(t, infoHash, []fixturePiece{{index: 0, data: data}}, false, false, true, firstRequest, firstRequestForSecond, nil)
+	secondConn, secondDone := startFixturePeerMode(t, infoHash, []fixturePiece{{index: 0, data: data}}, true, false, false, nil, nil, firstRequestForSecond)
+	transfer, err := NewTransfer(TransferConfig{
+		Selection: selection, Output: plan,
+		Stager:         storage.NewStager(storage.StagerConfig{CacheRoot: filepath.Join(t.TempDir(), "cache"), MaxPieces: 1, MaxBytes: int64(len(data))}),
+		LocalHandshake: peer.Handshake{InfoHash: infoHash, PeerID: [20]byte{4, 5, 6}},
+		Peers: []ConnectedPeer{
+			{ID: "first-contributor", Endpoint: firstEndpoint, Conn: firstConn, Handshake: peer.Handshake{InfoHash: infoHash, PeerID: [20]byte{1, 1, 1}}, ReqQ: 1, ReqQSet: true},
+			{ID: "second-contributor", Endpoint: secondEndpoint, Conn: secondConn, Handshake: peer.Handshake{InfoHash: infoHash, PeerID: [20]byte{2, 2, 2}}, ReqQ: 1, ReqQSet: true},
+		},
+		PieceCount: 1, PieceLength: uint32(len(data)), LastPieceLength: uint32(len(data)),
+	})
+	if err != nil {
+		firstConn.Close()
+		secondConn.Close()
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := transfer.Run(ctx); err != nil {
+		t.Fatalf("transfer: %v", err)
+	}
+	for name, done := range map[string]<-chan error{"first": firstDone, "second": secondDone} {
+		if err := <-done; err != nil {
+			t.Fatalf("%s peer: %v", name, err)
+		}
+	}
+	firstBlock := <-firstRequest
+	if firstBlock.Length != 16<<10 {
+		t.Fatalf("first contributor range = %v, want one 16 KiB block", firstBlock)
+	}
+	got, err := os.ReadFile(filepath.Join(root, "fixture"))
+	if err != nil || !bytes.Equal(got, data) {
+		t.Fatalf("output length=%d, err=%v; want clean %d-byte piece", len(got), err, len(data))
+	}
+	for _, endpoint := range []peer.Endpoint{firstEndpoint, secondEndpoint} {
+		if got := transfer.scheduler.StrikeCount(endpoint); got != 1 {
+			t.Errorf("endpoint %v strikes=%d, want one each for mixed-source hash failure", endpoint, got)
+		}
+	}
+}
+
 func TestTransferCancellationJoinsAndCleansWorkspace(t *testing.T) {
 	data := []byte("pause")
 	meta := singleFileMeta(data)
@@ -925,15 +984,17 @@ func TestTransferDisconnectReassignsOutstandingBlock(t *testing.T) {
 		t.Fatal(err)
 	}
 	infoHash := [20]byte{8, 8, 8}
-	firstConn, firstDone := startFixturePeer(t, infoHash, []fixturePiece{{index: 0, data: data}}, false, true)
-	secondConn, secondDone := startFixturePeer(t, infoHash, []fixturePiece{{index: 0, data: data}}, false, false)
+	firstEndpoint, secondEndpoint := endpoint(41), endpoint(42)
+	firstRequests, secondRequests := make(chan peer.Block, 1), make(chan peer.Block, 1)
+	firstConn, firstDone := startFixturePeerMode(t, infoHash, []fixturePiece{{index: 0, data: data}}, false, true, false, firstRequests, nil, nil)
+	secondConn, secondDone := startFixturePeerObserved(t, infoHash, []fixturePiece{{index: 0, data: data}}, false, false, secondRequests)
 	transfer, err := NewTransfer(TransferConfig{
 		Selection: selection, Output: plan,
 		Stager:         storage.NewStager(storage.StagerConfig{CacheRoot: filepath.Join(t.TempDir(), "cache"), MaxPieces: 1, MaxBytes: int64(len(data))}),
 		LocalHandshake: peer.Handshake{InfoHash: infoHash, PeerID: [20]byte{4, 5, 6}},
 		Peers: []ConnectedPeer{
-			{ID: "disconnecting", Conn: firstConn, Handshake: peer.Handshake{InfoHash: infoHash, PeerID: [20]byte{1, 1, 1}}},
-			{ID: "replacement", Conn: secondConn, Handshake: peer.Handshake{InfoHash: infoHash, PeerID: [20]byte{2, 2, 2}}},
+			{ID: "disconnecting", Endpoint: firstEndpoint, Conn: firstConn, Handshake: peer.Handshake{InfoHash: infoHash, PeerID: [20]byte{1, 1, 1}}},
+			{ID: "replacement", Endpoint: secondEndpoint, Conn: secondConn, Handshake: peer.Handshake{InfoHash: infoHash, PeerID: [20]byte{2, 2, 2}}},
 		},
 		PieceCount: 1, PieceLength: uint32(len(data)), LastPieceLength: uint32(len(data)),
 	})
@@ -953,12 +1014,19 @@ func TestTransferDisconnectReassignsOutstandingBlock(t *testing.T) {
 	if err := <-secondDone; err != nil {
 		t.Fatal(err)
 	}
+	firstBlock, secondBlock := <-firstRequests, <-secondRequests
+	if firstBlock != secondBlock {
+		t.Fatalf("disconnected request %v was not reassigned unchanged; replacement requested %v", firstBlock, secondBlock)
+	}
 	got, err := os.ReadFile(filepath.Join(root, "fixture"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if string(got) != string(data) {
 		t.Fatalf("output = %q, want %q", got, data)
+	}
+	if transfer.scheduler.StrikeCount(firstEndpoint) != 0 || transfer.scheduler.StrikeCount(secondEndpoint) != 0 {
+		t.Fatalf("ordinary disconnect/reassignment caused corruption strikes: first=%d second=%d", transfer.scheduler.StrikeCount(firstEndpoint), transfer.scheduler.StrikeCount(secondEndpoint))
 	}
 }
 
@@ -1497,6 +1565,14 @@ type fixturePiece struct {
 // encoder. It writes independent BEP 3 frames and only uses the production
 // decoder to inspect the request tuple.
 func startFixturePeer(t *testing.T, infoHash [20]byte, pieces []fixturePiece, badOnce bool, disconnectBeforePiece bool) (net.Conn, <-chan error) {
+	return startFixturePeerMode(t, infoHash, pieces, badOnce, disconnectBeforePiece, false, nil, nil, nil)
+}
+
+func startFixturePeerObserved(t *testing.T, infoHash [20]byte, pieces []fixturePiece, badOnce bool, disconnectBeforePiece bool, observed chan<- peer.Block) (net.Conn, <-chan error) {
+	return startFixturePeerMode(t, infoHash, pieces, badOnce, disconnectBeforePiece, false, observed, nil, nil)
+}
+
+func startFixturePeerMode(t *testing.T, infoHash [20]byte, pieces []fixturePiece, badOnce bool, disconnectBeforePiece bool, disconnectAfterFirst bool, observed chan<- peer.Block, observedAlso chan<- peer.Block, corruptDifferentFrom <-chan peer.Block) (net.Conn, <-chan error) {
 	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -1560,6 +1636,13 @@ func startFixturePeer(t *testing.T, infoHash [20]byte, pieces []fixturePiece, ba
 			index := int(binary.BigEndian.Uint32(message.Payload[:4]))
 			begin := int(binary.BigEndian.Uint32(message.Payload[4:8]))
 			length := int(binary.BigEndian.Uint32(message.Payload[8:12]))
+			if observed != nil {
+				block := peer.Block{Index: uint32(index), Begin: uint32(begin), Length: uint32(length)}
+				observed <- block
+				if observedAlso != nil {
+					observedAlso <- block
+				}
+			}
 			piece := byIndex[index]
 			if begin < 0 || length <= 0 || begin+length > len(piece) {
 				done <- io.ErrUnexpectedEOF
@@ -1571,6 +1654,13 @@ func startFixturePeer(t *testing.T, infoHash [20]byte, pieces []fixturePiece, ba
 			}
 			payload := append([]byte(nil), piece[begin:begin+length]...)
 			corruptThis := badOnce && !corrupted
+			if corruptDifferentFrom != nil {
+				first := <-corruptDifferentFrom
+				corruptDifferentFrom = nil
+				if uint32(index) == first.Index && uint32(begin) == first.Begin {
+					corruptThis = false
+				}
+			}
 			if corruptThis {
 				payload[0] ^= 0xff
 				corrupted = true
@@ -1581,6 +1671,10 @@ func startFixturePeer(t *testing.T, infoHash [20]byte, pieces []fixturePiece, ba
 			copy(framePayload[8:], payload)
 			if err := writeFixtureFrame(conn, peer.PieceID, framePayload); err != nil {
 				done <- err
+				return
+			}
+			if disconnectAfterFirst {
+				done <- nil
 				return
 			}
 		}
