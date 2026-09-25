@@ -967,15 +967,15 @@ rejection rules where the upstream clients accept or repair malformed input.
 `internal/session/`. **References:** DESIGN §§8–13, 15, 19; Transmission's
 [file-to-piece cases](https://github.com/transmission/transmission/blob/48835c6660a7a3730b5a122bb7b88909997addbe/tests/libtransmission/file-piece-map-test.cc#L21-L131).
 
-- [ ] Test a four-byte piece spanning selected `A="AB"` and unselected
+- [x] Test a four-byte piece spanning selected `A="AB"` and unselected
   `B="CD"`, with existing `A="AB"` under `--resume`. Request the full piece,
   verify it, write only `A`, create no `B`, and finish with whole-torrent
   `left=2` and `stopped` but no `completed`.
-- [ ] In separate scripted sessions, reassign an outstanding block after a
+- [x] In separate scripted sessions, reassign an outstanding block after a
   peer disconnects, and recover from a piece whose blocks came from two bad
   endpoints. Assert strikes by resolved endpoint, a later clean piece, final
   bytes, no upload, and joined connections.
-- [ ] Inject an output-close or staged-read error after tracker `started` was
+- [x] Inject an output-close or staged-read error after tracker `started` was
   transmitted. Assert the error remains primary, `stopped` is attempted under
   its deadline, `completed` is absent, the current workspace is removed, and
   network workers join. Include one mixed-tracker shutdown trace only if it
