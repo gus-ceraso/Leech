@@ -158,7 +158,9 @@ func TestRunInvalidTorrentCreatesNoOutputOrCacheAndStartsNoNetwork(t *testing.T)
 	cachePath := filepath.Join(base, "cache")
 	var httpCalls, udpCalls, resolveCalls, dialCalls int
 	var stdout, stderr bytes.Buffer
-	err := RunWithSession(context.Background(), Options{Source: torrentPath, Output: outputPath}, &stdout, &stderr, session.RunConfig{
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	err := RunWithSession(ctx, Options{Source: torrentPath, Output: outputPath}, &stdout, &stderr, session.RunConfig{
 		HTTP:     countHTTPAnnounce{calls: &httpCalls},
 		UDP:      countUDPAnnounce{calls: &udpCalls},
 		Resolver: countingResolver{calls: &resolveCalls},
