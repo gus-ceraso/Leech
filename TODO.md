@@ -836,27 +836,27 @@ worker crosses a phase boundary or outlives orderly return.
 regressions, and final usage/build documentation. Reuse the earlier local fixtures.
 **References:** DESIGN §19 and the coverage map below.
 
-- [ ] Close gaps across `.torrent`/magnet/bare-hash input; HTTP/UDP discovery;
+- [x] Close gaps across `.torrent`/magnet/bare-hash input; HTTP/UDP discovery;
   IPv4/IPv6; TCP/uTP winners; full/selective output; bulk/streaming; overwrite/
   resume; and local/remote listings. Use representative combinations, not a
   mechanically exhaustive Cartesian product.
-- [ ] Assert mandatory default-tracker inclusion while routing every resolver,
+- [x] Assert mandatory default-tracker inclusion while routing every resolver,
   tracker transport, and peer dial to controlled local fixtures. Test helpers may
   provide dependencies to the same CLI/session entry points. Do not contact live
   trackers/clients, add test-only user flags, or silently skip protocol families.
-- [ ] Cover cancellation and first-signal cleanup during discovery, dialing,
+- [x] Cover cancellation and first-signal cleanup during discovery, dialing,
   resume, transfer, and finalization; second-signal immediate termination;
   blocked queues; no-progress expiry; mixed-source corruption; and injected
   cache/output/close/removal failures. Assert bounded final-event deadlines.
-- [ ] Capture outbound peer traffic and instrument storage boundaries throughout
+- [x] Capture outbound peer traffic and instrument storage boundaries throughout
   complete sessions. Prove payload/metadata requests cause no payload/cache/
   output reads, no payload responses, no availability/unchoke messages, and the
   specified rejection counts. Assert `uploaded=0` on every announce.
-- [ ] Verify fuzz targets and seed cases exist for each parser/state boundary
+- [x] Verify fuzz targets and seed cases exist for each parser/state boundary
   required by DESIGN §19, including racing, deduplication, strikes, and shutdown.
   Run bounded fuzz sessions and the relevant race tests; retain discovered
   regressions. Reuse earlier evidence when the implementation has not changed.
-- [ ] Update README with build/run examples, supported behavior, and the actual
+- [x] Update README with build/run examples, supported behavior, and the actual
   implementation status. Update durable AGENTS guidance only where implementation
   reveals a useful command, boundary, or pitfall. Keep temporary task history out
   of guidance and do not claim external interoperability evidence.
@@ -865,15 +865,20 @@ regressions, and final usage/build documentation. Reuse the earlier local fixtur
 evidence. Remaining follow-ups concern measured tuning or out-of-scope ideas,
 not silently omitted requirements.
 
-- [ ] U4/P3 integration fix: a uTP connection returned by `DialContext` must
+- [x] U4/P3 integration fix: a uTP connection returned by `DialContext` must
   remain live when P3 cancels the winning dial attempt's context; V1's local
   complete-session uTP fixture currently exposes premature connection closure.
 
-- [ ] **R5 — Final integration review:** one reviewer checks L1, L2, and V1,
+- [x] **R5 — Final integration review:** one reviewer checks L1, L2, and V1,
   plus the interfaces between already reviewed groups. Verify phase ordering,
   CLI side effects, shutdown/error precedence, default tracker routing in tests,
   and the coverage map. Revisit earlier internals only when integration changes
   or new evidence warrant it.
+
+  R5 fixes are integrated: verified-output diagnostics, metadata final-event
+  diagnostics, second-signal exit during cleanup, partial-resume preparation,
+  and committed-output reporting after staged-file removal failure. The reviewer
+  signed off on `4424ed9`.
 
 ## Coverage and completion
 
@@ -903,15 +908,15 @@ merely because there is a disagreement.
 
 Before marking the implementation complete:
 
-- [ ] All task checkboxes and R1–R5 are complete; any breaking change has explicit
+- [x] All task checkboxes and R1–R5 are complete; any breaking change has explicit
   user approval and a matching design update. Development subsets are not
   described as the complete supported client.
-- [ ] Formatting, `go vet ./...`, and `go test ./...` pass on the integrated tree.
-- [ ] `go test -race ./...` passes with the toolchain support the race detector
+- [x] Formatting, `go vet ./...`, and `go test ./...` pass on the integrated tree.
+- [x] `go test -race ./...` passes with the toolchain support the race detector
   needs. This does not relax the pure-Go production rule.
-- [ ] `CGO_ENABLED=0 go build ./cmd/leech` succeeds with no third-party modules.
-- [ ] Required bounded fuzz runs and deterministic network/filesystem regressions
+- [x] `CGO_ENABLED=0 go build ./cmd/leech` succeeds with no third-party modules.
+- [x] Required bounded fuzz runs and deterministic network/filesystem regressions
   have passed. Run focused tests during work and these integrated checks once on
   the final tree; repeat only after relevant changes or failures.
-- [ ] Validation has used no existing BitTorrent clients or live trackers. State
+- [x] Validation has used no existing BitTorrent clients or live trackers. State
   that limit in the completion report rather than implying tested compatibility.

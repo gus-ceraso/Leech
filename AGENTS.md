@@ -52,6 +52,7 @@ Leech is a KISS, robust, download-only BitTorrent v1 client written in Go and ex
 - Never create output files for unselected content. Full in-progress pieces may exist only in the internal cache.
 - Treat final output paths as partial until their selected content has passed piece verification and the download completes.
 - A successful output `Write` and `Close` is sufficient before deleting a staged piece; do not require `fsync`, and recover from any resulting power-loss inconsistency by rehashing in a later resume run.
+- A partial resume must prepare transfer output in resume mode. The transfer configuration's zero value is overwrite mode, which truncates verified files.
 - Fail the whole download after any cache or output error, including disk-full, permission, short-write, and close failures.
 - Keep the single-active-torrent lifecycle explicit so cancellation, cleanup, and completion are deterministic. On `SIGINT` or `SIGTERM`, stop scheduling work, cancel and join connections, attempt bounded `stopped` announces, remove the current cache workspace, close output files, and exit; a second signal may terminate immediately.
 
