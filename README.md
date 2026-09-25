@@ -7,14 +7,13 @@ bytes to their final paths, and never uploads torrent data.
 ## Build
 
 ```sh
-go build -o leech ./cmd/leech
+make build
+make check
 ```
 
-The implementation uses only the Go standard library. To build without cgo:
-
-```sh
-CGO_ENABLED=0 go build -o leech ./cmd/leech
-```
+`make build` produces `./leech` without cgo. `make check` runs the tests,
+race detector, vet, and build in sequence. The implementation uses only the Go
+standard library.
 
 ## Use
 
