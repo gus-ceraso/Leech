@@ -6,6 +6,7 @@ package session
 // session identity and disabled-tracker state for the later transfer phase.
 
 import (
+	"container/list"
 	"context"
 	cryptorand "crypto/rand"
 	"crypto/sha1"
@@ -13,7 +14,9 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -31,6 +34,15 @@ const (
 	metadataMessageLimit              = limits.MetadataRequests * 4
 	metadataPeerTimeout               = 30 * time.Second
 	metadataRetryPoll                 = 100 * time.Millisecond
+	trackerPeerQueueLimit             = limits.Candidates
+	trackerPeerHostLimit              = limits.PathBytes
+	trackerPeerHostBytesLimit         = limits.HTTPResponseBytes
+	trackerResolverWorkers            = 8
+	trackerResolverTimeout            = 2 * time.Second
+	trackerEndpointRaceTimeout        = 2 * time.Second
+	trackerAdmissionBatch             = 64
+	trackerEventBatch                 = 8
+	trackerResolverQueue              = trackerResolverWorkers
 )
 
 var (
@@ -40,7 +52,415 @@ var (
 	ErrMetadataInvalid      = errors.New("peer supplied invalid complete metadata")
 	ErrMetadataEventQueue   = errors.New("metadata tracker event queue is full")
 	ErrMetadataAlreadyPhase = errors.New("metadata tracker phase is already active")
+	ErrTrackerUpdateQueue   = errors.New("session tracker event queue is full")
 )
+
+// trackerPeerUpdateQueue keeps status events and announced peers in separate
+// bounded queues. IP literals have priority over pending peers: when the peer
+// budget is full, a newly announced IP evicts the oldest queued peer. Peers
+// already being resolved are never evicted.
+//
+// The event channel retains the original accounting/error fields but never a
+// tracker-owned peer slice. Peer entries are copied into one queue node each,
+// so a large input slice cannot keep an oversized backing array reachable.
+type trackerPeerUpdateQueue struct {
+	mu        sync.Mutex
+	events    chan tracker.Update
+	notify    chan struct{}
+	ipPeers   list.List
+	hosts     list.List
+	total     int // queued and currently resolving peers
+	hostBytes int // queued and currently resolving hostname bytes
+	nextID    uint64
+}
+
+type queuedTrackerPeer struct {
+	peer  tracker.TrackerPeer
+	phase tracker.Phase
+	ip    bool
+	id    uint64
+}
+
+func newTrackerPeerUpdateQueue() *trackerPeerUpdateQueue {
+	return &trackerPeerUpdateQueue{
+		events: make(chan tracker.Update, metadataEventQueueSize),
+		notify: make(chan struct{}, 1),
+	}
+}
+
+// enqueue is nonblocking with respect to consumers and network operations.
+// The caller owns handling ErrTrackerUpdateQueue, preserving the existing
+// tracker-event overflow behavior.
+func (q *trackerPeerUpdateQueue) enqueue(update tracker.Update) error {
+	if q == nil {
+		return ErrTrackerUpdateQueue
+	}
+	status := update
+	status.Peers = nil
+	select {
+	case q.events <- status:
+	default:
+		return ErrTrackerUpdateQueue
+	}
+	q.enqueuePeers(update.Phase, update.Peers)
+	return nil
+}
+
+func (q *trackerPeerUpdateQueue) enqueuePeers(phase tracker.Phase, peers []tracker.TrackerPeer) {
+	if q == nil {
+		return
+	}
+	limit := len(peers)
+	if limit > trackerPeerQueueLimit {
+		limit = trackerPeerQueueLimit
+	}
+	if limit == 0 {
+		q.signal()
+		return
+	}
+	q.mu.Lock()
+	// Admit IP literals first, so a hostname-heavy update cannot place its
+	// usable literal peers behind any resolver work, including in later updates.
+	for i := 0; i < limit; i++ {
+		announced := peers[i]
+		if !usableQueuedPeer(announced) || !isTrackerPeerIP(announced.Host) {
+			continue
+		}
+		q.makeRoomForIPLocked()
+		if q.total == trackerPeerQueueLimit {
+			continue
+		}
+		q.pushLocked(phase, announced, true)
+	}
+	for i := 0; i < limit; i++ {
+		announced := peers[i]
+		if !usableQueuedPeer(announced) || isTrackerPeerIP(announced.Host) || q.total == trackerPeerQueueLimit || q.hostBytes+len(announced.Host) > trackerPeerHostBytesLimit {
+			continue
+		}
+		q.pushLocked(phase, announced, false)
+	}
+	q.mu.Unlock()
+	q.signal()
+}
+
+func usableQueuedPeer(announced tracker.TrackerPeer) bool {
+	return announced.Port != 0 && announced.Host != "" && len(announced.Host) <= trackerPeerHostLimit
+}
+
+func isTrackerPeerIP(host string) bool {
+	if len(host) == 0 || len(host) > trackerPeerHostLimit {
+		return false
+	}
+	_, err := netip.ParseAddr(host)
+	return err == nil
+}
+
+func (q *trackerPeerUpdateQueue) pushLocked(phase tracker.Phase, announced tracker.TrackerPeer, isIP bool) {
+	q.nextID++
+	entry := &queuedTrackerPeer{
+		peer: tracker.TrackerPeer{
+			Host: strings.Clone(announced.Host), Port: announced.Port,
+			PeerID: announced.PeerID, HasID: announced.HasID,
+		},
+		phase: phase, ip: isIP, id: q.nextID,
+	}
+	if isIP {
+		q.ipPeers.PushBack(entry)
+	} else {
+		q.hosts.PushBack(entry)
+		q.hostBytes += len(entry.peer.Host)
+	}
+	q.total++
+}
+
+func (q *trackerPeerUpdateQueue) makeRoomForIPLocked() {
+	if q.total < trackerPeerQueueLimit {
+		return
+	}
+	var oldest *list.Element
+	if ip := q.ipPeers.Front(); ip != nil {
+		oldest = ip
+	}
+	if host := q.hosts.Front(); host != nil && (oldest == nil || host.Value.(*queuedTrackerPeer).id < oldest.Value.(*queuedTrackerPeer).id) {
+		oldest = host
+	}
+	if oldest == nil {
+		// The remaining capacity is held by resolver jobs, not queued peers.
+		return
+	}
+	entry := oldest.Value.(*queuedTrackerPeer)
+	if entry.ip {
+		q.ipPeers.Remove(oldest)
+	} else {
+		q.hosts.Remove(oldest)
+		q.hostBytes -= len(entry.peer.Host)
+	}
+	q.total--
+}
+
+func (q *trackerPeerUpdateQueue) takePeer(allowHostname bool) *queuedTrackerPeer {
+	if q == nil {
+		return nil
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if newest := q.ipPeers.Back(); newest != nil {
+		q.ipPeers.Remove(newest)
+		return newest.Value.(*queuedTrackerPeer)
+	}
+	if allowHostname {
+		if front := q.hosts.Front(); front != nil {
+			q.hosts.Remove(front)
+			return front.Value.(*queuedTrackerPeer)
+		}
+	}
+	return nil
+}
+
+func (q *trackerPeerUpdateQueue) releasePeer(item *queuedTrackerPeer) {
+	if q == nil {
+		return
+	}
+	q.mu.Lock()
+	if q.total > 0 {
+		q.total--
+	}
+	if item != nil && !item.ip {
+		q.hostBytes -= len(item.peer.Host)
+	}
+	q.mu.Unlock()
+}
+
+func (q *trackerPeerUpdateQueue) pendingPeers() int {
+	if q == nil {
+		return 0
+	}
+	q.mu.Lock()
+	n := q.total
+	q.mu.Unlock()
+	return n
+}
+
+func (q *trackerPeerUpdateQueue) clear() {
+	if q == nil {
+		return
+	}
+	q.mu.Lock()
+	q.ipPeers.Init()
+	q.hosts.Init()
+	q.total = 0
+	q.hostBytes = 0
+	q.mu.Unlock()
+	for {
+		select {
+		case <-q.events:
+		default:
+			q.signal()
+			return
+		}
+	}
+}
+
+func (q *trackerPeerUpdateQueue) signal() {
+	if q == nil {
+		return
+	}
+	select {
+	case q.notify <- struct{}{}:
+	default:
+	}
+}
+
+type trackerResolveResult struct {
+	peer       *queuedTrackerPeer
+	candidates []peer.ResolvedCandidate
+	err        error
+}
+
+// trackerPeerResolver owns a fixed worker set. Its job queue is deliberately
+// small; the remaining announced peers stay in trackerPeerUpdateQueue, where
+// IP literals can continue to pass hostname work.
+type trackerPeerResolver struct {
+	ctx      context.Context
+	cancel   context.CancelFunc
+	resolver peer.Resolver
+	queue    *trackerPeerUpdateQueue
+	jobs     chan *queuedTrackerPeer
+	results  chan trackerResolveResult
+	wg       sync.WaitGroup
+	mu       sync.Mutex
+}
+
+func newTrackerPeerResolver(ctx context.Context, resolver peer.Resolver, queue *trackerPeerUpdateQueue) *trackerPeerResolver {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	workerCtx, cancel := context.WithCancel(ctx)
+	a := &trackerPeerResolver{
+		ctx: workerCtx, cancel: cancel, resolver: resolver, queue: queue,
+		jobs:    make(chan *queuedTrackerPeer, trackerResolverQueue),
+		results: make(chan trackerResolveResult, trackerResolverWorkers),
+	}
+	for i := 0; i < trackerResolverWorkers; i++ {
+		a.wg.Add(1)
+		go a.worker()
+	}
+	return a
+}
+
+func (a *trackerPeerResolver) worker() {
+	defer a.wg.Done()
+	for {
+		if a.ctx.Err() != nil {
+			return
+		}
+		select {
+		case <-a.ctx.Done():
+			return
+		case item := <-a.jobs:
+			if item == nil {
+				continue
+			}
+			if a.ctx.Err() != nil {
+				a.queue.releasePeer(item)
+				continue
+			}
+			lookupCtx, cancel := context.WithTimeout(a.ctx, trackerResolverTimeout)
+			candidates, err := peer.ResolveCandidate(lookupCtx, a.resolver, peer.Candidate{
+				Host: item.peer.Host, Port: item.peer.Port,
+				ExpectedPeerID: item.peer.PeerID, HasExpectedID: item.peer.HasID,
+			})
+			cancel()
+			// A full result buffer can hold at most one result per worker. This
+			// blocking send is always canceled during phase shutdown, and keeps
+			// ownership explicit so Close can release every peer reservation.
+			select {
+			case a.results <- trackerResolveResult{peer: item, candidates: candidates, err: err}:
+				a.queue.signal()
+			case <-a.ctx.Done():
+				a.queue.releasePeer(item)
+				return
+			}
+		}
+	}
+}
+
+func (a *trackerPeerResolver) pump(ctx context.Context, phase tracker.Phase, pool *peer.CandidatePool) int {
+	if a == nil || pool == nil {
+		return 0
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	work := 0
+	for work < trackerResolverWorkers {
+		select {
+		case result := <-a.results:
+			if result.err == nil {
+				for _, candidate := range result.candidates {
+					_, _ = pool.Add(candidate)
+				}
+			}
+			a.queue.releasePeer(result.peer)
+			work++
+		default:
+			goto resultsDrained
+		}
+	}
+resultsDrained:
+	for work < trackerAdmissionBatch-trackerEventBatch-trackerResolverWorkers {
+		allowHostname := len(a.jobs) < cap(a.jobs)
+		item := a.queue.takePeer(allowHostname)
+		if item == nil {
+			break
+		}
+		if item.phase != phase {
+			a.queue.releasePeer(item)
+			work++
+			continue
+		}
+		if item.ip {
+			candidates, err := peer.ResolveCandidate(ctx, nil, peer.Candidate{
+				Host: item.peer.Host, Port: item.peer.Port,
+				ExpectedPeerID: item.peer.PeerID, HasExpectedID: item.peer.HasID,
+			})
+			if err == nil {
+				for _, candidate := range candidates {
+					_, _ = pool.Add(candidate)
+				}
+			}
+			a.queue.releasePeer(item)
+			work++
+			continue
+		}
+		select {
+		case a.jobs <- item:
+			work++
+		default:
+			// Only the coordinator submits jobs, and workers only receive, so
+			// this is defensive. Return the item to the front without changing
+			// the retained-peer count.
+			a.queue.requeuePeer(item)
+			return work
+		}
+	}
+	for i := 0; i < trackerEventBatch; i++ {
+		select {
+		case <-a.queue.events:
+		default:
+			i = trackerEventBatch
+		}
+	}
+	return work
+}
+
+func (q *trackerPeerUpdateQueue) requeuePeer(item *queuedTrackerPeer) {
+	if q == nil || item == nil {
+		return
+	}
+	q.mu.Lock()
+	if item.ip {
+		q.ipPeers.PushFront(item)
+	} else {
+		q.hosts.PushFront(item)
+	}
+	q.mu.Unlock()
+}
+
+func (a *trackerPeerResolver) close() {
+	if a == nil {
+		return
+	}
+	a.cancel()
+	done := make(chan struct{})
+	go func() {
+		a.wg.Wait()
+		close(done)
+	}()
+	for {
+		select {
+		case result := <-a.results:
+			a.queue.releasePeer(result.peer)
+		case <-done:
+			for {
+				select {
+				case result := <-a.results:
+					a.queue.releasePeer(result.peer)
+				default:
+					goto resultsDrained
+				}
+			}
+		resultsDrained:
+			for {
+				select {
+				case item := <-a.jobs:
+					a.queue.releasePeer(item)
+				default:
+					return
+				}
+			}
+		}
+	}
+}
 
 // MetadataConfig contains only phase-local dependencies. TrackerSet and
 // Updates are both optional together: when TrackerSet is nil, discovery
@@ -51,13 +471,15 @@ type MetadataConfig struct {
 	Trackers []string
 	Peers    []torrent.PeerAddress
 
-	TrackerSet   *tracker.TrackerSet
-	Updates      <-chan tracker.Update
-	Identity     tracker.Identity
-	HTTP         tracker.TrackerHTTP
-	UDP          tracker.TrackerUDP
-	TrackerClock tracker.Clock
-	Random       io.Reader
+	TrackerSet    *tracker.TrackerSet
+	Updates       <-chan tracker.Update
+	updateQueue   *trackerPeerUpdateQueue
+	candidatePool *peer.CandidatePool
+	Identity      tracker.Identity
+	HTTP          tracker.TrackerHTTP
+	UDP           tracker.TrackerUDP
+	TrackerClock  tracker.Clock
+	Random        io.Reader
 
 	Resolver       peer.Resolver
 	TCPDial        peer.DialFunc
@@ -114,7 +536,9 @@ func NewMetadataDiscovery(config MetadataConfig) (*MetadataDiscovery, error) {
 			return nil, fmt.Errorf("%w: Updates requires an injected TrackerSet", ErrMetadataConfig)
 		}
 	} else if config.Updates == nil {
-		return nil, fmt.Errorf("%w: injected TrackerSet requires Updates", ErrMetadataConfig)
+		if config.updateQueue == nil {
+			return nil, fmt.Errorf("%w: injected TrackerSet requires Updates", ErrMetadataConfig)
+		}
 	}
 	for _, candidate := range config.Peers {
 		if candidate.Port == 0 || candidate.Host == "" {
@@ -155,11 +579,11 @@ func (d *MetadataDiscovery) Run(ctx context.Context) (result MetadataResult, pri
 	phaseCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	var updateQueue chan tracker.Update
-	if config.TrackerSet == nil {
-		updateQueue = make(chan tracker.Update, metadataEventQueueSize)
-		updates = updateQueue
+	updateQueue := config.updateQueue
+	if updateQueue == nil {
+		updateQueue = newTrackerPeerUpdateQueue()
 	}
+	defer updateQueue.clear()
 
 	var callbackErr error
 	var callbackMu sync.Mutex
@@ -175,16 +599,14 @@ func (d *MetadataDiscovery) Run(ctx context.Context) (result MetadataResult, pri
 		if update.Phase != tracker.MetadataPhase {
 			return
 		}
-		select {
-		case updateQueue <- update:
-		default:
+		if enqueueErr := updateQueue.enqueue(update); enqueueErr != nil {
 			setCallbackErr(ErrMetadataEventQueue)
 		}
 	}
 
 	set := config.TrackerSet
 	ownSet := false
-	var pool *peer.CandidatePool
+	pool := config.candidatePool
 	var err error
 	if set == nil {
 		ownSet = true
@@ -230,16 +652,14 @@ func (d *MetadataDiscovery) Run(ctx context.Context) (result MetadataResult, pri
 	}
 	local.Reserved[5] |= metadataExtensionReservedBit
 
-	resolver := config.Resolver
-	pool, err = peer.NewCandidatePool(peer.CandidatePoolConfig{Resolver: resolver})
-	if err != nil {
-		return MetadataResult{}, fmt.Errorf("%w: candidate pool: %v", ErrMetadataConfig, err)
+	if pool == nil {
+		pool, err = peer.NewCandidatePool(peer.CandidatePoolConfig{Resolver: config.Resolver})
+		if err != nil {
+			return MetadataResult{}, fmt.Errorf("%w: candidate pool: %v", ErrMetadataConfig, err)
+		}
 	}
 	for _, embedded := range config.Peers {
-		_, admitErr := pool.Admit(phaseCtx, peer.Candidate{Host: embedded.Host, Port: embedded.Port})
-		if admitErr != nil {
-			return MetadataResult{}, fmt.Errorf("%w: embedded peer: %v", ErrMetadataConfig, admitErr)
-		}
+		updateQueue.enqueuePeers(tracker.MetadataPhase, []tracker.TrackerPeer{{Host: embedded.Host, Port: embedded.Port}})
 	}
 
 	backoff := config.Backoff
@@ -262,6 +682,7 @@ func (d *MetadataDiscovery) Run(ctx context.Context) (result MetadataResult, pri
 	}
 
 	var run *tracker.PhaseRun
+	var resolver *trackerPeerResolver
 	finalize := func() {
 		if run == nil {
 			return
@@ -275,6 +696,9 @@ func (d *MetadataDiscovery) Run(ctx context.Context) (result MetadataResult, pri
 	defer func() {
 		cancel()
 		finalize()
+		if resolver != nil {
+			resolver.close()
+		}
 		if ownSet {
 			_ = set.Close(context.Background())
 		}
@@ -283,6 +707,7 @@ func (d *MetadataDiscovery) Run(ctx context.Context) (result MetadataResult, pri
 	if err != nil {
 		return MetadataResult{}, err
 	}
+	resolver = newTrackerPeerResolver(phaseCtx, config.Resolver, updateQueue)
 
 	strikes := make(map[peer.Endpoint]uint8)
 	for {
@@ -298,23 +723,24 @@ func (d *MetadataDiscovery) Run(ctx context.Context) (result MetadataResult, pri
 			break
 		}
 
-		// Consume all immediately available tracker updates before looking for
-		// another dial. The callback itself remains nonblocking.
-		for {
+		// Admit a bounded amount of peer work before dialing. The peer queue
+		// prioritizes IP literals, while names go to the fixed resolver pool.
+		resolver.pump(phaseCtx, tracker.MetadataPhase, pool)
+		for i := 0; updates != nil && i < trackerEventBatch; i++ {
 			select {
 			case update, ok := <-updates:
 				if !ok {
 					updates = nil
+					i = trackerEventBatch
 					continue
 				}
-				for _, announced := range update.Peers {
-					_, _ = pool.Admit(phaseCtx, peer.Candidate{Host: announced.Host, Port: announced.Port, ExpectedPeerID: announced.PeerID, HasExpectedID: announced.HasID})
+				if err := updateQueue.enqueue(update); err != nil {
+					setCallbackErr(ErrMetadataEventQueue)
 				}
 			default:
-				goto updatesDrained
+				i = trackerEventBatch
 			}
 		}
-	updatesDrained:
 
 		var candidate peer.ResolvedCandidate
 		found := false
@@ -359,13 +785,14 @@ func (d *MetadataDiscovery) Run(ctx context.Context) (result MetadataResult, pri
 		}
 
 		select {
+		case <-updateQueue.notify:
 		case update, ok := <-updates:
 			if !ok {
 				updates = nil
 				continue
 			}
-			for _, announced := range update.Peers {
-				_, _ = pool.Admit(phaseCtx, peer.Candidate{Host: announced.Host, Port: announced.Port, ExpectedPeerID: announced.PeerID, HasExpectedID: announced.HasID})
+			if err := updateQueue.enqueue(update); err != nil {
+				setCallbackErr(ErrMetadataEventQueue)
 			}
 		case <-ctx.Done():
 			primary = ctx.Err()
@@ -382,7 +809,9 @@ func (d *MetadataDiscovery) Run(ctx context.Context) (result MetadataResult, pri
 }
 
 func (d *MetadataDiscovery) tryCandidate(ctx context.Context, manager *peer.DialManager, candidate peer.ResolvedCandidate, strikes map[peer.Endpoint]uint8, backoff *peer.EndpointBackoff) (metadataCandidate, error) {
-	connected, err := manager.Race(ctx, candidate)
+	raceCtx, cancel := context.WithTimeout(ctx, trackerEndpointRaceTimeout)
+	connected, err := manager.Race(raceCtx, candidate)
+	cancel()
 	if err != nil {
 		if errors.Is(err, peer.ErrProtocolViolation) {
 			backoff.Blacklist(candidate.Endpoint)

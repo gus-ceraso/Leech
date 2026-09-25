@@ -16,7 +16,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/gus-ceraso/Leech/internal/limits"
 	"github.com/gus-ceraso/Leech/internal/peer"
 	"github.com/gus-ceraso/Leech/internal/storage"
 	"github.com/gus-ceraso/Leech/internal/torrent"
@@ -153,6 +152,7 @@ func Run(ctx context.Context, config RunConfig) (result RunResult, err error) {
 	}
 
 	run := &coordinator{config: config, identity: identity, backoff: peer.NewEndpointBackoff(), verifiedOutput: &verifiedOutput}
+	run.updateQueue = newTrackerPeerUpdateQueue()
 	run.ownSet = config.TrackerSet == nil
 	defer func() {
 		if closeErr := run.closeSet(); closeErr != nil {
@@ -171,8 +171,7 @@ func Run(ctx context.Context, config RunConfig) (result RunResult, err error) {
 		}
 		run.identity = run.set.Identity()
 	} else {
-		run.updateSend = make(chan tracker.Update, limits.SessionEvents)
-		run.updates = run.updateSend
+		run.updates = nil
 		if source.Kind != torrent.SourcePath {
 			if err := run.makeSet(source.Trackers, source.InfoHash, true); err != nil {
 				return RunResult{}, err
@@ -359,11 +358,11 @@ type coordinator struct {
 	identity       tracker.Identity
 	verifiedOutput *atomic.Bool
 
-	set        *tracker.TrackerSet
-	ownSet     bool
-	updates    <-chan tracker.Update
-	updateSend chan tracker.Update
-	account    *tracker.Accounting
+	set         *tracker.TrackerSet
+	ownSet      bool
+	updates     <-chan tracker.Update
+	updateQueue *trackerPeerUpdateQueue
+	account     *tracker.Accounting
 
 	metadataMode      atomic.Bool
 	backoff           *peer.EndpointBackoff
@@ -416,12 +415,10 @@ func (c *coordinator) makeSet(trackers []string, infoHash torrent.InfoHash, meta
 }
 
 func (c *coordinator) enqueueUpdate(update tracker.Update) {
-	if c == nil || c.updateSend == nil {
+	if c == nil || c.updateQueue == nil {
 		return
 	}
-	select {
-	case c.updateSend <- update:
-	default:
+	if err := c.updateQueue.enqueue(update); err != nil {
 		c.overflow.Store(true)
 	}
 }
@@ -463,6 +460,7 @@ func (c *coordinator) discover(ctx context.Context, source torrent.Source) (torr
 	metadata, err := DiscoverMetadata(ctx, MetadataConfig{
 		InfoHash: source.InfoHash, Trackers: source.Trackers,
 		Peers: peersForSource(source), TrackerSet: c.set, Updates: c.updates,
+		updateQueue: c.updateQueue, candidatePool: p,
 		Identity: c.identity, HTTP: c.config.HTTP, UDP: c.config.UDP,
 		TrackerClock: c.config.TrackerClock, Resolver: c.config.Resolver,
 		TCPDial: c.tcpDial(), UTPDial: c.utpDial(), Clock: c.config.RaceClock,
@@ -526,7 +524,7 @@ func (c *coordinator) startTransferPhase(ctx context.Context, source torrent.Sou
 		_, _ = pool.Add(candidate)
 	}
 	for _, endpoint := range peersForSource(source) {
-		_, _ = pool.Admit(ctx, peer.Candidate{Host: endpoint.Host, Port: endpoint.Port})
+		c.updateQueue.enqueuePeers(tracker.TransferPhase, []tracker.TrackerPeer{{Host: endpoint.Host, Port: endpoint.Port}})
 	}
 	c.poolMu.Lock()
 	c.pool = pool
@@ -548,20 +546,50 @@ func (c *coordinator) startTransferPhase(ctx context.Context, source torrent.Sou
 	if err != nil {
 		return err
 	}
+	admission := newTrackerPeerResolver(runCtx, c.config.Resolver, c.updateQueue)
+	defer func() {
+		admission.close()
+		c.updateQueue.clear()
+	}()
 	var liveMu sync.Mutex
 	live := make(map[net.Conn]*peer.LivePeer)
+	var candidateCursorMu sync.Mutex
+	candidateCursor := 0
 	acquire := func(acquireCtx context.Context) (ConnectedPeer, error) {
 		for {
 			if c.overflow.Load() {
 				return ConnectedPeer{}, errors.New("session tracker event queue is full")
 			}
-			for _, candidate := range pool.Snapshot() {
+			admission.pump(acquireCtx, tracker.TransferPhase, pool)
+			select {
+			case <-c.updateQueue.notify:
+				candidateCursorMu.Lock()
+				candidateCursor = 0
+				candidateCursorMu.Unlock()
+			default:
+			}
+			snapshot := pool.Snapshot()
+			candidateCursorMu.Lock()
+			start := 0
+			if len(snapshot) > 0 {
+				start = candidateCursor % len(snapshot)
+				candidateCursor = (start + trackerAdmissionBatch) % len(snapshot)
+			}
+			candidateCursorMu.Unlock()
+			checked := len(snapshot)
+			if checked > trackerAdmissionBatch {
+				checked = trackerAdmissionBatch
+			}
+			for i := 0; i < checked; i++ {
+				candidate := snapshot[(start+i)%len(snapshot)]
 				if !c.backoff.Ready(candidate.Endpoint, time.Now()) {
 					continue
 				}
-				admitted, dialErr := manager.Dial(acquireCtx, candidate)
+				dialCtx, dialCancel := context.WithTimeout(acquireCtx, trackerEndpointRaceTimeout)
+				admitted, dialErr := manager.Dial(dialCtx, candidate)
+				dialCancel()
 				if dialErr != nil {
-					continue
+					break
 				}
 				liveMu.Lock()
 				live[admitted.Conn] = admitted
@@ -575,12 +603,17 @@ func (c *coordinator) startTransferPhase(ctx context.Context, source torrent.Sou
 				if !ok {
 					return ConnectedPeer{}, ErrNoPeer
 				}
-				if update.Phase != tracker.TransferPhase {
-					continue
+				if enqueueErr := c.updateQueue.enqueue(update); enqueueErr != nil {
+					c.overflow.Store(true)
+					return ConnectedPeer{}, errors.New("session tracker event queue is full")
 				}
-				for _, announced := range update.Peers {
-					_, _ = pool.Admit(acquireCtx, peer.Candidate{Host: announced.Host, Port: announced.Port, ExpectedPeerID: announced.PeerID, HasExpectedID: announced.HasID})
-				}
+				candidateCursorMu.Lock()
+				candidateCursor = 0
+				candidateCursorMu.Unlock()
+			case <-c.updateQueue.notify:
+				candidateCursorMu.Lock()
+				candidateCursor = 0
+				candidateCursorMu.Unlock()
 			case <-time.After(100 * time.Millisecond):
 			}
 		}
