@@ -16,6 +16,12 @@ type candidateResolver struct {
 	err     error
 }
 
+func backoffTestEndpoint(index int) Endpoint {
+	value := uint32(index)
+	addr := netip.AddrFrom4([4]byte{10, byte(value >> 16), byte(value >> 8), byte(value)})
+	return Endpoint{Addr: addr, Port: 6881}
+}
+
 func (r candidateResolver) LookupIPAddr(context.Context, string) ([]net.IPAddr, error) {
 	return r.answers, r.err
 }
@@ -204,5 +210,74 @@ func TestEndpointBackoffIsTransportIndependentAndBounded(t *testing.T) {
 	backoff.Blacklist(ep)
 	if backoff.Ready(ep, now) || !backoff.IsBlacklisted(ep) {
 		t.Fatal("blacklist not enforced")
+	}
+}
+
+func TestEndpointBackoffOrdinaryStateIsBoundedUnderCandidateChurn(t *testing.T) {
+	pool, err := NewCandidatePool(CandidatePoolConfig{MaxCandidates: limits.Candidates})
+	if err != nil {
+		t.Fatalf("NewCandidatePool: %v", err)
+	}
+	backoff := NewEndpointBackoff()
+	now := time.Unix(100, 0)
+	const churnCount = 2 * maxEndpointFailureStates
+	for index := 1; index <= churnCount; index++ {
+		endpoint := backoffTestEndpoint(index)
+		if _, err := pool.Add(ResolvedCandidate{Endpoint: endpoint}); err != nil {
+			t.Fatalf("add candidate %d: %v", index, err)
+		}
+		backoff.RecordFailure(endpoint, now)
+	}
+	if pool.Len() != limits.Candidates {
+		t.Fatalf("candidate count = %d, want %d", pool.Len(), limits.Candidates)
+	}
+	if len(backoff.states) != maxEndpointFailureStates {
+		t.Fatalf("ordinary backoff entries = %d, want cap %d", len(backoff.states), maxEndpointFailureStates)
+	}
+	if !backoff.Ready(backoffTestEndpoint(1), now) {
+		t.Fatal("oldest failure state was not evicted after candidate churn")
+	}
+	if backoff.Ready(backoffTestEndpoint(churnCount), now) {
+		t.Fatal("most recent failure lost its ordinary backoff")
+	}
+}
+
+func TestEndpointBackoffSuccessChurnDoesNotRetainOrdinaryState(t *testing.T) {
+	backoff := NewEndpointBackoff()
+	now := time.Unix(100, 0)
+	const churnCount = 2 * maxEndpointFailureStates
+	for index := 1; index <= churnCount; index++ {
+		backoff.RecordSuccess(backoffTestEndpoint(index))
+	}
+	if len(backoff.states) != 0 {
+		t.Fatalf("success-only churn retained %d ordinary entries", len(backoff.states))
+	}
+
+	endpoint := backoffTestEndpoint(1)
+	backoff.RecordFailure(endpoint, now)
+	backoff.RecordSuccess(endpoint)
+	if len(backoff.states) != 0 || !backoff.Ready(endpoint, now) {
+		t.Fatalf("success did not clear ordinary state: entries=%d ready=%t", len(backoff.states), backoff.Ready(endpoint, now))
+	}
+}
+
+func TestEndpointBackoffBlacklistSurvivesOrdinaryStateChurn(t *testing.T) {
+	backoff := NewEndpointBackoff()
+	blocked := Endpoint{Addr: netip.MustParseAddr("127.0.0.1"), Port: 6881}
+	backoff.Blacklist(blocked)
+	now := time.Unix(100, 0)
+	const churnCount = 2 * maxEndpointFailureStates
+	for index := 1; index <= churnCount; index++ {
+		backoff.RecordFailure(backoffTestEndpoint(index), now)
+	}
+	if !backoff.IsBlacklisted(blocked) || backoff.Ready(blocked, now) {
+		t.Fatal("ordinary-state eviction cleared an endpoint blacklist")
+	}
+	backoff.RecordSuccess(blocked)
+	if !backoff.IsBlacklisted(blocked) || backoff.Ready(blocked, now) {
+		t.Fatal("success cleared an endpoint blacklist")
+	}
+	if len(backoff.states) > maxEndpointFailureStates {
+		t.Fatalf("ordinary backoff entries = %d, over cap %d", len(backoff.states), maxEndpointFailureStates)
 	}
 }

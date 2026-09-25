@@ -296,27 +296,39 @@ func (p *CandidatePool) Len() int {
 }
 
 // EndpointBackoff tracks ordinary dial failures independently of transport,
-// candidate source, and peer ID. It does not record corruption strikes;
-// protocol and piece penalties remain coordinator-owned.
+// candidate source, and peer ID. Ordinary failure state is bounded; blacklist
+// entries persist for the run. It does not record corruption strikes; protocol
+// and piece penalties remain coordinator-owned.
 type EndpointBackoff struct {
-	mu     sync.Mutex
-	states map[Endpoint]endpointBackoffState
+	mu          sync.Mutex
+	states      map[Endpoint]*list.Element
+	blacklisted map[Endpoint]struct{}
+	order       list.List
 }
 
 type endpointBackoffState struct {
 	failures  uint8
 	notBefore time.Time
-	blacklist bool
+}
+
+type endpointBackoffEntry struct {
+	endpoint Endpoint
+	state    endpointBackoffState
 }
 
 const (
 	endpointFailureBase = time.Second
 	endpointFailureMax  = 5 * time.Minute
+	// Match the ordinary-state cap to the maximum number of retained candidates.
+	maxEndpointFailureStates = limits.Candidates
 )
 
 // NewEndpointBackoff creates empty endpoint health state.
 func NewEndpointBackoff() *EndpointBackoff {
-	return &EndpointBackoff{states: make(map[Endpoint]endpointBackoffState)}
+	return &EndpointBackoff{
+		states:      make(map[Endpoint]*list.Element),
+		blacklisted: make(map[Endpoint]struct{}),
+	}
 }
 
 // Ready reports whether an endpoint may be attempted at now. A zero now uses
@@ -334,9 +346,14 @@ func (b *EndpointBackoff) Ready(endpoint Endpoint, now time.Time) bool {
 		now = time.Now()
 	}
 	b.mu.Lock()
-	state := b.states[endpoint]
+	_, blacklisted := b.blacklisted[endpoint]
+	element := b.states[endpoint]
+	var state endpointBackoffState
+	if element != nil {
+		state = element.Value.(*endpointBackoffEntry).state
+	}
 	b.mu.Unlock()
-	return !state.blacklist && !now.Before(state.notBefore)
+	return !blacklisted && !now.Before(state.notBefore)
 }
 
 // RecordFailure records one ordinary failure and returns the resulting
@@ -353,7 +370,15 @@ func (b *EndpointBackoff) RecordFailure(endpoint Endpoint, now time.Time) time.T
 		now = time.Now()
 	}
 	b.mu.Lock()
-	state := b.states[endpoint]
+	if _, blacklisted := b.blacklisted[endpoint]; blacklisted {
+		b.mu.Unlock()
+		return now
+	}
+	element := b.states[endpoint]
+	var state endpointBackoffState
+	if element != nil {
+		state = element.Value.(*endpointBackoffEntry).state
+	}
 	if state.failures < 8 {
 		state.failures++
 	}
@@ -366,7 +391,20 @@ func (b *EndpointBackoff) RecordFailure(endpoint Endpoint, now time.Time) time.T
 		}
 	}
 	state.notBefore = now.Add(delay)
-	b.states[endpoint] = state
+	if element == nil {
+		if len(b.states) >= maxEndpointFailureStates {
+			oldest := b.order.Front()
+			entry := oldest.Value.(*endpointBackoffEntry)
+			delete(b.states, entry.endpoint)
+			b.order.Remove(oldest)
+		}
+		element = b.order.PushBack(&endpointBackoffEntry{endpoint: endpoint, state: state})
+		b.states[endpoint] = element
+	} else {
+		entry := element.Value.(*endpointBackoffEntry)
+		entry.state = state
+		b.order.MoveToBack(element)
+	}
 	b.mu.Unlock()
 	return state.notBefore
 }
@@ -381,10 +419,7 @@ func (b *EndpointBackoff) RecordSuccess(endpoint Endpoint) {
 		return
 	}
 	b.mu.Lock()
-	state := b.states[endpoint]
-	state.failures = 0
-	state.notBefore = time.Time{}
-	b.states[endpoint] = state
+	b.removeFailureStateLocked(endpoint)
 	b.mu.Unlock()
 }
 
@@ -400,10 +435,16 @@ func (b *EndpointBackoff) Blacklist(endpoint Endpoint) {
 		return
 	}
 	b.mu.Lock()
-	state := b.states[endpoint]
-	state.blacklist = true
-	b.states[endpoint] = state
+	b.blacklisted[endpoint] = struct{}{}
+	b.removeFailureStateLocked(endpoint)
 	b.mu.Unlock()
+}
+
+func (b *EndpointBackoff) removeFailureStateLocked(endpoint Endpoint) {
+	if element := b.states[endpoint]; element != nil {
+		delete(b.states, endpoint)
+		b.order.Remove(element)
+	}
 }
 
 func (b *EndpointBackoff) IsBlacklisted(endpoint Endpoint) bool {
@@ -415,7 +456,7 @@ func (b *EndpointBackoff) IsBlacklisted(endpoint Endpoint) bool {
 		return false
 	}
 	b.mu.Lock()
-	blocked := b.states[endpoint].blacklist
+	_, blocked := b.blacklisted[endpoint]
 	b.mu.Unlock()
 	return blocked
 }
