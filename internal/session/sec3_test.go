@@ -106,6 +106,114 @@ func TestTrackerPeerUpdateQueuePreservesStatusWithoutPeerBackingSlice(t *testing
 	}
 }
 
+func TestTrackerPeerResolverPreservesSourceAcrossPhases(t *testing.T) {
+	for _, phase := range []tracker.Phase{tracker.MetadataPhase, tracker.TransferPhase} {
+		name := map[tracker.Phase]string{tracker.MetadataPhase: "metadata", tracker.TransferPhase: "transfer"}[phase]
+		t.Run(name, func(t *testing.T) {
+			queue := newTrackerPeerUpdateQueue()
+			pool, err := peer.NewCandidatePool(peer.CandidatePoolConfig{MaxCandidates: 3})
+			if err != nil {
+				t.Fatalf("NewCandidatePool: %v", err)
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			admission := newTrackerPeerResolver(ctx, sec3SourceResolver{}, queue)
+			t.Cleanup(func() {
+				cancel()
+				admission.close()
+				queue.clear()
+			})
+
+			enqueue := func(source string, peers []tracker.TrackerPeer) {
+				t.Helper()
+				if err := queue.enqueue(tracker.Update{Tracker: source, Phase: phase, Peers: peers}); err != nil {
+					t.Fatalf("enqueue %s update: %v", source, err)
+				}
+			}
+			admitPeers := func(source string, peers []tracker.TrackerPeer) {
+				t.Helper()
+				enqueue(source, peers)
+				admission.pump(ctx, phase, pool)
+				if got := queue.pendingPeers(); got != 0 {
+					t.Fatalf("pending peers after %s admission = %d, want 0", source, got)
+				}
+			}
+			admit := func(source string, ports ...uint16) {
+				t.Helper()
+				peers := make([]tracker.TrackerPeer, len(ports))
+				for i, port := range ports {
+					peers[i] = tracker.TrackerPeer{Host: "127.0.0.1", Port: port}
+				}
+				admitPeers(source, peers)
+			}
+			byPort := func() map[uint16]peer.ResolvedCandidate {
+				result := make(map[uint16]peer.ResolvedCandidate)
+				for _, candidate := range pool.Snapshot() {
+					result[candidate.Endpoint.Port] = candidate
+				}
+				return result
+			}
+
+			admit("tracker-A", 51431, 51432, 51433)
+			for port, candidate := range byPort() {
+				if candidate.Source != "tracker-A" {
+					t.Fatalf("initial endpoint %d source = %q, want tracker-A", port, candidate.Source)
+				}
+			}
+			admit("tracker-B", 51434)
+			admit("tracker-A", 51431, 51432, 51433)
+			candidates := byPort()
+			if _, ok := candidates[51434]; !ok {
+				t.Fatalf("tracker-B endpoint was evicted after tracker-A reannouncement: %+v", candidates)
+			}
+			admit("tracker-B", 51435)
+			candidates = byPort()
+			for _, port := range []uint16{51434, 51435} {
+				candidate, ok := candidates[port]
+				if !ok || candidate.Source != "tracker-B" {
+					t.Fatalf("tracker-B endpoint %d = %+v, present=%t; want source-aware admission", port, candidate, ok)
+				}
+			}
+
+			// Exercise the resolver-worker result path as well as direct IP
+			// admission. Drain the enqueue signal, then wait for the worker's
+			// post-result notification before pumping the resolved candidate.
+			enqueue("tracker-C", []tracker.TrackerPeer{{Host: "source.test", Port: 51436}})
+			select {
+			case <-queue.notify: // discard the enqueue notification
+			default:
+			}
+			admission.pump(ctx, phase, pool)
+			select {
+			case <-queue.notify:
+			case <-ctx.Done():
+				t.Fatal("resolver result was not signaled")
+			case <-time.After(time.Second):
+				t.Fatal("resolver result was not signaled")
+			}
+			admission.pump(ctx, phase, pool)
+			if got := queue.pendingPeers(); got != 0 {
+				t.Fatalf("pending peers after resolved tracker-C admission = %d, want 0", got)
+			}
+			candidates = byPort()
+			if candidate, ok := candidates[51436]; !ok || candidate.Source != "tracker-C" {
+				t.Fatalf("resolved tracker-C candidate = %+v, present=%t", candidate, ok)
+			}
+		})
+	}
+}
+
+type sec3SourceResolver struct{}
+
+func (sec3SourceResolver) LookupIPAddr(ctx context.Context, host string) ([]net.IPAddr, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if host != "source.test" {
+		return nil, fmt.Errorf("unexpected lookup host %q", host)
+	}
+	return []net.IPAddr{{IP: net.ParseIP("127.0.0.1")}}, nil
+}
+
 type sec3ControlledResolver struct {
 	started chan string
 	mu      sync.Mutex

@@ -30,6 +30,7 @@ import (
 const (
 	// BEP 10 assigns bit 20 from the right, which is reserved[5]'s 0x10 bit.
 	metadataExtensionReservedBit byte = 0x10
+	magnetPeerSource                  = "magnet"
 	metadataEventQueueSize            = limits.SessionEvents
 	metadataMessageLimit              = limits.MetadataRequests * 4
 	metadataPeerTimeout               = 30 * time.Second
@@ -75,10 +76,11 @@ type trackerPeerUpdateQueue struct {
 }
 
 type queuedTrackerPeer struct {
-	peer  tracker.TrackerPeer
-	phase tracker.Phase
-	ip    bool
-	id    uint64
+	peer   tracker.TrackerPeer
+	phase  tracker.Phase
+	source string
+	ip     bool
+	id     uint64
 }
 
 func newTrackerPeerUpdateQueue() *trackerPeerUpdateQueue {
@@ -102,13 +104,20 @@ func (q *trackerPeerUpdateQueue) enqueue(update tracker.Update) error {
 	default:
 		return ErrTrackerUpdateQueue
 	}
-	q.enqueuePeers(update.Phase, update.Peers)
+	q.enqueuePeersFrom(update.Tracker, update.Phase, update.Peers)
 	return nil
 }
 
 func (q *trackerPeerUpdateQueue) enqueuePeers(phase tracker.Phase, peers []tracker.TrackerPeer) {
+	q.enqueuePeersFrom(peer.DefaultCandidateSource, phase, peers)
+}
+
+func (q *trackerPeerUpdateQueue) enqueuePeersFrom(source string, phase tracker.Phase, peers []tracker.TrackerPeer) {
 	if q == nil {
 		return
+	}
+	if source == "" {
+		source = peer.DefaultCandidateSource
 	}
 	limit := len(peers)
 	if limit > trackerPeerQueueLimit {
@@ -132,14 +141,14 @@ func (q *trackerPeerUpdateQueue) enqueuePeers(phase tracker.Phase, peers []track
 		if q.total == trackerPeerQueueLimit {
 			continue
 		}
-		q.pushLocked(phase, announced, true)
+		q.pushLocked(source, phase, announced, true)
 	}
 	for i := 0; i < limit; i++ {
 		announced := peers[i]
 		if !usableQueuedPeer(announced) || isTrackerPeerIP(announced.Host) || q.total == trackerPeerQueueLimit || q.hostBytes+len(announced.Host) > trackerPeerHostBytesLimit {
 			continue
 		}
-		q.pushLocked(phase, announced, false)
+		q.pushLocked(source, phase, announced, false)
 	}
 	q.mu.Unlock()
 	q.signal()
@@ -157,14 +166,14 @@ func isTrackerPeerIP(host string) bool {
 	return err == nil
 }
 
-func (q *trackerPeerUpdateQueue) pushLocked(phase tracker.Phase, announced tracker.TrackerPeer, isIP bool) {
+func (q *trackerPeerUpdateQueue) pushLocked(source string, phase tracker.Phase, announced tracker.TrackerPeer, isIP bool) {
 	q.nextID++
 	entry := &queuedTrackerPeer{
 		peer: tracker.TrackerPeer{
 			Host: strings.Clone(announced.Host), Port: announced.Port,
 			PeerID: announced.PeerID, HasID: announced.HasID,
 		},
-		phase: phase, ip: isIP, id: q.nextID,
+		phase: phase, source: source, ip: isIP, id: q.nextID,
 	}
 	if isIP {
 		q.ipPeers.PushBack(entry)
@@ -359,7 +368,7 @@ func (a *trackerPeerResolver) pump(ctx context.Context, phase tracker.Phase, poo
 		case result := <-a.results:
 			if result.err == nil {
 				for _, candidate := range result.candidates {
-					_, _ = pool.Add(candidate)
+					_, _ = pool.AddFrom(result.peer.source, candidate)
 				}
 			}
 			a.queue.releasePeer(result.peer)
@@ -387,7 +396,7 @@ resultsDrained:
 			})
 			if err == nil {
 				for _, candidate := range candidates {
-					_, _ = pool.Add(candidate)
+					_, _ = pool.AddFrom(item.source, candidate)
 				}
 			}
 			a.queue.releasePeer(item)
@@ -661,7 +670,7 @@ func (d *MetadataDiscovery) Run(ctx context.Context) (result MetadataResult, pri
 		}
 	}
 	for _, embedded := range config.Peers {
-		updateQueue.enqueuePeers(tracker.MetadataPhase, []tracker.TrackerPeer{{Host: embedded.Host, Port: embedded.Port}})
+		updateQueue.enqueuePeersFrom(magnetPeerSource, tracker.MetadataPhase, []tracker.TrackerPeer{{Host: embedded.Host, Port: embedded.Port}})
 	}
 
 	backoff := config.Backoff

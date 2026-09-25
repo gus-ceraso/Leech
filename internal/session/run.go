@@ -521,10 +521,10 @@ func (c *coordinator) startTransferPhase(ctx context.Context, source torrent.Sou
 		return err
 	}
 	for _, candidate := range c.metadataEndpoints {
-		_, _ = pool.Add(candidate)
+		_, _ = pool.AddFrom(candidate.Source, candidate)
 	}
 	for _, endpoint := range peersForSource(source) {
-		c.updateQueue.enqueuePeers(tracker.TransferPhase, []tracker.TrackerPeer{{Host: endpoint.Host, Port: endpoint.Port}})
+		c.updateQueue.enqueuePeersFrom(magnetPeerSource, tracker.TransferPhase, []tracker.TrackerPeer{{Host: endpoint.Host, Port: endpoint.Port}})
 	}
 	c.poolMu.Lock()
 	c.pool = pool

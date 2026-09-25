@@ -114,7 +114,7 @@ func TestCandidatePoolTriesLaterPeerBeforeFullOlderPool(t *testing.T) {
 			t.Fatalf("add initial candidate %d: %v", index, err)
 		}
 	}
-	good := ResolvedCandidate{Endpoint: Endpoint{Addr: netip.MustParseAddr("203.0.113.1"), Port: 51413}}
+	good := ResolvedCandidate{Endpoint: Endpoint{Addr: netip.MustParseAddr("203.0.113.1"), Port: 51413}, Source: DefaultCandidateSource}
 	// A later tracker can replace a stale entry and should be dialed first.
 	if _, err := pool.Add(good); err != nil {
 		t.Fatalf("add later tracker candidate: %v", err)
@@ -152,6 +152,131 @@ func TestCandidatePoolTriesLaterPeerBeforeFullOlderPool(t *testing.T) {
 	if len(attempted) != 1 || attempted[0] != good.Endpoint.String() {
 		t.Fatalf("dial attempts = %v, want the later peer first", attempted)
 	}
+}
+
+func TestCandidatePoolKeepsCapacityFairAcrossSources(t *testing.T) {
+	pool, err := NewCandidatePool(CandidatePoolConfig{MaxCandidates: 3})
+	if err != nil {
+		t.Fatalf("NewCandidatePool: %v", err)
+	}
+	endpoint := func(last byte) ResolvedCandidate {
+		return ResolvedCandidate{Endpoint: Endpoint{Addr: netip.AddrFrom4([4]byte{192, 0, 2, last}), Port: 51413}}
+	}
+	from := func(source string, candidate ResolvedCandidate) bool {
+		t.Helper()
+		added, err := pool.AddFrom(source, candidate)
+		if err != nil {
+			t.Fatalf("AddFrom(%q, %s): %v", source, candidate.Endpoint, err)
+		}
+		return added
+	}
+	a := []ResolvedCandidate{endpoint(1), endpoint(2), endpoint(3)}
+	for _, candidate := range a {
+		if !from("tracker-A", candidate) {
+			t.Fatalf("first admission of %s was not added", candidate.Endpoint)
+		}
+	}
+	good := endpoint(4)
+	if !from("tracker-B", good) {
+		t.Fatal("new source's endpoint was not admitted")
+	}
+
+	// A full reannouncement cycles the one A endpoint displaced by B. It must
+	// not cycle B out, regardless of how many times A repeats the same set.
+	for round := 0; round < 5; round++ {
+		for _, candidate := range a {
+			from("tracker-A", candidate)
+		}
+		if !candidatePresent(pool.Snapshot(), good.Endpoint) {
+			t.Fatalf("tracker-B endpoint evicted during A reannouncement round %d", round)
+		}
+	}
+
+	// A source with fewer owned slots can grow by evicting from the
+	// overrepresented source.
+	bSecond := endpoint(5)
+	if !from("tracker-B", bSecond) {
+		t.Fatal("underrepresented tracker-B did not grow")
+	}
+	if !candidatePresent(pool.Snapshot(), good.Endpoint) || !candidatePresent(pool.Snapshot(), bSecond.Endpoint) {
+		t.Fatalf("tracker-B candidates did not both remain after growth: %+v", pool.Snapshot())
+	}
+
+	// Duplicates retain endpoint identity and capacity ownership while the most
+	// recent tracker-supplied expected peer ID replaces the stale value.
+	refreshedID := [20]byte{7, 8, 9}
+	duplicate := a[2]
+	duplicate.ExpectedPeerID = refreshedID
+	duplicate.HasExpectedID = true
+	if from("tracker-B", duplicate) {
+		t.Fatal("duplicate endpoint consumed another pool slot")
+	}
+	var refreshed *ResolvedCandidate
+	for _, candidate := range pool.Snapshot() {
+		if candidate.Endpoint == duplicate.Endpoint {
+			copy := candidate
+			refreshed = &copy
+			break
+		}
+	}
+	if refreshed == nil || !refreshed.HasExpectedID || refreshed.ExpectedPeerID != refreshedID || refreshed.Source != "tracker-A" {
+		t.Fatalf("duplicate refresh = %+v, want refreshed ID and incumbent source ownership", refreshed)
+	}
+	if pool.Len() != 3 {
+		t.Fatalf("pool size after duplicate refresh = %d, want 3", pool.Len())
+	}
+}
+
+func TestCandidatePoolMaintainsPerSourceOldestIndex(t *testing.T) {
+	pool, err := NewCandidatePool(CandidatePoolConfig{MaxCandidates: 3})
+	if err != nil {
+		t.Fatalf("NewCandidatePool: %v", err)
+	}
+	candidate := func(last byte) ResolvedCandidate {
+		return ResolvedCandidate{Endpoint: Endpoint{Addr: netip.AddrFrom4([4]byte{192, 0, 2, last}), Port: 51413}}
+	}
+	for _, last := range []byte{1, 2, 3} {
+		if _, err := pool.AddFrom("tracker-A", candidate(last)); err != nil {
+			t.Fatalf("add A%d: %v", last, err)
+		}
+	}
+	if _, err := pool.AddFrom("tracker-B", candidate(4)); err != nil {
+		t.Fatalf("add B4: %v", err)
+	}
+	assertOldest := func(source string, want Endpoint) {
+		t.Helper()
+		queue := pool.sourceOrder[source]
+		if queue == nil || queue.Front() == nil {
+			t.Fatalf("source %q has no per-source LRU entry", source)
+		}
+		entry := queue.Front().Value.(*candidatePoolEntry)
+		if entry.candidate.Endpoint != want || pool.sourceCount[source] != queue.Len() {
+			t.Fatalf("source %q oldest/count/index = %s/%d/%d, want oldest %s", source, entry.candidate.Endpoint, pool.sourceCount[source], queue.Len(), want)
+		}
+	}
+	assertOldest("tracker-A", candidate(2).Endpoint)
+	if _, err := pool.AddFrom("tracker-A", candidate(2)); err != nil {
+		t.Fatalf("refresh A2: %v", err)
+	}
+	assertOldest("tracker-A", candidate(3).Endpoint)
+	if _, err := pool.AddFrom("tracker-A", candidate(1)); err != nil {
+		t.Fatalf("re-admit A1: %v", err)
+	}
+	// A owns two of three slots, so this admission evicts its source-local
+	// oldest entry without scanning the global candidate order.
+	assertOldest("tracker-A", candidate(2).Endpoint)
+	if candidatePresent(pool.Snapshot(), candidate(3).Endpoint) {
+		t.Fatal("source-local oldest candidate A3 was not evicted")
+	}
+}
+
+func candidatePresent(candidates []ResolvedCandidate, endpoint Endpoint) bool {
+	for _, candidate := range candidates {
+		if candidate.Endpoint == endpoint {
+			return true
+		}
+	}
+	return false
 }
 
 func TestCandidatePoolRefreshClearsStaleExpectedPeerID(t *testing.T) {

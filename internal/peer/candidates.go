@@ -24,6 +24,11 @@ var (
 	ErrCandidateDNS   = errors.New("peer candidate resolution failed")
 )
 
+// DefaultCandidateSource is used by Add and Admit when the caller has no
+// source identity. Session code should use AddFrom or AdmitFrom for tracker
+// and magnet announcements.
+const DefaultCandidateSource = "default"
+
 // Candidate is an endpoint received from a tracker or a magnet. Host may be
 // an IP literal or a DNS name. A tracker-supplied peer ID is only an optional
 // expected handshake value; it never participates in endpoint deduplication.
@@ -40,6 +45,10 @@ type ResolvedCandidate struct {
 	Endpoint       Endpoint
 	ExpectedPeerID [20]byte
 	HasExpectedID  bool
+	// Source is the source that currently owns this candidate's pool slot.
+	// Duplicate announcements refresh the expected peer ID without changing
+	// slot ownership.
+	Source string
 }
 
 // String renders an endpoint in the standard host:port form used by dialers
@@ -73,9 +82,11 @@ type CandidatePool struct {
 	maxCandidates int
 	maxDNSAnswers int
 
-	mu         sync.Mutex
-	candidates map[Endpoint]*list.Element
-	order      list.List
+	mu          sync.Mutex
+	candidates  map[Endpoint]*list.Element
+	sourceCount map[string]int
+	sourceOrder map[string]*list.List
+	order       list.List
 }
 
 // NewCandidatePool validates bounds and returns an empty candidate set.
@@ -100,6 +111,8 @@ func NewCandidatePool(config CandidatePoolConfig) (*CandidatePool, error) {
 		maxCandidates: maxCandidates,
 		maxDNSAnswers: maxDNSAnswers,
 		candidates:    make(map[Endpoint]*list.Element),
+		sourceCount:   make(map[string]int),
+		sourceOrder:   make(map[string]*list.List),
 	}, nil
 }
 
@@ -210,6 +223,12 @@ func withExpected(endpoint Endpoint, candidate Candidate) ResolvedCandidate {
 // Admit resolves and adds one candidate. Duplicate endpoints are refreshed
 // with the newest optional expected ID and return false.
 func (p *CandidatePool) Admit(ctx context.Context, candidate Candidate) ([]ResolvedCandidate, error) {
+	return p.AdmitFrom(ctx, DefaultCandidateSource, candidate)
+}
+
+// AdmitFrom resolves and adds one candidate under source's capacity share.
+// An empty source uses DefaultCandidateSource.
+func (p *CandidatePool) AdmitFrom(ctx context.Context, source string, candidate Candidate) ([]ResolvedCandidate, error) {
 	if p == nil {
 		return nil, ErrCandidateConfig
 	}
@@ -217,9 +236,13 @@ func (p *CandidatePool) Admit(ctx context.Context, candidate Candidate) ([]Resol
 	if err != nil {
 		return nil, err
 	}
+	if source == "" {
+		source = DefaultCandidateSource
+	}
 	added := make([]ResolvedCandidate, 0, len(resolved))
 	for _, item := range resolved {
-		ok, err := p.Add(item)
+		item.Source = source
+		ok, err := p.AddFrom(source, item)
 		if err != nil {
 			return added, err
 		}
@@ -230,15 +253,27 @@ func (p *CandidatePool) Admit(ctx context.Context, candidate Candidate) ([]Resol
 	return added, nil
 }
 
-// Add inserts or refreshes one already-resolved candidate. It performs the
-// same endpoint normalization as NormalizeEndpoint, so callers cannot bypass
-// admission filtering by skipping DNS. A duplicate refreshes its optional
-// expected ID and moves to the newest position. At capacity, the least
-// recently announced endpoint is evicted. Endpoint health and live-connection
-// state are owned elsewhere and are not changed.
+// Add inserts or refreshes one already-resolved candidate under the default
+// source. It performs the same endpoint normalization as NormalizeEndpoint,
+// so callers cannot bypass admission filtering by skipping DNS. A duplicate
+// refreshes its optional expected ID and moves to the newest position.
 func (p *CandidatePool) Add(candidate ResolvedCandidate) (bool, error) {
+	return p.AddFrom(DefaultCandidateSource, candidate)
+}
+
+// AddFrom inserts or refreshes one already-resolved candidate under source's
+// capacity share. When full, admission evicts from the most represented other
+// source if source is underrepresented; otherwise it replaces the oldest
+// candidate owned by source. This lets a lone source use the full pool while
+// preventing repeated full announcements from one source from cycling out all
+// candidates admitted by another. Slot ownership is independent of endpoint
+// health, live connections, and strikes.
+func (p *CandidatePool) AddFrom(source string, candidate ResolvedCandidate) (bool, error) {
 	if p == nil {
 		return false, ErrCandidateConfig
+	}
+	if source == "" {
+		source = DefaultCandidateSource
 	}
 	endpoint, err := NormalizeEndpoint(candidate.Endpoint)
 	if err != nil {
@@ -251,22 +286,74 @@ func (p *CandidatePool) Add(candidate ResolvedCandidate) (bool, error) {
 		entry := current.Value.(*candidatePoolEntry)
 		entry.candidate.ExpectedPeerID = candidate.ExpectedPeerID
 		entry.candidate.HasExpectedID = candidate.HasExpectedID
+		// Keep the incumbent source's capacity ownership. A duplicate doesn't
+		// consume another pool slot or transfer the incumbent's share.
 		p.order.MoveToBack(current)
+		p.sourceOrder[entry.candidate.Source].MoveToBack(entry.sourceElement)
 		return false, nil
 	}
 	if len(p.candidates) >= p.maxCandidates {
-		oldest := p.order.Front()
-		entry := oldest.Value.(*candidatePoolEntry)
-		delete(p.candidates, entry.candidate.Endpoint)
-		p.order.Remove(oldest)
+		p.evictForSourceLocked(source)
 	}
-	element := p.order.PushBack(&candidatePoolEntry{candidate: candidate})
+	candidate.Source = source
+	entry := &candidatePoolEntry{candidate: candidate}
+	element := p.order.PushBack(entry)
+	entry.globalElement = element
+	if p.sourceOrder[source] == nil {
+		p.sourceOrder[source] = &list.List{}
+	}
+	entry.sourceElement = p.sourceOrder[source].PushBack(entry)
 	p.candidates[endpoint] = element
+	p.sourceCount[source]++
 	return true, nil
 }
 
+func (p *CandidatePool) evictForSourceLocked(source string) {
+	ownCount := p.sourceCount[source]
+	maxOtherCount := 0
+	maxOtherSource := ""
+	for other, count := range p.sourceCount {
+		if other == source {
+			continue
+		}
+		if count > maxOtherCount || count == maxOtherCount && (maxOtherSource == "" || other < maxOtherSource) {
+			maxOtherCount, maxOtherSource = count, other
+		}
+	}
+
+	// If source is new or underrepresented, remove the oldest candidate from
+	// the most represented other source. The bounded source map chooses a
+	// deterministic source on ties; its per-source LRU provides the victim in
+	// constant time. Otherwise replace source's own oldest candidate.
+	preferOther := ownCount == 0 || maxOtherCount > ownCount
+	target := source
+	if preferOther {
+		target = maxOtherSource
+	}
+	if target != "" {
+		if sourceOrder := p.sourceOrder[target]; sourceOrder != nil && sourceOrder.Front() != nil {
+			p.removeEntryLocked(sourceOrder.Front().Value.(*candidatePoolEntry))
+		}
+	}
+}
+
+func (p *CandidatePool) removeEntryLocked(entry *candidatePoolEntry) {
+	delete(p.candidates, entry.candidate.Endpoint)
+	p.order.Remove(entry.globalElement)
+	source := entry.candidate.Source
+	perSource := p.sourceOrder[source]
+	perSource.Remove(entry.sourceElement)
+	p.sourceCount[source]--
+	if p.sourceCount[source] == 0 {
+		delete(p.sourceCount, source)
+		delete(p.sourceOrder, source)
+	}
+}
+
 type candidatePoolEntry struct {
-	candidate ResolvedCandidate
+	candidate     ResolvedCandidate
+	globalElement *list.Element
+	sourceElement *list.Element
 }
 
 // Snapshot returns an independent newest-announcement-first candidate slice.
