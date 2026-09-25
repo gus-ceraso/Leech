@@ -41,7 +41,10 @@ func (d *Dialer) DialContext(ctx context.Context, network, address string) (net.
 		_ = raw.Close()
 		return nil, fmt.Errorf("utp: UDP dial returned %T", raw)
 	}
-	conn, err := NewConn(ctx, udp)
+	// The caller's context bounds setup, not the lifetime of a successfully
+	// returned net.Conn. DialContext closes and joins this worker if setup is
+	// canceled or fails below.
+	conn, err := NewConn(context.Background(), udp)
 	if err != nil {
 		_ = udp.Close()
 		return nil, err

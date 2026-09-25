@@ -56,6 +56,40 @@ func TestDialContextStreamAndAddresses(t *testing.T) {
 	}
 }
 
+func TestDialContextCancellationAfterEstablishmentKeepsStream(t *testing.T) {
+	server, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	serverErr := make(chan error, 1)
+	go func() { serverErr <- serveOne(t, server) }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	conn, err := DialContext(ctx, "utp4", server.LocalAddr().String())
+	if err != nil {
+		cancel()
+		t.Fatalf("DialContext: %v", err)
+	}
+	cancel()
+	defer conn.Close()
+
+	want := []byte("connection outlives dial context")
+	if n, err := conn.Write(want); n != len(want) || err != nil {
+		t.Fatalf("Write = %d, %v", n, err)
+	}
+	got := make([]byte, len(want))
+	if _, err := io.ReadFull(conn, got); err != nil {
+		t.Fatalf("ReadFull after context cancellation: %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("echo = %q, want %q", got, want)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestConnReadDeadlineAndCloseUnblock(t *testing.T) {
 	server, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
@@ -107,16 +141,48 @@ func TestDialContextCancellationJoinsWorker(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer server.Close()
-	ctx, cancel := context.WithTimeout(context.Background(), 35*time.Millisecond)
-	defer cancel()
+	type synResult struct {
+		addr *net.UDPAddr
+		err  error
+	}
+	synReceived := make(chan synResult, 1)
+	go func() {
+		packet, addr, err := readPacket(server)
+		if err == nil && packet.Type != Syn {
+			err = errors.New("first packet was not SYN")
+		}
+		synReceived <- synResult{addr: addr, err: err}
+	}()
+	ctx, cancel := context.WithCancel(context.Background())
+	dialResult := make(chan error, 1)
+	go func() {
+		conn, err := DialContext(ctx, "utp4", server.LocalAddr().String())
+		if conn != nil {
+			_ = conn.Close()
+		}
+		dialResult <- err
+	}()
+	syn := <-synReceived
+	if syn.err != nil {
+		cancel()
+		t.Fatal(syn.err)
+	}
 	start := time.Now()
-	_, err = DialContext(ctx, "utp4", server.LocalAddr().String())
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("DialContext error = %v, want deadline", err)
+	cancel()
+	err = <-dialResult
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("DialContext error = %v, want cancellation", err)
 	}
 	if time.Since(start) > time.Second {
 		t.Fatalf("canceled dial took too long: %s", time.Since(start))
 	}
+	// Rebinding the client's observed local UDP endpoint proves that the
+	// canceled, not-yet-established connection released its socket.
+	rebound, err := net.ListenUDP("udp4", syn.addr)
+	if err != nil {
+		t.Fatalf("canceled dial kept UDP socket bound at %v: %v", syn.addr, err)
+	}
+	_ = rebound.Close()
 }
 
 func TestDialContextPreEstablishmentResetFailsImmediately(t *testing.T) {
