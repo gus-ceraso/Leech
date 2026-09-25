@@ -350,7 +350,55 @@ func FuzzReadMessage(f *testing.F) {
 	f.Add([]byte{0, 0, 0, 1, HaveNoneID})
 	f.Add(extensionFrame(ExtensionHandshakeID, []byte("d1:md11:ut_metadatai9ee13:metadata_sizei32769ee")))
 	f.Fuzz(func(t *testing.T, wire []byte) {
-		_, _ = ReadMessage(newChunkConn(wire, 3))
+		message, err := ReadMessage(newChunkConn(wire, 3))
+		if err != nil {
+			return
+		}
+		if len(wire) < 4 {
+			t.Fatalf("successful parse from %d-byte input", len(wire))
+		}
+		frameLength := binary.BigEndian.Uint32(wire[:4])
+		if frameLength > MaxPeerFrameBytes || uint64(len(wire)) < uint64(frameLength)+4 {
+			t.Fatalf("successful parse of incomplete or oversized frame: length=%d input=%d", frameLength, len(wire))
+		}
+		if frameLength == 0 {
+			if !message.KeepAlive || message.ID != 0 || len(message.Payload) != 0 {
+				t.Fatalf("zero-length frame decoded as %#v", message)
+			}
+			return
+		}
+		if message.KeepAlive || message.ID != wire[4] {
+			t.Fatalf("frame ID decoded as %#v, wire ID=%d", message, wire[4])
+		}
+		body := wire[5 : 4+int(frameLength)]
+		if len(message.Payload) > len(body) {
+			t.Fatalf("returned payload length %d exceeds frame body %d", len(message.Payload), len(body))
+		}
+		if message.ID == ExtendedID {
+			if len(body) == 0 {
+				t.Fatal("successful extended frame has no extension ID")
+			}
+			if body[0] != ExtensionHandshakeID && body[0] != defaultUtMetadataID {
+				if !bytes.Equal(message.Payload, body[:1]) {
+					t.Fatalf("unknown extension retained %x, want only ID %d", message.Payload, body[0])
+				}
+			} else if !bytes.Equal(message.Payload, body) {
+				t.Fatalf("known extension payload = %x, want %x", message.Payload, body)
+			}
+			return
+		}
+		switch message.ID {
+		case ChokeID, UnchokeID, InterestedID, NotInterestedID, HaveID, BitfieldID,
+			RequestID, PieceID, CancelID, SuggestID, HaveAllID, HaveNoneID,
+			RejectRequestID, AllowedFastID:
+			if !bytes.Equal(message.Payload, body) {
+				t.Fatalf("message %d payload = %x, want frame body %x", message.ID, message.Payload, body)
+			}
+		default:
+			if len(message.Payload) != 0 {
+				t.Fatalf("unknown core ID %d retained payload %x", message.ID, message.Payload)
+			}
+		}
 	})
 }
 
@@ -362,6 +410,21 @@ func FuzzReadHandshake(f *testing.F) {
 	}
 	f.Add(valid.writes.Bytes())
 	f.Fuzz(func(t *testing.T, wire []byte) {
-		_, _ = ReadHandshake(newChunkConn(wire, 3), nil, nil)
+		handshake, err := ReadHandshake(newChunkConn(wire, 3), nil, nil)
+		if err != nil {
+			return
+		}
+		if len(wire) < HandshakeBytes {
+			t.Fatalf("successful parse from %d-byte handshake input", len(wire))
+		}
+		pstrEnd := 1 + len(ProtocolName)
+		if wire[0] != byte(len(ProtocolName)) || !bytes.Equal(wire[1:pstrEnd], []byte(ProtocolName)) {
+			t.Fatalf("successful handshake has invalid protocol bytes: %x", wire[:pstrEnd])
+		}
+		if !bytes.Equal(handshake.Reserved[:], wire[pstrEnd:pstrEnd+8]) ||
+			!bytes.Equal(handshake.InfoHash[:], wire[pstrEnd+8:pstrEnd+28]) ||
+			!bytes.Equal(handshake.PeerID[:], wire[pstrEnd+28:pstrEnd+48]) {
+			t.Fatalf("handshake fields do not match input bytes: %#v", handshake)
+		}
 	})
 }
