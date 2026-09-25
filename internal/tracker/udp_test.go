@@ -387,6 +387,177 @@ func TestUDPBEP15RetrySchedule(t *testing.T) {
 	}
 }
 
+func TestUDPAnnounceRefreshesConnectionIDAtExpiredRetry(t *testing.T) {
+	clock := newFixtureClock()
+	clock.now = time.Unix(0, 0)
+	var conns []*fixtureConn
+	created := make(chan *fixtureConn, 2)
+	var events []string
+	var refreshAt time.Time
+	dialer := fixtureDialer{factory: func() net.Conn {
+		index := len(conns)
+		var conn *fixtureConn
+		conn = newFixtureConn(func(packet []byte) {
+			action := binary.BigEndian.Uint32(packet[8:12])
+			if index == 0 {
+				switch action {
+				case 0:
+					clock.advance(time.Second) // connection ID arrives at t=1
+					conn.push(connectResponse(packet, 1))
+				case 1:
+					if len(events) == 0 {
+						clock.advance(time.Second) // first announce is sent at t=2
+					}
+					events = append(events, "announce-old")
+				}
+				return
+			}
+			switch action {
+			case 0:
+				events = append(events, "connect-refresh")
+				refreshAt = clock.Now()
+				conn.push(connectResponse(packet, 2))
+			case 1:
+				events = append(events, "announce-fresh")
+				conn.push(announceResponse(packet))
+			}
+		})
+		conns = append(conns, conn)
+		created <- conn
+		return conn
+	}}
+	client := NewUDPClient(Config{
+		Resolver: fixtureResolver{ips: []net.IPAddr{{IP: net.ParseIP("127.0.0.1")}}},
+		Dialer:   dialer,
+		Clock:    clock,
+		Random:   bytesReader{0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3},
+	})
+	done := make(chan error, 1)
+	go func() {
+		_, err := client.Announce(context.Background(), "udp://tracker.test:1", testRequest())
+		done <- err
+	}()
+	oldConn := waitFixtureConn(t, created)
+	waitFixtureWrites(t, oldConn, 2)
+	for i, delay := range []time.Duration{15 * time.Second, 30 * time.Second, 60 * time.Second} {
+		timer := clock.nextActive(t)
+		clock.advance(delay)
+		clock.fire(timer)
+		if i < 2 {
+			waitFixtureWrites(t, oldConn, 3+i)
+		}
+	}
+	newConn := waitFixtureConn(t, created)
+	waitFixtureWrites(t, newConn, 2)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("announce: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("announce did not finish after refreshing the connection ID")
+	}
+	if got := binary.BigEndian.Uint64(newConn.writeAt(1)[:8]); got != 2 {
+		t.Fatalf("refreshed announce connection ID = %d, want 2", got)
+	}
+	if len(events) != 5 || events[0] != "announce-old" || events[1] != "announce-old" || events[2] != "announce-old" || events[3] != "connect-refresh" || events[4] != "announce-fresh" {
+		t.Fatalf("packet order = %v", events)
+	}
+	if want := time.Unix(0, 0).Add(107 * time.Second); !refreshAt.Equal(want) {
+		t.Fatalf("refresh connect sent at %v, want %v", refreshAt, want)
+	}
+	if got := oldConn.writeCount(); got != 4 {
+		t.Fatalf("old socket writes = %d, want connect + initial and two pre-expiry retries", got)
+	}
+}
+
+func TestUDPCancelDuringAnnounceConnectionRefresh(t *testing.T) {
+	clock := newFixtureClock()
+	clock.now = time.Unix(0, 0)
+	var conns []*fixtureConn
+	created := make(chan *fixtureConn, 2)
+	dialer := fixtureDialer{factory: func() net.Conn {
+		index := len(conns)
+		firstAnnounce := true
+		var conn *fixtureConn
+		conn = newFixtureConn(func(packet []byte) {
+			switch binary.BigEndian.Uint32(packet[8:12]) {
+			case 0:
+				if index == 0 {
+					clock.advance(time.Second)
+					conn.push(connectResponse(packet, 1))
+				}
+			case 1:
+				if index == 0 && firstAnnounce {
+					clock.advance(time.Second)
+					firstAnnounce = false
+				}
+			}
+		})
+		conns = append(conns, conn)
+		created <- conn
+		return conn
+	}}
+	client := NewUDPClient(Config{
+		Resolver: fixtureResolver{ips: []net.IPAddr{{IP: net.ParseIP("127.0.0.1")}}},
+		Dialer:   dialer,
+		Clock:    clock,
+		Random:   bytesReader{0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3},
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { _, err := client.Announce(ctx, "udp://tracker.test:1", testRequest()); done <- err }()
+	oldConn := waitFixtureConn(t, created)
+	waitFixtureWrites(t, oldConn, 2)
+	for i, delay := range []time.Duration{15 * time.Second, 30 * time.Second, 60 * time.Second} {
+		timer := clock.nextActive(t)
+		clock.advance(delay)
+		clock.fire(timer)
+		if i < 2 {
+			waitFixtureWrites(t, oldConn, 3+i)
+		}
+	}
+	newConn := waitFixtureConn(t, created)
+	waitFixtureWrites(t, newConn, 1)
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("announce error = %v, want context cancellation", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cancellation did not join the reconnect transaction")
+	}
+	select {
+	case <-newConn.closed:
+	default:
+		t.Fatal("reconnect socket remains open after cancellation")
+	}
+}
+
+func waitFixtureConn(t *testing.T, created <-chan *fixtureConn) *fixtureConn {
+	t.Helper()
+	select {
+	case conn := <-created:
+		return conn
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for a tracker socket")
+		return nil
+	}
+}
+
+func waitFixtureWrites(t *testing.T, conn *fixtureConn, count int) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if conn.writeCount() >= count {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("socket writes = %d, want at least %d", conn.writeCount(), count)
+}
+
 func TestUDPAnnounceIPv6Peers(t *testing.T) {
 	packet := make([]byte, 20+18)
 	binary.BigEndian.PutUint32(packet[0:4], 1)

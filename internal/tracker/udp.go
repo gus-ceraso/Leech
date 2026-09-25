@@ -383,7 +383,25 @@ func (c *UDPClient) announceFamily(ctx context.Context, endpoint netip.AddrPort,
 	if conn == nil {
 		return udpAnnounceResponse{}, false, &Error{Code: ErrorDial, Operation: "announce", Err: errors.New("tracker socket closed")}
 	}
-	response, transmitted, err := c.exchange(ctx, conn, packet, tx, 1, "announce")
+	response, transmitted, err := c.exchangeWithRefresh(ctx, conn, packet, tx, 1, "announce", func() bool {
+		return !c.clock.Now().Before(s.expires)
+	}, func() (net.Conn, []byte, error) {
+		if err := c.ensureConnection(ctx, s, network); err != nil {
+			return nil, nil, err
+		}
+		packet, err := c.buildAnnounce(s.connID, req, urlData)
+		if err != nil {
+			return nil, nil, &Error{Code: ErrorInvalidURL, Operation: "announce", Err: err}
+		}
+		binary.BigEndian.PutUint32(packet[12:16], tx)
+		s.connMu.RLock()
+		conn := s.conn
+		s.connMu.RUnlock()
+		if conn == nil {
+			return nil, nil, &Error{Code: ErrorDial, Operation: "announce", Err: errors.New("tracker socket closed")}
+		}
+		return conn, packet, nil
+	})
 	if err != nil {
 		if transmitted && (errors.Is(err, ErrTimeout) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
 			c.invalidateLocked(s)
@@ -493,6 +511,14 @@ func (c *UDPClient) isClosed() bool {
 // through 15*2^8 seconds. A complete Write marks the transaction transmitted
 // before any response parsing occurs.
 func (c *UDPClient) exchange(ctx context.Context, conn net.Conn, packet []byte, tx uint32, action uint32, operation string) ([]byte, bool, error) {
+	return c.exchangeWithRefresh(ctx, conn, packet, tx, action, operation, nil, nil)
+}
+
+// exchangeWithRefresh keeps the announce transaction's retry counter while
+// allowing an expired connection ID to be refreshed at a retransmission.
+// refresh runs only after the current reader has been joined, so the exchange
+// never has competing readers on the old and replacement sockets.
+func (c *UDPClient) exchangeWithRefresh(ctx context.Context, conn net.Conn, packet []byte, tx uint32, action uint32, operation string, needsRefresh func() bool, refresh func() (net.Conn, []byte, error)) ([]byte, bool, error) {
 	if len(packet) > limits.DatagramBytes {
 		return nil, false, &Error{Code: ErrorWrite, Operation: operation, Err: errors.New("UDP datagram exceeds limit")}
 	}
@@ -517,30 +543,15 @@ func (c *UDPClient) exchange(ctx context.Context, conn net.Conn, packet []byte, 
 		return nil, transmitted, &Error{Code: ErrorWrite, Operation: operation, Transmitted: transmitted, Err: err}
 	}
 
-	reads := make(chan readResult, 1)
-	readDone := make(chan struct{})
-	go func() {
-		defer close(readDone)
-		readPacket(conn, reads)
-	}()
-	abort := make(chan struct{})
-	watchDone := make(chan struct{})
-	go func() {
-		defer close(watchDone)
-		select {
-		case <-ctx.Done():
-			_ = conn.Close()
-		case <-abort:
-		}
-	}()
+	workers := startExchangeIO(ctx, conn)
 	closeForCleanup := false
 	defer func() {
-		if closeForCleanup {
+		if closeForCleanup && conn != nil {
 			_ = conn.Close()
 		}
-		close(abort)
-		<-readDone
-		<-watchDone
+		if workers != nil {
+			workers.stop()
+		}
 	}()
 
 	attempt := 0
@@ -548,7 +559,7 @@ func (c *UDPClient) exchange(ctx context.Context, conn net.Conn, packet []byte, 
 	for {
 		timer := c.clock.NewTimer(retryDelay(attempt))
 		select {
-		case result := <-reads:
+		case result := <-workers.reads:
 			_ = timer.Stop()
 			if result.err != nil {
 				if ctxErr := ctx.Err(); ctxErr != nil {
@@ -585,7 +596,24 @@ func (c *UDPClient) exchange(ctx context.Context, conn net.Conn, packet []byte, 
 				closeForCleanup = true
 				return nil, transmitted, &Error{Code: ErrorCanceled, Operation: operation, Transmitted: transmitted, Err: err}
 			}
-			if err := write(); err != nil {
+			if refresh != nil && needsRefresh != nil && needsRefresh() {
+				// Stop the old reader before it can race a response from the
+				// replacement socket.
+				_ = conn.Close()
+				workers.stop()
+				workers = nil
+				newConn, newPacket, err := refresh()
+				if err != nil {
+					closeForCleanup = true
+					return nil, transmitted, err
+				}
+				conn, packet = newConn, newPacket
+				if err := write(); err != nil {
+					closeForCleanup = true
+					return nil, transmitted, &Error{Code: ErrorWrite, Operation: operation, Transmitted: transmitted, Err: err}
+				}
+				workers = startExchangeIO(ctx, conn)
+			} else if err := write(); err != nil {
 				closeForCleanup = true
 				return nil, transmitted, &Error{Code: ErrorWrite, Operation: operation, Transmitted: transmitted, Err: err}
 			}
@@ -601,6 +629,39 @@ func (c *UDPClient) exchange(ctx context.Context, conn net.Conn, packet []byte, 
 			return nil, transmitted, &Error{Code: ErrorCanceled, Operation: operation, Transmitted: transmitted, Err: ctx.Err()}
 		}
 	}
+}
+
+type exchangeIO struct {
+	reads     chan readResult
+	readDone  chan struct{}
+	abort     chan struct{}
+	watchDone chan struct{}
+}
+
+func startExchangeIO(ctx context.Context, conn net.Conn) *exchangeIO {
+	io := &exchangeIO{
+		reads: make(chan readResult, 1), readDone: make(chan struct{}),
+		abort: make(chan struct{}), watchDone: make(chan struct{}),
+	}
+	go func() {
+		defer close(io.readDone)
+		readPacket(conn, io.reads)
+	}()
+	go func() {
+		defer close(io.watchDone)
+		select {
+		case <-ctx.Done():
+			_ = conn.Close()
+		case <-io.abort:
+		}
+	}()
+	return io
+}
+
+func (io *exchangeIO) stop() {
+	close(io.abort)
+	<-io.readDone
+	<-io.watchDone
 }
 
 type readResult struct {
