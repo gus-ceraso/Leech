@@ -131,6 +131,40 @@ func TestRunRemoteListingCancelsWithoutNetwork(t *testing.T) {
 	}
 }
 
+func TestRunWithSessionEmitsProductionDebugPhaseDiagnostic(t *testing.T) {
+	info, _ := v1Info(t, []byte("x"))
+	torrentPath := writeV1Torrent(t, v1Metainfo(t, info, ""))
+	output := t.TempDir()
+	if err := os.WriteFile(filepath.Join(output, "payload.bin"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, level := range []LogLevel{LogDebug, LogInfo} {
+		t.Run(string(level), func(t *testing.T) {
+			var stderr bytes.Buffer
+			var callerEvents []session.Diagnostic
+			opts := Options{Source: torrentPath, Output: output, Resume: true, LogLevel: level}
+			if err := RunWithSession(context.Background(), opts, &bytes.Buffer{}, &stderr, session.RunConfig{
+				OnDiagnostic: func(event session.Diagnostic) { callerEvents = append(callerEvents, event) },
+			}); err != nil {
+				t.Fatal(err)
+			}
+			gotDebug := strings.Contains(stderr.String(), "debug: session phase=selection")
+			if gotDebug != (level == LogDebug) {
+				t.Fatalf("debug filtering at %s: %q", level, stderr.String())
+			}
+			if strings.Contains(stderr.String(), "status:") {
+				t.Fatalf("noninteractive stderr emitted periodic status: %q", stderr.String())
+			}
+			if level == LogDebug && strings.Index(stderr.String(), "debug: session phase=selection") > strings.Index(stderr.String(), "result: output is already complete") {
+				t.Fatalf("diagnostics were not drained before final output: %q", stderr.String())
+			}
+			if len(callerEvents) < 2 || callerEvents[0].Kind != session.DiagnosticPhaseTransition || callerEvents[0].Phase != "selection" {
+				t.Fatalf("caller diagnostic callback was not composed: %#v", callerEvents)
+			}
+		})
+	}
+}
+
 func TestRunWithSessionDoesNotClaimInvalidTorrentIsResumable(t *testing.T) {
 	torrentPath := filepath.Join(t.TempDir(), "bad.torrent")
 	if err := os.WriteFile(torrentPath, []byte("not bencode"), 0o600); err != nil {

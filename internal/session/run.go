@@ -88,6 +88,9 @@ type RunConfig struct {
 	newTimeoutTimer func(time.Duration) timeoutTimer
 	OnWarning       func(string)
 	OnSecondary     func(error)
+	// OnDiagnostic receives optional bounded read-only observations. Callbacks
+	// must return promptly; they run synchronously at session ownership points.
+	OnDiagnostic func(Diagnostic)
 }
 
 // RunResult describes the validated session result.  Metainfo and Selection
@@ -111,6 +114,33 @@ type RunProgress struct {
 	SelectedBytes         int64
 	ActivePeers           int
 	RecentRateBytesPerSec uint64
+}
+
+// DiagnosticKind identifies a bounded, read-only observation. Diagnostics are
+// separate from progress, warnings, and secondary failures.
+type DiagnosticKind uint8
+
+const (
+	DiagnosticPhaseTransition DiagnosticKind = iota + 1
+)
+
+// DiagnosticEndpoint contains only tracker scheme and host. Producers must not
+// place userinfo, path, query, or fragment data here.
+type DiagnosticEndpoint struct {
+	Scheme string
+	Host   string
+}
+
+// Diagnostic is a fixed-field observation. Text fields retained by a CLI
+// observer are bounded to 4096 aggregate bytes per record; queues are bounded
+// independently by the observer. Counts and durations remain typed values.
+type Diagnostic struct {
+	Kind     DiagnosticKind
+	Phase    string
+	Endpoint DiagnosticEndpoint
+	Count    uint64
+	Duration time.Duration
+	Detail   string
 }
 
 // RunSource parses raw source syntax and runs one session.
@@ -402,7 +432,13 @@ type coordinator struct {
 }
 
 func (c *coordinator) phase(name string) {
-	if c != nil && c.config.OnPhase != nil {
+	if c == nil {
+		return
+	}
+	if c.config.OnDiagnostic != nil {
+		c.config.OnDiagnostic(Diagnostic{Kind: DiagnosticPhaseTransition, Phase: name})
+	}
+	if c.config.OnPhase != nil {
 		c.config.OnPhase(name)
 	}
 }

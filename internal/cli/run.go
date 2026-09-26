@@ -63,6 +63,21 @@ func runWithReporter(ctx context.Context, opts Options, stdout io.Writer, depend
 		shown, err := reporter.renderStatus(activeStatus)
 		pending = !shown && err == nil
 	}
+	diagnostics := newDiagnosticQueue()
+	diagnosticDone := make(chan struct{})
+	go func() {
+		defer close(diagnosticDone)
+		for diagnostic := range diagnostics.records {
+			renderDiagnostic(reporter, diagnostic)
+		}
+		if dropped := diagnostics.dropped.Load(); dropped != 0 {
+			_ = reporter.Debug("diagnostics: dropped %d debug records because the queue was full", dropped)
+		}
+	}()
+	stopDiagnostics := func() {
+		close(diagnostics.records)
+		<-diagnosticDone
+	}
 	stopStatus := func() {}
 	if reporter.statusEnabled() {
 		stop := make(chan struct{})
@@ -90,6 +105,7 @@ func runWithReporter(ctx context.Context, opts Options, stdout io.Writer, depend
 	oldPhaseStatus := dependencies.OnPhaseStatus
 	oldStatus := dependencies.OnStatus
 	oldWarning, oldSecondary := dependencies.OnWarning, dependencies.OnSecondary
+	oldDiagnostic := dependencies.OnDiagnostic
 	dependencies.OnPhase = func(phase string) {
 		if oldPhase != nil {
 			oldPhase(phase)
@@ -132,6 +148,12 @@ func runWithReporter(ctx context.Context, opts Options, stdout io.Writer, depend
 			statusMu.Unlock()
 		}
 	}
+	dependencies.OnDiagnostic = func(diagnostic session.Diagnostic) {
+		if oldDiagnostic != nil {
+			oldDiagnostic(diagnostic)
+		}
+		diagnostics.enqueue(diagnostic)
+	}
 	dependencies.OnWarning = func(message string) {
 		if oldWarning != nil {
 			oldWarning(message)
@@ -152,6 +174,7 @@ func runWithReporter(ctx context.Context, opts Options, stdout io.Writer, depend
 	}
 	result, err := session.Run(ctx, dependencies)
 	stopStatus()
+	stopDiagnostics()
 	if err != nil {
 		_ = reporter.PrimaryFailure(err, result.HasVerifiedOutput)
 		return err

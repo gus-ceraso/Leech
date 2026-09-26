@@ -18,6 +18,12 @@ exit; this package adapts arguments, reporting, and signals to `session.Run`.
 - Preserve the distinction between primary failure and secondary diagnostics,
   and between completed selection, completed torrent, already-valid resume, and
   retained verified partial output.
+- Session diagnostics use a CLI-owned nonblocking queue of 128 fixed-field
+  records. Sanitize and truncate before enqueueing; retain at most 4096 aggregate
+  text bytes plus fixed fields per record. Saturating drop accounting applies
+  only to debug records. Consume diagnostics even on noninteractive stderr and
+  join the consumer before final output; status remains separately TTY/level
+  gated. Tracker identifiers retain scheme and host only.
 - Keep phase/progress reporting testable with controlled time and TTY state.
   Phase-entry status uses `OnPhaseStatus`; `OnProgress` remains commit-only.
   Live transfer `OnStatus` refreshes the same display without affecting the
