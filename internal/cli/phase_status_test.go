@@ -202,7 +202,7 @@ func TestCLIStatusReturnsAfterRapidResumeToStalledTransfer(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(output, "payload.bin"), data[:16<<10], 0600); err != nil {
 		t.Fatal(err)
 	}
-	opts := parseV1Options(t, "--resume", "--loglevel=info", "--output", output, path)
+	opts := parseV1Options(t, "--resume", "--loglevel=debug", "--output", output, path)
 	fixture := &statusHeldTracker{started: make(chan struct{})}
 	stderr := &statusOutput{changed: make(chan struct{}, 1)}
 	var stdout bytes.Buffer
@@ -215,7 +215,7 @@ func TestCLIStatusReturnsAfterRapidResumeToStalledTransfer(t *testing.T) {
 		done <- runWithReporter(ctx, opts, &stdout, session.RunConfig{
 			HTTP: fixture, CacheRoot: cache,
 			OnProgress: func(session.RunProgress) { commits.Add(1) },
-		}, statusReporter(stderr, LogInfo, true, &clock))
+		}, statusReporter(stderr, LogDebug, true, &clock))
 	}()
 	select {
 	case <-fixture.started:
@@ -228,8 +228,15 @@ func TestCLIStatusReturnsAfterRapidResumeToStalledTransfer(t *testing.T) {
 		strings.Contains(initial, `status: phase="transfer"`) {
 		t.Fatalf("rapid phase transition did not exercise the throttle: %q", initial)
 	}
+	waitStatusOutput(t, stderr, "debug: session phase=transfer")
 	clock.Store(int64(2 * time.Second))
-	waitStatusOutput(t, stderr, `status: phase="transfer" verified=16384/32768 bytes peers=0 rate=0 B/s`)
+	transferStatus := `status: phase="transfer" verified=16384/32768 bytes peers=0 rate=0 B/s`
+	waitStatusOutput(t, stderr, transferStatus)
+	finalAt := strings.LastIndex(stderr.String(), transferStatus)
+	diagnosticAt := strings.LastIndex(stderr.String(), "debug: session phase=transfer")
+	if diagnosticAt < 0 || finalAt < diagnosticAt {
+		t.Fatalf("status was not restored after diagnostic: %q", stderr.String())
+	}
 	if commits.Load() != 0 {
 		t.Fatal("status refresh reported a committed piece")
 	}
