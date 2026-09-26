@@ -275,7 +275,7 @@ func TestCommittedFinalizeErrorSettlesPieceAndCallsVerifiedOnce(t *testing.T) {
 	}
 	removeErr := errors.New("staged file removal failed")
 	finalized := storage.FinalizeResult{Piece: piece(0, 0, int64(len(data))), OutputCommitted: true}
-	gotErr := transfer.settleFinalizedPiece(0, finalized.Piece, finalized, removeErr)
+	gotErr := transfer.settleFinalizedPiece(0, finalized.Piece, finalized, removeErr, 0)
 	if !errors.Is(gotErr, removeErr) {
 		t.Fatalf("settlement error = %v, want removal error", gotErr)
 	}
@@ -285,7 +285,7 @@ func TestCommittedFinalizeErrorSettlesPieceAndCallsVerifiedOnce(t *testing.T) {
 	if len(verified) != 1 || verified[0].SelectedBytes != int64(len(data)) {
 		t.Fatalf("verified callbacks = %#v, want one committed selected piece", verified)
 	}
-	if err := transfer.settleFinalizedPiece(0, finalized.Piece, finalized, removeErr); !errors.Is(err, removeErr) {
+	if err := transfer.settleFinalizedPiece(0, finalized.Piece, finalized, removeErr, 0); !errors.Is(err, removeErr) {
 		t.Fatalf("duplicate settlement error = %v, want original removal error", err)
 	}
 	if len(verified) != 1 {
@@ -919,7 +919,7 @@ func TestFinalizePieceCorruptStageCloseFailurePropagatesFatal(t *testing.T) {
 		t.Fatal(err)
 	}
 	transfer := &Transfer{scheduler: scheduler, stager: stager, output: plan, stages: map[int]*storage.PieceStage{0: stage}}
-	if err := transfer.finalizePiece(context.Background(), 0); !errors.Is(err, closeErr) || !errors.Is(err, storage.ErrStagingFatal) {
+	if err := transfer.finalizePiece(context.Background(), 0, 0); !errors.Is(err, closeErr) || !errors.Is(err, storage.ErrStagingFatal) {
 		t.Fatalf("finalizePiece error = %v, want injected close error and ErrStagingFatal", err)
 	}
 	if got := scheduler.StrikeCount(endpoint); got != 1 {

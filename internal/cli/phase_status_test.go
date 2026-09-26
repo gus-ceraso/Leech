@@ -285,6 +285,88 @@ func TestCLIStatusRetainsCommittedPieceProgress(t *testing.T) {
 	}
 }
 
+func TestCLIStatusTracksLivePeerAndPayloadRateWithoutCommit(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		partial bool
+	}{
+		{name: "choked peer disconnect"},
+		{name: "partial payload rate decay", partial: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			data := bytes.Repeat([]byte{'x'}, 32<<10)
+			info, hash := v1Info(t, data)
+			path := writeV1Torrent(t, v1Metainfo(t, info, ""))
+			peers := newV1Peers(t, hash, info, data, false)
+			peers.stall, peers.partial = !tc.partial, tc.partial
+			peers.failAfterFirst = true
+			fixture := &v1Tracker{}
+			config := v1SessionConfig(t, fixture, peers)
+			var clock atomic.Int64
+			clock.Store(int64(100 * time.Second))
+			statuses := make(chan session.RunProgress, 16)
+			config.OnStatus = func(progress session.RunProgress) {
+				statuses <- progress
+				clock.Add(int64(time.Second))
+			}
+			config.Now = func() time.Time { return time.Unix(0, clock.Load()) }
+			stderr := &statusOutput{changed: make(chan struct{}, 1)}
+			var stdout bytes.Buffer
+			opts := parseV1Options(t, "--loglevel=info", "--output", t.TempDir(), path)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			done := make(chan error, 1)
+			go func() {
+				done <- runWithReporter(ctx, opts, &stdout, config, statusReporter(stderr, LogInfo, true, &clock))
+			}()
+			waitProgress := func(check func(session.RunProgress) bool) session.RunProgress {
+				t.Helper()
+				timer := time.NewTimer(7 * time.Second)
+				defer timer.Stop()
+				for {
+					select {
+					case progress := <-statuses:
+						if check(progress) {
+							return progress
+						}
+					case <-timer.C:
+						t.Fatalf("status condition not observed; output=%q", stderr.String())
+					}
+				}
+			}
+			if tc.partial {
+				progress := waitProgress(func(progress session.RunProgress) bool { return progress.RecentRateBytesPerSec > 0 })
+				if progress.VerifiedSelectedBytes != 0 || progress.ActivePeers != 1 {
+					t.Fatalf("partial payload status = %+v", progress)
+				}
+				progress = waitProgress(func(progress session.RunProgress) bool { return progress.RecentRateBytesPerSec == 0 })
+				if progress.VerifiedSelectedBytes != 0 {
+					t.Fatalf("rate decay changed verified bytes: %+v", progress)
+				}
+			} else {
+				progress := waitProgress(func(progress session.RunProgress) bool { return progress.ActivePeers == 1 })
+				if progress.VerifiedSelectedBytes != 0 {
+					t.Fatalf("choked peer status = %+v", progress)
+				}
+				peers.close()
+				progress = waitProgress(func(progress session.RunProgress) bool { return progress.ActivePeers == 0 })
+				if progress.VerifiedSelectedBytes != 0 {
+					t.Fatalf("disconnect status = %+v", progress)
+				}
+			}
+			cancel()
+			select {
+			case <-done:
+			case <-time.After(7 * time.Second):
+				t.Fatal("status run did not join")
+			}
+			if stdout.Len() != 0 {
+				t.Fatalf("status wrote stdout: %q", stdout.String())
+			}
+		})
+	}
+}
+
 func TestStatusThrottleSurvivesPermanentLinesAndFastPhases(t *testing.T) {
 	var output bytes.Buffer
 	// A zero clock is intentional: even the first timestamp must survive

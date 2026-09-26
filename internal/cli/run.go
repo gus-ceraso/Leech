@@ -88,6 +88,7 @@ func runWithReporter(ctx context.Context, opts Options, stdout io.Writer, depend
 	}
 	oldPhase, oldProgress := dependencies.OnPhase, dependencies.OnProgress
 	oldPhaseStatus := dependencies.OnPhaseStatus
+	oldStatus := dependencies.OnStatus
 	oldWarning, oldSecondary := dependencies.OnWarning, dependencies.OnSecondary
 	dependencies.OnPhase = func(phase string) {
 		if oldPhase != nil {
@@ -114,10 +115,22 @@ func runWithReporter(ctx context.Context, opts Options, stdout io.Writer, depend
 			oldProgress(progress)
 		}
 		statusMu.Lock()
-		activeStatus = Status{Phase: "transfer", VerifiedSelectedBytes: uint64(maxInt64(0, progress.VerifiedSelectedBytes)), SelectedBytes: uint64(maxInt64(0, progress.SelectedBytes)), ActivePeers: progress.ActivePeers, RecentRateBytesPerSec: progress.RecentRateBytesPerSec}
+		activeStatus = transferStatus(progress)
 		active = true
 		renderStatus()
 		statusMu.Unlock()
+	}
+	if reporter.statusEnabled() {
+		dependencies.OnStatus = func(progress session.RunProgress) {
+			if oldStatus != nil {
+				oldStatus(progress)
+			}
+			statusMu.Lock()
+			activeStatus = transferStatus(progress)
+			active = true
+			renderStatus()
+			statusMu.Unlock()
+		}
 	}
 	dependencies.OnWarning = func(message string) {
 		if oldWarning != nil {
@@ -158,6 +171,10 @@ func runWithReporter(ctx context.Context, opts Options, stdout io.Writer, depend
 	_ = reporter.ReportResult(Result{NoTransferNeeded: result.NoTransferNeeded,
 		SelectionComplete: result.SelectionComplete, TorrentComplete: result.TorrentComplete})
 	return nil
+}
+
+func transferStatus(progress session.RunProgress) Status {
+	return Status{Phase: "transfer", VerifiedSelectedBytes: uint64(maxInt64(0, progress.VerifiedSelectedBytes)), SelectedBytes: uint64(maxInt64(0, progress.SelectedBytes)), ActivePeers: progress.ActivePeers, RecentRateBytesPerSec: progress.RecentRateBytesPerSec}
 }
 
 func maxInt64(value, floor int64) int64 {

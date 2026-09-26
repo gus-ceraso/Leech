@@ -43,6 +43,11 @@ piece/request state, and `transfer.go` coordinates peer I/O and finalization.
 - The coordinator alone mutates rarity, request ownership, provenance, strikes,
   and completion. Give the finalizer immutable coverage snapshots. Worker
   callbacks and command enqueueing must not stall coordination indefinitely.
+  Transfer status snapshots run on the transfer coordinator's existing
+  replacement tick; it supplies admitted live-peer counts. The session owner
+  composes verified bytes and its five-second payload-rate window there. Keep
+  `OnProgress` commit-only: status observations never reset the no-progress
+  timer. Callbacks must return promptly.
 - Retire disconnected peers after a drive pass, once their workers have joined
   and no event index or iteration is in use. Clear removed slice references;
   keep endpoint penalties separately.

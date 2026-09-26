@@ -1149,6 +1149,8 @@ type v1PeerFixture struct {
 	metadataFirst   bool
 	stall           bool
 	withhold        bool
+	partial         bool
+	failAfterFirst  bool
 	calls           atomic.Int32
 	done            chan error
 	mu              sync.Mutex
@@ -1173,6 +1175,11 @@ func (f *v1PeerFixture) dial(ctx context.Context, _, _ string) (net.Conn, error)
 	f.servers = append(f.servers, server)
 	f.serverMu.Unlock()
 	phase := f.calls.Add(1)
+	if f.failAfterFirst && phase > 1 {
+		_ = server.Close()
+		_ = client.Close()
+		return nil, errors.New("fixture refuses reconnect")
+	}
 	go func() {
 		var err error
 		if f.metadataFirst && phase == 1 {
@@ -1322,6 +1329,10 @@ func (f *v1PeerFixture) serveTransfer(conn net.Conn) error {
 			binary.BigEndian.PutUint32(piece[4:8], begin)
 			copy(piece[8:], f.data[int(absoluteBegin):int(absoluteBegin+uint64(length))])
 			if err := v1WriteFrame(conn, v1RawMessage(peer.PieceID, piece)); err != nil {
+				return err
+			}
+			if f.partial {
+				_, err := io.Copy(io.Discard, conn)
 				return err
 			}
 			for position := int(absoluteBegin); position < int(absoluteBegin+uint64(length)); position++ {

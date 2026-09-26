@@ -20,8 +20,11 @@ exit; this package adapts arguments, reporting, and signals to `session.Run`.
   retained verified partial output.
 - Keep phase/progress reporting testable with controlled time and TTY state.
   Phase-entry status uses `OnPhaseStatus`; `OnProgress` remains commit-only.
-  Permanent lines clear the displayed status without resetting its one-second
-  throttle. One CLI-owned worker retries the latest deferred snapshot and joins
+  Live transfer `OnStatus` refreshes the same display without affecting the
+  session no-progress timer. Preserve caller callbacks and install CLI activity
+  observation only when status is enabled. Permanent lines clear the displayed
+  status without resetting its one-second throttle. One CLI-owned worker retries
+  the latest deferred snapshot and joins
   before final output, so a stalled phase still gets status after a fast change.
   Isolate platform terminal checks in `signals_terminal_*`.
 - Keep the signal owner live during graceful cleanup so a second signal can

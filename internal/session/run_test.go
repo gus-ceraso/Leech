@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -269,13 +270,18 @@ func TestRunNoProgressTimeoutRemainsPrimaryShutdownError(t *testing.T) {
 		t.Fatal(err)
 	}
 	secondary := make(chan error, 1)
+	var statuses atomic.Int32
 	_, err = Run(context.Background(), RunConfig{
 		Source: torrent.Source{Kind: torrent.SourcePath, Path: torrentPath}, OutputDir: root,
-		HTTP: noPeersTracker{}, CacheRoot: filepath.Join(root, "cache"), Timeout: 60 * time.Millisecond,
+		HTTP: noPeersTracker{}, CacheRoot: filepath.Join(root, "cache"), Timeout: 1400 * time.Millisecond,
+		OnStatus:    func(RunProgress) { statuses.Add(1) },
 		OnSecondary: func(err error) { secondary <- err },
 	})
 	if !errors.Is(err, ErrNoProgressTimeout) {
 		t.Fatalf("Run error = %v, want no-progress timeout", err)
+	}
+	if statuses.Load() == 0 {
+		t.Fatal("status refresh did not occur before the no-progress timeout")
 	}
 	select {
 	case secondaryErr := <-secondary:

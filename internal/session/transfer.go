@@ -44,6 +44,7 @@ type PieceVerified struct {
 	PieceIndex    int
 	PieceBytes    int64
 	SelectedBytes int64
+	ActivePeers   int
 }
 
 // ConnectedPeer is a transport that has already completed the BEP 3
@@ -94,6 +95,9 @@ type TransferConfig struct {
 	ResumeComplete []int
 	// OnPieceVerified must return promptly; it is called after output commit.
 	OnPieceVerified func(PieceVerified)
+	// OnStatus is called by the transfer coordinator on its existing one-second
+	// replacement tick with the count of admitted, live peers.
+	OnStatus func(int)
 	// OnPayloadReceived is called synchronously for every well-framed Piece
 	// body, before its terminal is accepted by PeerState or the scheduler. The
 	// count is the file payload length, excluding the piece index and offset.
@@ -122,6 +126,7 @@ type Transfer struct {
 	releasePeer            func(ConnectedPeer)
 	onPieceVerified        func(PieceVerified)
 	onPayloadReceived      func(int64) error
+	onStatus               func(int)
 	onEndpointBlacklisted  func(peer.Endpoint)
 	beforePeerShutdown     func() error
 	shutdownCallbackCalled bool
@@ -256,6 +261,7 @@ func NewTransfer(config TransferConfig) (*Transfer, error) {
 		releasePeer:           config.ReleasePeer,
 		onPieceVerified:       config.OnPieceVerified,
 		onPayloadReceived:     config.OnPayloadReceived,
+		onStatus:              config.OnStatus,
 		onEndpointBlacklisted: config.OnEndpointBlacklisted,
 		beforePeerShutdown:    config.BeforePeerShutdown,
 		now:                   config.Now,
@@ -397,6 +403,9 @@ func (t *Transfer) Run(ctx context.Context) error {
 		if result.ReplacementTick {
 			if err := t.rotateUnproductive(ctx, &peers); err != nil {
 				primary = err
+			}
+			if t.onStatus != nil {
+				t.onStatus(countLive(peers))
 			}
 			continue
 		}
@@ -1060,7 +1069,7 @@ func (t *Transfer) handleEventWithPeers(ctx context.Context, peers []*transferPe
 				return err
 			}
 			if result.Complete {
-				return t.finalizePiece(ctx, int(block.Index))
+				return t.finalizePiece(ctx, int(block.Index), countLive(peers))
 			}
 		case peer.TerminalReject:
 			delete(p.active, block)
@@ -1158,7 +1167,7 @@ func (t *Transfer) cancelRedundant(ctx context.Context, peers []*transferPeer, c
 	return nil
 }
 
-func (t *Transfer) finalizePiece(ctx context.Context, index int) error {
+func (t *Transfer) finalizePiece(ctx context.Context, index, activePeers int) error {
 	snapshot, err := t.scheduler.Snapshot(index)
 	if err != nil {
 		return err
@@ -1182,17 +1191,17 @@ func (t *Transfer) finalizePiece(ctx context.Context, index int) error {
 			return errors.Join(verifyErr, t.stager.Fatal())
 		}
 	}
-	return t.settleFinalizedPiece(index, snapshot.Piece, finalized, err)
+	return t.settleFinalizedPiece(index, snapshot.Piece, finalized, err, activePeers)
 }
 
-func (t *Transfer) settleFinalizedPiece(index int, piece torrent.Piece, finalized storage.FinalizeResult, finalizeErr error) error {
+func (t *Transfer) settleFinalizedPiece(index int, piece torrent.Piece, finalized storage.FinalizeResult, finalizeErr error, activePeers int) error {
 	if finalizeErr != nil && !finalized.OutputCommitted {
 		return finalizeErr
 	}
 	delete(t.stages, index)
 	result, verifyErr := t.scheduler.VerifyPiece(index, true)
 	if verifyErr == nil && result.SelectedBytes > 0 && t.onPieceVerified != nil {
-		t.onPieceVerified(PieceVerified{PieceIndex: index, PieceBytes: piece.Range.End - piece.Range.Begin, SelectedBytes: result.SelectedBytes})
+		t.onPieceVerified(PieceVerified{PieceIndex: index, PieceBytes: piece.Range.End - piece.Range.Begin, SelectedBytes: result.SelectedBytes, ActivePeers: activePeers})
 	}
 	return errors.Join(finalizeErr, verifyErr)
 }

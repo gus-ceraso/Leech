@@ -70,8 +70,11 @@ type RunConfig struct {
 	// It is separate from OnProgress, which reports committed pieces only.
 	OnPhaseStatus func(string, RunProgress)
 	OnProgress    func(RunProgress)
-	OnWarning     func(string)
-	OnSecondary   func(error)
+	OnStatus      func(RunProgress)
+	// Now controls transfer and payload-rate timestamps for deterministic callers.
+	Now         func() time.Time
+	OnWarning   func(string)
+	OnSecondary func(error)
 }
 
 // RunResult describes the validated session result.  Metainfo and Selection
@@ -89,7 +92,7 @@ type RunResult struct {
 	HasVerifiedOutput bool
 }
 
-// Progress is the small callback snapshot emitted after a verified piece.
+// RunProgress is the immutable snapshot used by commit and live-status callbacks.
 type RunProgress struct {
 	VerifiedSelectedBytes int64
 	SelectedBytes         int64
@@ -648,6 +651,18 @@ func (c *coordinator) startTransferPhase(ctx context.Context, source torrent.Sou
 	}
 	verifiedSelected := int64(0)
 	rate := newPayloadRate()
+	now := c.config.Now
+	if now == nil {
+		now = time.Now
+	}
+	statusSnapshot := func(activePeers int) RunProgress {
+		return RunProgress{
+			VerifiedSelectedBytes: verifiedSelected,
+			SelectedBytes:         runSelectedBytes(selection),
+			ActivePeers:           activePeers,
+			RecentRateBytesPerSec: rate.perSecond(now()),
+		}
+	}
 	prepareMode := storage.Overwrite
 	if c.config.Resume {
 		prepareMode = storage.Resume
@@ -659,6 +674,12 @@ func (c *coordinator) startTransferPhase(ctx context.Context, source torrent.Sou
 		CacheRoot: c.config.CacheRoot,
 		OpenFile:  c.config.StageFileOpener,
 	})
+	var onStatus func(int)
+	if c.config.OnStatus != nil {
+		onStatus = func(activePeers int) {
+			c.config.OnStatus(statusSnapshot(activePeers))
+		}
+	}
 	transfer, err := NewTransfer(TransferConfig{
 		Selection: selection, Output: output, Stager: stager,
 		PrepareMode:     prepareMode,
@@ -668,6 +689,8 @@ func (c *coordinator) startTransferPhase(ctx context.Context, source torrent.Sou
 		AcquirePeer:     acquire, ReleasePeer: release, InitialStrikes: initialStrikes,
 		OnEndpointBlacklisted: c.backoff.Blacklist,
 		ResumeComplete:        resume.VerifiedPieces,
+		Now:                   now,
+		OnStatus:              onStatus,
 		OnPieceVerified: func(piece PieceVerified) {
 			if piece.SelectedBytes > 0 {
 				c.verifiedOutput.Store(true)
@@ -677,15 +700,12 @@ func (c *coordinator) startTransferPhase(ctx context.Context, source torrent.Sou
 			}
 			verifiedSelected += piece.SelectedBytes
 			if c.config.OnProgress != nil {
-				liveMu.Lock()
-				activePeers := len(live)
-				liveMu.Unlock()
-				progress := RunProgress{VerifiedSelectedBytes: verifiedSelected, SelectedBytes: runSelectedBytes(selection), ActivePeers: activePeers, RecentRateBytesPerSec: rate.perSecond(time.Now())}
+				progress := statusSnapshot(piece.ActivePeers)
 				c.config.OnProgress(progress)
 			}
 		},
 		OnPayloadReceived: func(n int64) error {
-			rate.add(time.Now(), n)
+			rate.add(now(), n)
 			return c.account.AddReceived(n)
 		},
 		BeforePeerShutdown: func() error {
