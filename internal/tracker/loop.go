@@ -399,6 +399,15 @@ func (r *PhaseRun) Finalize(ctx context.Context, fullCompletion bool) error {
 	r.wg.Wait()
 	finalCtx, cancelFinal := boundedFinalContext(ctx)
 	defer cancelFinal()
+	completedCtx := finalCtx
+	if fullCompletion {
+		deadline, _ := finalCtx.Deadline()
+		// Completed gets the first two thirds of the final window, leaving
+		// bounded time to transmit stopped even if completed stalls.
+		var cancelCompleted context.CancelFunc
+		completedCtx, cancelCompleted = context.WithTimeout(finalCtx, time.Until(deadline)*2/3)
+		defer cancelCompleted()
+	}
 
 	type finalResult struct {
 		tracker string
@@ -415,7 +424,11 @@ func (r *PhaseRun) Finalize(ctx context.Context, fullCompletion bool) error {
 			defer finalWG.Done()
 			var errs []error
 			for _, event := range finalEventSequence(r.phase, fullCompletion) {
-				if err := r.sendOne(finalCtx, state, event); err != nil {
+				eventCtx := finalCtx
+				if event == EventCompleted {
+					eventCtx = completedCtx
+				}
+				if err := r.sendOne(eventCtx, state, event); err != nil {
 					errs = append(errs, fmt.Errorf("tracker %s %s: %w", trackerLabel(state.tracker), eventName(event), err))
 				}
 			}

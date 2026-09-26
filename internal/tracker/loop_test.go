@@ -530,6 +530,89 @@ func TestFinalEventsUseIndependentBoundedContext(t *testing.T) {
 	}
 }
 
+type stalledCompletedHTTP struct {
+	base      *loopHTTP
+	completed chan finalContextObservation
+	stopped   chan finalContextObservation
+}
+
+func (f *stalledCompletedHTTP) Announce(ctx context.Context, tracker string, request AnnounceRequest) (HTTPAnnounceResult, error) {
+	deadline, has := ctx.Deadline()
+	switch request.Event {
+	case EventCompleted:
+		result, _ := f.base.Announce(ctx, tracker, request)
+		f.completed <- finalContextObservation{err: ctx.Err(), deadline: deadline, has: has}
+		<-ctx.Done()
+		return result, ctx.Err()
+	case EventStopped:
+		f.stopped <- finalContextObservation{err: ctx.Err(), deadline: deadline, has: has}
+	}
+	return f.base.Announce(ctx, tracker, request)
+}
+
+func TestStalledCompletedLeavesTimeForStopped(t *testing.T) {
+	fake := &stalledCompletedHTTP{
+		base:      &loopHTTP{},
+		completed: make(chan finalContextObservation, 1),
+		stopped:   make(chan finalContextObservation, 1),
+	}
+	updates := make(chan Update, 3)
+	set, err := NewTrackerSet(TrackerSetConfig{
+		Trackers: []string{"http://stalled-completed.test/announce"},
+		Identity: Identity{Port: 49152},
+		HTTP:     fake,
+		OnUpdate: func(update Update) { updates <- update },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := set.Start(context.Background(), TransferPhase)
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case update := <-updates:
+		if update.Request.Event != EventStarted || !update.Transmitted {
+			t.Fatalf("started update = %+v", update)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for started announce")
+	}
+	finalCtx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	if err := run.Finalize(finalCtx, true); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("stalled completed error = %v, want deadline exceeded", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("final events exceeded their bounded window: %v", elapsed)
+	}
+	var completed, stopped finalContextObservation
+	select {
+	case completed = <-fake.completed:
+	case <-time.After(time.Second):
+		t.Fatal("completed was not attempted")
+	}
+	select {
+	case stopped = <-fake.stopped:
+	case <-time.After(time.Second):
+		t.Fatal("stopped was not attempted")
+	}
+	if completed.err != nil || stopped.err != nil || !completed.has || !stopped.has || !completed.deadline.Before(stopped.deadline) {
+		t.Fatalf("completed context = %+v, stopped context = %+v", completed, stopped)
+	}
+	requests := fake.base.snapshot()
+	if len(requests) != 3 || requests[0].Event != EventStarted || requests[1].Event != EventCompleted || requests[2].Event != EventStopped {
+		t.Fatalf("requests = %+v, want started, completed, stopped", requests)
+	}
+	if update := <-updates; update.Request.Event != EventCompleted {
+		t.Fatalf("second update = %+v, want completed", update)
+	}
+	if update := <-updates; update.Request.Event != EventStopped || !update.Transmitted {
+		t.Fatalf("third update = %+v, want transmitted stopped", update)
+	}
+}
+
 func TestMetadataPhaseNeverSendsCompleted(t *testing.T) {
 	fake := &loopHTTP{}
 	updates := make(chan Update, 4)
