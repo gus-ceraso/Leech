@@ -165,6 +165,63 @@ func TestRunWithSessionEmitsProductionDebugPhaseDiagnostic(t *testing.T) {
 	}
 }
 
+type failingDiagnosticTracker struct{ called chan struct{} }
+
+func (f failingDiagnosticTracker) Announce(ctx context.Context, _ string, _ tracker.AnnounceRequest) (tracker.HTTPAnnounceResult, error) {
+	select {
+	case f.called <- struct{}{}:
+	default:
+	}
+	return tracker.HTTPAnnounceResult{Transmitted: true}, errors.New("tracker failed at https://u:p@example.invalid/private?token=secret")
+}
+
+func TestRunWithSessionReportsRedactedProductionTrackerFailure(t *testing.T) {
+	info, _ := v1Info(t, []byte("x"))
+	trackerURL := "http://user:password@[2001:db8::1]:8080/private?token=secret"
+	torrentPath := writeV1Torrent(t, v1Metainfo(t, info, trackerURL))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var stderr bytes.Buffer
+	called := make(chan struct{}, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- RunWithSession(ctx, Options{Source: torrentPath, Output: t.TempDir(), LogLevel: LogDebug}, &bytes.Buffer{}, &stderr, session.RunConfig{
+			HTTP: failingDiagnosticTracker{called: called},
+			OnDiagnostic: func(event session.Diagnostic) {
+				if event.Kind == session.DiagnosticTrackerFailure && event.Endpoint.Host == "[2001:db8::1]:8080" {
+					cancel()
+				}
+			},
+			Resolver: noNetworkResolver{}, TCPDial: noNetworkDial, UTPDial: noNetworkDial,
+		})
+	}()
+	select {
+	case <-called:
+	case <-time.After(2 * time.Second):
+		t.Fatal("production tracker attempt did not run")
+	}
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("canceled tracker session unexpectedly succeeded")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("session did not join after cancellation")
+	}
+	got := stderr.String()
+	if !strings.Contains(got, "warning: tracker failure phase=transfer tracker=http://[2001:db8::1]:8080") {
+		t.Fatalf("tracker warning missing safe endpoint: %q", got)
+	}
+	if !strings.Contains(got, "debug: tracker attempt phase=transfer") || !strings.Contains(got, "retrying: transaction failed") {
+		t.Fatalf("tracker debug detail missing: %q", got)
+	}
+	for _, secret := range []string{"user", "password", "/private", "token=secret"} {
+		if strings.Contains(got, secret) {
+			t.Fatalf("tracker diagnostic leaked %q: %q", secret, got)
+		}
+	}
+}
+
 func TestRunWithSessionDoesNotClaimInvalidTorrentIsResumable(t *testing.T) {
 	torrentPath := filepath.Join(t.TempDir(), "bad.torrent")
 	if err := os.WriteFile(torrentPath, []byte("not bencode"), 0o600); err != nil {

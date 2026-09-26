@@ -11,8 +11,11 @@ Read [DESIGN §10](../../DESIGN.md#10-tracker-subsystem),
 - Sanitize initial and redirect URLs alike, preserving unrelated query data.
   A delimiter-heavy query must not create one allocation per delimiter or
   silently narrow the supported URL input contract.
-- Track complete-request transmission separately from response success.
-  Preserve permanent HTTP client-error classification through body failures
+- Track complete-request transmission separately from response success. Loop
+  updates retain attempted/transmitted/activated separately, include final-event
+  attempts, and carry compact IPv4/IPv6 counts from response decoding (never
+  infer compact provenance from hostname resolution). Preserve permanent HTTP
+  client-error classification through body failures
   unless a parsed applicable retry hint changes it.
 - Use tracker-specific bencode structure limits. One response owns one endpoint
   deduplication set across dictionary, IPv4, and IPv6 peers, retaining first

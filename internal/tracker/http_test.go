@@ -167,7 +167,7 @@ func TestHTTPAnnounceParsesCompactFamiliesAndDictionaryPeers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("announce: %v", err)
 	}
-	if got.Interval != time.Minute || got.Leechers != 4 || got.Seeders != 9 || len(got.Peers) != 2 {
+	if got.Interval != time.Minute || got.Leechers != 4 || got.Seeders != 9 || len(got.Peers) != 2 || got.IPv4Compact != 1 || got.IPv6Compact != 1 {
 		t.Fatalf("unexpected compact result: %+v", got)
 	}
 	if got.Peers[0].Host != "127.0.0.1" || got.Peers[0].Port != 6881 || got.Peers[1].Host != "2001:db8::1" || got.Peers[1].Port != 51413 {

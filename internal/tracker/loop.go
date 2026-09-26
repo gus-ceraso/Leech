@@ -68,9 +68,13 @@ type Update struct {
 	Phase       Phase
 	Request     AnnounceRequest
 	Peers       []TrackerPeer
+	IPv4Compact uint64
+	IPv6Compact uint64
+	Attempted   bool
 	Interval    time.Duration
 	Transmitted bool
 	Activated   bool
+	Disabled    bool
 	Err         error
 }
 
@@ -515,6 +519,9 @@ func (r *PhaseRun) loop(state *trackerState) {
 			startedSent = true
 			state.startedTransmitted = true
 		}
+		if reqErr == nil {
+			update.Disabled = isPermanent(update.Err, update.Interval)
+		}
 		r.endNormal()
 		r.notify(update)
 		if reqErr != nil {
@@ -532,7 +539,7 @@ func (r *PhaseRun) loop(state *trackerState) {
 			}
 			continue
 		}
-		if isPermanent(update.Err, update.Interval) {
+		if update.Disabled {
 			state.permanent = true
 			r.set.mu.Lock()
 			r.set.disabled[state.tracker] = true
@@ -553,12 +560,13 @@ func (r *PhaseRun) loop(state *trackerState) {
 }
 
 func (r *PhaseRun) announce(ctx context.Context, state *trackerState, request AnnounceRequest) Update {
-	update := Update{Tracker: state.tracker, Phase: r.phase, Request: request}
+	update := Update{Tracker: state.tracker, Phase: r.phase, Request: request, Attempted: true}
 	scheme := trackerScheme(state.tracker)
 	switch scheme {
 	case "http", "https":
 		result, err := r.set.http.Announce(ctx, state.tracker, request)
 		update.Interval, update.Transmitted, update.Err = result.Interval, result.Transmitted, err
+		update.IPv4Compact, update.IPv6Compact = result.IPv4Compact, result.IPv6Compact
 		update.Activated = err == nil && result.Interval >= limits.MinTrackerSeconds*time.Second && result.Interval <= limits.MaxTrackerSeconds*time.Second
 		for _, peer := range result.Peers {
 			update.Peers = append(update.Peers, TrackerPeer{Host: peer.Host, Port: peer.Port, PeerID: peer.PeerID, HasID: peer.HasID})
@@ -570,6 +578,16 @@ func (r *PhaseRun) announce(ctx context.Context, state *trackerState, request An
 		result, err := r.set.udp.Announce(ctx, state.tracker, request)
 		update.Interval, update.Transmitted, update.Err = result.Interval, result.Transmitted, err
 		update.Activated = err == nil && result.Interval >= limits.MinTrackerSeconds*time.Second && result.Interval <= limits.MaxTrackerSeconds*time.Second
+		for _, family := range result.Families {
+			if !family.Endpoint.IsValid() || family.Err != nil {
+				continue
+			}
+			if family.Endpoint.Addr().Is4() {
+				update.IPv4Compact += uint64(len(family.Peers))
+			} else if family.Endpoint.Addr().Is6() {
+				update.IPv6Compact += uint64(len(family.Peers))
+			}
+		}
 		for _, peer := range result.Peers {
 			update.Peers = append(update.Peers, TrackerPeer{Host: peer.Addr().String(), Port: peer.Port()})
 		}

@@ -43,7 +43,8 @@ piece/request state, and `transfer.go` coordinates peer I/O and finalization.
 - `RunConfig.OnDiagnostic` is optional and separate from progress, warnings, and
   secondary failures. Its exact value shape is
   `Diagnostic{Kind DiagnosticKind, Phase string, Endpoint DiagnosticEndpoint,
-  Peer peer.Endpoint, Count uint64, Duration time.Duration, Detail string}`;
+  Peer peer.Endpoint, Count, IPv4Count, IPv6Count uint64,
+  Duration time.Duration, Detail string}`;
   `DiagnosticEndpoint` is `{Scheme, Host string}` and peer endpoint is the fixed
   `netip.Addr` plus `uint16` port (`peer.Endpoint`), zero when not applicable
   or when the address has a zone.
@@ -52,7 +53,10 @@ piece/request state, and `transfer.go` coordinates peer I/O and finalization.
   bytes per record; a numeric peer renders to at most 47 bytes. CLI queue holds
   128 records. Producers must return promptly. Tracker endpoints contain
   scheme/host only; never put URLs, errors, payload, or magnet sources in
-  diagnostics. The CLI drops debug records on pressure.
+  diagnostics. Tracker updates carry attempt/transmission/activation results and
+  compact IPv4/IPv6 counts from response decoding; final attempts use the same
+  callback after normal admission stops. The coordinator coalesces unchanged
+  tracker failures and reports recovery. The CLI drops debug records on pressure.
 - The coordinator alone mutates rarity, request ownership, provenance, strikes,
   and completion. Give the finalizer immutable coverage snapshots. Worker
   callbacks and command enqueueing must not stall coordination indefinitely.

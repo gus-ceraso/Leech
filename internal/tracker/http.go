@@ -110,6 +110,8 @@ type HTTPAnnounceResult struct {
 	Leechers    uint32
 	Seeders     uint32
 	Peers       []HTTPPeer
+	IPv4Compact uint64
+	IPv6Compact uint64
 	Transmitted bool
 }
 
@@ -460,6 +462,8 @@ func parseHTTPAnnounceResponse(body []byte) (HTTPAnnounceResult, error) {
 	}
 	result.Interval = time.Duration(intervalValue.Int) * time.Second
 	result.Peers = peers.peers
+	result.IPv4Compact = peers.ipv4Compact
+	result.IPv6Compact = peers.ipv6Compact
 	if leechers, ok := dictionaryValue(value, "leechers"); ok {
 		result.Leechers, err = parseCounter(leechers)
 		if err != nil {
@@ -539,8 +543,10 @@ type httpPeerEndpoint struct {
 
 // httpPeerSet deduplicates every peer representation in one tracker response.
 type httpPeerSet struct {
-	peers []HTTPPeer
-	seen  map[httpPeerEndpoint]int
+	peers       []HTTPPeer
+	seen        map[httpPeerEndpoint]int
+	ipv4Compact uint64
+	ipv6Compact uint64
 }
 
 func newHTTPPeerSet(capacity int) *httpPeerSet {
@@ -645,6 +651,11 @@ func parseCompactPeers(value []byte, addressBytes int, peers *httpPeerSet) error
 		port := int(value[offset+addressBytes])<<8 | int(value[offset+addressBytes+1])
 		if port == 0 || addr.IsUnspecified() || addr.IsMulticast() {
 			return &HTTPError{Code: HTTPErrorMalformed, Class: HTTPFailureTransient, Err: errors.New("invalid compact peer endpoint")}
+		}
+		if addressBytes == 4 {
+			peers.ipv4Compact++
+		} else {
+			peers.ipv6Compact++
 		}
 		peers.append(HTTPPeer{Host: addr.String(), Port: uint16(port)})
 	}

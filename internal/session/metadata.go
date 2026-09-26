@@ -508,23 +508,28 @@ type trackerResolveResult struct {
 // small; the remaining announced peers stay in trackerPeerUpdateQueue, where
 // IP literals can continue to pass hostname work.
 type trackerPeerResolver struct {
-	ctx      context.Context
-	cancel   context.CancelFunc
-	resolver peer.Resolver
-	queue    *trackerPeerUpdateQueue
-	jobs     chan *queuedTrackerPeer
-	results  chan trackerResolveResult
-	wg       sync.WaitGroup
-	mu       sync.Mutex
+	ctx          context.Context
+	cancel       context.CancelFunc
+	resolver     peer.Resolver
+	onDiagnostic func(Diagnostic)
+	queue        *trackerPeerUpdateQueue
+	jobs         chan *queuedTrackerPeer
+	results      chan trackerResolveResult
+	wg           sync.WaitGroup
+	mu           sync.Mutex
 }
 
-func newTrackerPeerResolver(ctx context.Context, resolver peer.Resolver, queue *trackerPeerUpdateQueue) *trackerPeerResolver {
+func newTrackerPeerResolver(ctx context.Context, resolver peer.Resolver, queue *trackerPeerUpdateQueue, onDiagnostic ...func(Diagnostic)) *trackerPeerResolver {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	workerCtx, cancel := context.WithCancel(ctx)
+	var observe func(Diagnostic)
+	if len(onDiagnostic) != 0 {
+		observe = onDiagnostic[0]
+	}
 	a := &trackerPeerResolver{
-		ctx: workerCtx, cancel: cancel, resolver: resolver, queue: queue,
+		ctx: workerCtx, cancel: cancel, resolver: resolver, onDiagnostic: observe, queue: queue,
 		jobs:    make(chan *queuedTrackerPeer, trackerResolverQueue),
 		results: make(chan trackerResolveResult, trackerResolverWorkers),
 	}
@@ -584,7 +589,8 @@ func (a *trackerPeerResolver) pump(ctx context.Context, phase tracker.Phase, poo
 		case result := <-a.results:
 			if result.err == nil {
 				for _, candidate := range result.candidates {
-					_, _ = pool.AddFrom(result.peer.source, candidate)
+					added, addErr := pool.AddFrom(result.peer.source, candidate)
+					observePeerSelection(a.onDiagnostic, candidate.Endpoint, added, addErr)
 				}
 			}
 			a.queue.releasePeer(result.peer)
@@ -631,7 +637,8 @@ resultsDrained:
 			})
 			if err == nil {
 				for _, candidate := range candidates {
-					_, _ = pool.AddFrom(item.source, candidate)
+					added, addErr := pool.AddFrom(item.source, candidate)
+					observePeerSelection(a.onDiagnostic, candidate.Endpoint, added, addErr)
 				}
 			}
 			a.queue.releasePeer(item)
@@ -657,6 +664,20 @@ resultsDrained:
 		}
 	}
 	return work
+}
+
+func observePeerSelection(callback func(Diagnostic), endpoint peer.Endpoint, added bool, err error) {
+	if callback == nil {
+		return
+	}
+	detail := "candidate duplicate"
+	if added {
+		detail = "candidate admitted"
+	}
+	if err != nil {
+		detail = "candidate rejected"
+	}
+	callback(Diagnostic{Kind: DiagnosticPeerSelection, Phase: "metadata", Peer: endpoint, Detail: detail})
 }
 
 func (q *trackerPeerUpdateQueue) takeHostname() *queuedTrackerPeer {
@@ -762,6 +783,7 @@ type MetadataConfig struct {
 	LocalHandshake peer.Handshake
 	Now            func() time.Time
 	OnSecondary    func(error)
+	OnDiagnostic   func(Diagnostic)
 
 	// OnStrike observes a completed, hash-invalid candidate. It is called once
 	// per invalid candidate, after the endpoint strike count is incremented.
@@ -979,7 +1001,7 @@ func (d *MetadataDiscovery) Run(ctx context.Context) (result MetadataResult, pri
 	if err != nil {
 		return MetadataResult{}, err
 	}
-	resolver = newTrackerPeerResolver(phaseCtx, config.Resolver, updateQueue)
+	resolver = newTrackerPeerResolver(phaseCtx, config.Resolver, updateQueue, config.OnDiagnostic)
 
 	strikes := make(map[peer.Endpoint]uint8)
 	for {
@@ -1044,6 +1066,9 @@ func (d *MetadataDiscovery) Run(ctx context.Context) (result MetadataResult, pri
 			if errors.As(err, &budgetErr) {
 				primary = budgetErr
 				break
+			}
+			if errors.Is(err, ErrMetadataRejected) && config.OnDiagnostic != nil {
+				config.OnDiagnostic(Diagnostic{Kind: DiagnosticMetadataRefusal, Phase: "metadata", Peer: candidate.Endpoint, Detail: "peer refused metadata or disabled BEP 10"})
 			}
 			if errors.Is(err, ErrMetadataInvalid) {
 				count := strikes[candidate.Endpoint]

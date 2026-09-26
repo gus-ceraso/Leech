@@ -443,6 +443,36 @@ func TestMetadataDiscoveryRotatesRefusalAndAcceptsRepeatedExtensionID(t *testing
 	}
 }
 
+func TestMetadataDiscoveryObservesMetadataReject(t *testing.T) {
+	info := largeTestInfo(t)
+	digest := sha1.Sum(info)
+	var expected torrent.InfoHash
+	copy(expected[:], digest[:])
+	const port = 51422
+	var diagnostics []Diagnostic
+	dial := func(context.Context, string, string) (net.Conn, error) {
+		client, server := net.Pipe()
+		go serveRefusingMetadataPeer(t, server, expected)
+		return client, nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
+	defer cancel()
+	_, err := DiscoverMetadata(ctx, MetadataConfig{
+		InfoHash: expected, Peers: []torrent.PeerAddress{{Host: "127.0.0.1", Port: port}},
+		HTTP: &metadataFixtureTracker{}, TCPDial: dial, PeerTimeout: 20 * time.Millisecond,
+		OnDiagnostic: func(event Diagnostic) { diagnostics = append(diagnostics, event) },
+	})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("discovery error = %v, want timeout", err)
+	}
+	for _, event := range diagnostics {
+		if event.Kind == DiagnosticMetadataRefusal && event.Peer.Port == port {
+			return
+		}
+	}
+	t.Fatalf("metadata reject observation missing: %+v", diagnostics)
+}
+
 func TestMetadataDiscoveryCancellationClosesSilentPeer(t *testing.T) {
 	info := testInfo(t)
 	digest := sha1.Sum(info)

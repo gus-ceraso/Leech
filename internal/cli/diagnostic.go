@@ -65,9 +65,6 @@ func (q *diagnosticQueue) enqueue(record session.Diagnostic) {
 }
 
 func renderDiagnostic(reporter *Reporter, diagnostic session.Diagnostic) {
-	if diagnostic.Kind != session.DiagnosticPhaseTransition {
-		return
-	}
 	var fields []string
 	if diagnostic.Endpoint.Host != "" {
 		fields = append(fields, "tracker="+diagnostic.Endpoint.Scheme+"://"+diagnostic.Endpoint.Host)
@@ -78,17 +75,43 @@ func renderDiagnostic(reporter *Reporter, diagnostic session.Diagnostic) {
 	if diagnostic.Count != 0 {
 		fields = append(fields, fmt.Sprintf("count=%d", diagnostic.Count))
 	}
+	if diagnostic.IPv4Count != 0 || diagnostic.IPv6Count != 0 {
+		fields = append(fields, fmt.Sprintf("compact-v4=%d compact-v6=%d", diagnostic.IPv4Count, diagnostic.IPv6Count))
+	}
 	if diagnostic.Duration != 0 {
 		fields = append(fields, "duration="+diagnostic.Duration.Round(time.Millisecond).String())
 	}
 	if diagnostic.Detail != "" {
 		fields = append(fields, diagnostic.Detail)
 	}
-	message := "session phase=" + diagnostic.Phase
+	var message string
+	level := LogDebug
+	switch diagnostic.Kind {
+	case session.DiagnosticPhaseTransition:
+		message = "session phase=" + diagnostic.Phase
+	case session.DiagnosticTrackerAttempt:
+		message = "tracker attempt phase=" + diagnostic.Phase
+	case session.DiagnosticTrackerFailure:
+		message, level = "tracker failure phase="+diagnostic.Phase, LogWarning
+	case session.DiagnosticTrackerRecovery:
+		message, level = "tracker recovery phase="+diagnostic.Phase, LogWarning
+	case session.DiagnosticMetadataRefusal:
+		message = "metadata refusal phase=" + diagnostic.Phase
+	case session.DiagnosticPeerSelection:
+		message = "peer selection phase=" + diagnostic.Phase
+	case session.DiagnosticLifecycle:
+		message = "session lifecycle"
+	default:
+		return
+	}
 	if len(fields) != 0 {
 		message += " " + strings.Join(fields, " ")
 	}
-	_ = reporter.Debug("%s", message)
+	if level == LogWarning {
+		_ = reporter.Warning("%s", message)
+	} else {
+		_ = reporter.Debug("%s", message)
+	}
 }
 
 // formatDiagnosticPeer accepts only normalized numeric addresses without zones.

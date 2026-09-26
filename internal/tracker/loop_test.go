@@ -411,7 +411,7 @@ func TestTransmittedStartedWithoutActivationStillGetsStopped(t *testing.T) {
 	}
 	select {
 	case update := <-updates:
-		if update.Request.Event != EventStarted || !update.Transmitted || update.Activated {
+		if update.Request.Event != EventStarted || !update.Attempted || !update.Transmitted || update.Activated {
 			t.Fatalf("started update = %+v", update)
 		}
 	case <-time.After(time.Second):
@@ -419,6 +419,10 @@ func TestTransmittedStartedWithoutActivationStillGetsStopped(t *testing.T) {
 	}
 	if err := run.Finalize(context.Background(), false); err != nil {
 		t.Fatalf("finalize: %v", err)
+	}
+	final := <-updates
+	if final.Request.Event != EventStopped || !final.Attempted || !final.Transmitted {
+		t.Fatalf("final stopped update = %+v, want attempted transmission", final)
 	}
 	requests := fake.snapshot()
 	if len(requests) != 2 || requests[0].Event != EventStarted || requests[1].Event != EventStopped {
