@@ -3,9 +3,11 @@ package peer
 import (
 	"bytes"
 	"errors"
+	"math"
 	"testing"
 
 	"github.com/gus-ceraso/Leech/internal/bencode"
+	"github.com/gus-ceraso/Leech/internal/limits"
 )
 
 func TestExtensionIDsAreDirectionalAndRepeatedHandshakesAreAdditive(t *testing.T) {
@@ -145,12 +147,87 @@ func TestParseExtensionHandshakeRejectsMalformedAndBoundsUnknown(t *testing.T) {
 	}
 }
 
+func TestExtensionReqQPresenceAndRepeatedUpdates(t *testing.T) {
+	state := NewExtensionState()
+	if got, present := state.RemoteReqQ(); got != 0 || present {
+		t.Fatalf("initial reqq = %d, %t", got, present)
+	}
+	without := extensionHandshakeBody(t, nil, 0)
+	parsed, err := ParseExtensionHandshake(without)
+	if err != nil || parsed.HasReqQ {
+		t.Fatalf("absent reqq = %#v, %v", parsed, err)
+	}
+	if err := state.ApplyHandshake(without); err != nil {
+		t.Fatal(err)
+	}
+	if _, present := state.RemoteReqQ(); present {
+		t.Fatal("omitted reqq became present")
+	}
+
+	for _, test := range []struct {
+		name string
+		wire int64
+		want uint32
+	}{
+		{"zero", 0, 0},
+		{"one", 1, 1},
+		{"local cap", limits.PeerRequests, limits.PeerRequests},
+		{"above uint32", int64(^uint32(0)) + 1, limits.PeerRequests},
+		{"maximum int64", math.MaxInt64, limits.PeerRequests},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			body := extensionHandshakeReqQBody(t, bencode.Value{Type: bencode.Integer, Int: test.wire})
+			parsed, err := ParseExtensionHandshake(body)
+			if err != nil || !parsed.HasReqQ || parsed.ReqQ != test.want {
+				t.Fatalf("parsed reqq = %#v, %v; want %d", parsed, err, test.want)
+			}
+			if err := state.ApplyHandshake(body); err != nil {
+				t.Fatal(err)
+			}
+			if got, present := state.RemoteReqQ(); !present || got != test.want {
+				t.Fatalf("remote reqq = %d, %t; want %d", got, present, test.want)
+			}
+			if err := state.ApplyHandshake(without); err != nil {
+				t.Fatal(err)
+			}
+			if got, present := state.RemoteReqQ(); !present || got != test.want {
+				t.Fatalf("omitted update changed reqq to %d, %t", got, present)
+			}
+		})
+	}
+}
+
+func TestExtensionReqQRejectsInvalidValues(t *testing.T) {
+	for _, body := range [][]byte{
+		extensionHandshakeReqQBody(t, bencode.Value{Type: bencode.Integer, Int: -1}),
+		extensionHandshakeReqQBody(t, bencode.Value{Type: bencode.Bytes, Bytes: []byte("1")}),
+		[]byte("d4:reqqi9223372036854775808ee"),
+	} {
+		if _, err := ParseExtensionHandshake(body); err == nil || !IsProtocolViolation(err) {
+			t.Errorf("invalid reqq %q = %v, want protocol violation", body, err)
+		}
+	}
+}
+
 func FuzzExtensionTransitions(f *testing.F) {
 	f.Add(byte(1), []byte("d1:md11:ut_metadatai9eee"), []byte("d8:msg_typei0e5:piecei0ee"))
 	f.Add(byte(255), []byte("d1:md11:ut_metadatai0eee"), []byte("garbage"))
+	f.Add(byte(7), []byte("d4:reqqi0ee"), []byte("d8:msg_typei0e5:piecei0ee"))
+	f.Add(byte(7), []byte("d4:reqqi9223372036854775807ee"), []byte("garbage"))
 	f.Fuzz(func(t *testing.T, extensionID byte, handshake, body []byte) {
 		state := NewExtensionStateWithLocalID(extensionID)
-		_ = state.ApplyHandshake(handshake)
+		parsed, parseErr := ParseExtensionHandshake(handshake)
+		if err := state.ApplyHandshake(handshake); (err == nil) != (parseErr == nil) {
+			t.Fatalf("parse/apply mismatch: %v, %v", parseErr, err)
+		}
+		if parseErr == nil {
+			if parsed.HasReqQ && parsed.ReqQ > limits.PeerRequests {
+				t.Fatalf("reqq %d exceeds local cap", parsed.ReqQ)
+			}
+			if got, present := state.RemoteReqQ(); got != parsed.ReqQ || present != parsed.HasReqQ {
+				t.Fatalf("remote reqq = %d, %t; parsed %d, %t", got, present, parsed.ReqQ, parsed.HasReqQ)
+			}
+		}
 		_, _ = state.ApplyMessage(Message{ID: ExtendedID, Payload: append([]byte{extensionID}, body...)})
 	})
 }
@@ -168,6 +245,17 @@ func extensionHandshakeBody(t *testing.T, ids map[string]int64, metadataSize int
 		dict.Dict = append(dict.Dict, bencode.Entry{Key: []byte("metadata_size"), Value: bencode.Value{Type: bencode.Integer, Int: metadataSize}})
 	}
 	body, err := bencode.Encode(dict)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return body
+}
+
+func extensionHandshakeReqQBody(t *testing.T, reqQ bencode.Value) []byte {
+	t.Helper()
+	body, err := bencode.Encode(bencode.Value{Type: bencode.Dictionary, Dict: []bencode.Entry{
+		{Key: []byte("reqq"), Value: reqQ},
+	}})
 	if err != nil {
 		t.Fatal(err)
 	}

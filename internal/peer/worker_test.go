@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"io"
 	"net"
 	"sync"
 	"testing"
@@ -205,6 +206,135 @@ func TestConnectionWorkerBlockedSendUnblocksOnClose(t *testing.T) {
 		t.Fatalf("Close = %v", err)
 	}
 	_ = remote.Close()
+}
+
+func TestConnectionWorkerSerializesRestrictedMetadataRejects(t *testing.T) {
+	local, remote := net.Pipe()
+	defer remote.Close()
+	worker := NewConnectionWorker(local, ReadOptions{})
+	defer worker.Close()
+	extensions := NewExtensionStateWithLocalID(7)
+	if err := worker.SendMetadataRejectContext(context.Background(), extensions, 3); !errors.Is(err, ErrUnsupported) {
+		t.Fatalf("reject without remote ut_metadata ID = %v", err)
+	}
+	if err := extensions.ApplyHandshake(extensionHandshakeBody(t, map[string]int64{UtMetadataExtension: 9}, 0)); err != nil {
+		t.Fatal(err)
+	}
+	if err := worker.Send(Message{ID: InterestedID}); err != nil {
+		t.Fatal(err)
+	}
+	if err := worker.SendMetadataRejectContext(context.Background(), extensions, 3); err != nil {
+		t.Fatal(err)
+	}
+	if err := extensions.ApplyHandshake(extensionHandshakeBody(t, map[string]int64{UtMetadataExtension: 11}, 0)); err != nil {
+		t.Fatal(err)
+	}
+	if err := worker.SendMetadataRejectContext(context.Background(), extensions, 4); err != nil {
+		t.Fatal(err)
+	}
+	if err := worker.Send(Message{ID: ChokeID}); err != nil {
+		t.Fatal(err)
+	}
+	data := metadataBody(t, MetadataData, 5, 1, []byte{1})
+	if err := worker.Send(Message{ID: ExtendedID, Payload: append([]byte{11}, data...)}); !errors.Is(err, ErrUnsupported) {
+		t.Fatalf("generic metadata data command = %v", err)
+	}
+
+	for index, want := range []struct {
+		id    byte
+		piece uint32
+	}{
+		{id: InterestedID},
+		{id: ExtendedID, piece: 3},
+		{id: ExtendedID, piece: 4},
+		{id: ChokeID},
+	} {
+		frame := readWorkerFrame(t, remote)
+		if frame[0] != want.id {
+			t.Fatalf("frame %d ID = %d, want %d", index, frame[0], want.id)
+		}
+		if want.id != ExtendedID {
+			continue
+		}
+		wantRemoteID := byte(9)
+		if index == 2 {
+			wantRemoteID = 11
+		}
+		if frame[1] != wantRemoteID {
+			t.Fatalf("frame %d remote ut_metadata ID = %d, want %d", index, frame[1], wantRemoteID)
+		}
+		message, err := ParseMetadataControl(frame[2:])
+		if err != nil || message.Type != MetadataReject || message.Piece != want.piece {
+			t.Fatalf("frame %d metadata = %#v, %v", index, message, err)
+		}
+	}
+	if err := extensions.ApplyHandshake(extensionHandshakeBody(t, map[string]int64{UtMetadataExtension: 0}, 0)); err != nil {
+		t.Fatal(err)
+	}
+	if err := worker.SendMetadataRejectContext(context.Background(), extensions, 5); !errors.Is(err, ErrUnsupported) {
+		t.Fatalf("reject after remote disable = %v", err)
+	}
+	if err := remote.SetReadDeadline(time.Now().Add(30 * time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	var prefix [4]byte
+	if _, err := io.ReadFull(remote, prefix[:]); err == nil {
+		t.Fatal("worker emitted an extra frame")
+	} else if timeout, ok := err.(net.Error); !ok || !timeout.Timeout() {
+		t.Fatalf("extra frame read = %v, want timeout", err)
+	}
+}
+
+func TestConnectionWorkerMetadataRejectQueueRespectsDeadlineAndClose(t *testing.T) {
+	local, remote := net.Pipe()
+	defer remote.Close()
+	worker, err := NewConnectionWorkerWithCaps(local, ReadOptions{}, 1, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer worker.Close()
+	extensions := NewExtensionState()
+	if err := extensions.ApplyHandshake(extensionHandshakeBody(t, map[string]int64{UtMetadataExtension: 9}, 0)); err != nil {
+		t.Fatal(err)
+	}
+	worker.Start(context.Background())
+	if err := worker.SendMetadataRejectContext(context.Background(), extensions, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := worker.SendMetadataRejectContext(context.Background(), extensions, 2); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	if err := worker.SendMetadataRejectContext(ctx, extensions, 3); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("blocked reject queue = %v", err)
+	}
+	if err := worker.Close(); err != nil {
+		t.Fatalf("Close = %v", err)
+	}
+	if err := worker.SendMetadataRejectContext(context.Background(), extensions, 4); !errors.Is(err, ErrWorkerClosed) {
+		t.Fatalf("reject after Close = %v", err)
+	}
+}
+
+func readWorkerFrame(t *testing.T, conn net.Conn) []byte {
+	t.Helper()
+	if err := conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	var prefix [4]byte
+	if _, err := io.ReadFull(conn, prefix[:]); err != nil {
+		t.Fatal(err)
+	}
+	length := binary.BigEndian.Uint32(prefix[:])
+	if length == 0 || length > MaxPeerFrameBytes {
+		t.Fatalf("unexpected frame length %d", length)
+	}
+	frame := make([]byte, length)
+	if _, err := io.ReadFull(conn, frame); err != nil {
+		t.Fatal(err)
+	}
+	return frame
 }
 
 func TestConnectionWorkerReportsFastFrameAndJoins(t *testing.T) {

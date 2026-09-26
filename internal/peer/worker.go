@@ -38,7 +38,7 @@ func (e PeerEvent) HasMessage() bool {
 type ConnectionWorker struct {
 	conn       net.Conn
 	options    ReadOptions
-	commands   chan Message
+	commands   chan []byte
 	events     chan PeerEvent
 	finishOnce sync.Once
 	wg         sync.WaitGroup
@@ -65,7 +65,7 @@ func NewConnectionWorkerWithCaps(conn net.Conn, options ReadOptions, commandCap,
 	return &ConnectionWorker{
 		conn:     conn,
 		options:  options,
-		commands: make(chan Message, commandCap),
+		commands: make(chan []byte, commandCap),
 		events:   make(chan PeerEvent, eventCap),
 		done:     make(chan struct{}),
 	}, nil
@@ -110,9 +110,25 @@ func (w *ConnectionWorker) Events() <-chan PeerEvent { return w.events }
 // SendContext queues a permitted local command. It waits for queue capacity
 // only while ctx remains live; it never closes the queue from the producer.
 func (w *ConnectionWorker) SendContext(ctx context.Context, message Message) error {
-	if _, err := EncodeOutbound(message); err != nil {
+	wire, err := EncodeOutbound(message)
+	if err != nil {
 		return err
 	}
+	return w.enqueue(ctx, wire)
+}
+
+// SendMetadataRejectContext queues the only extended response a transfer
+// worker may send. The connection's remote ut_metadata ID is resolved before
+// enqueueing, so later extension updates cannot change this frame's ID.
+func (w *ConnectionWorker) SendMetadataRejectContext(ctx context.Context, extensions *ExtensionState, piece uint32) error {
+	wire, err := extensions.EncodeMetadataReject(piece)
+	if err != nil {
+		return err
+	}
+	return w.enqueue(ctx, wire)
+}
+
+func (w *ConnectionWorker) enqueue(ctx context.Context, wire []byte) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -130,7 +146,7 @@ func (w *ConnectionWorker) SendContext(ctx context.Context, message Message) err
 		return ctx.Err()
 	case <-w.done:
 		return ErrWorkerClosed
-	case w.commands <- message:
+	case w.commands <- wire:
 		return nil
 	}
 }
@@ -221,10 +237,10 @@ func (w *ConnectionWorker) writeLoop(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
-		case message := <-w.commands:
-			if err := WriteMessage(w.conn, message); err != nil {
+		case wire := <-w.commands:
+			if err := writeAll(w.conn, wire); err != nil {
 				if !w.isClosing(ctx) {
-					w.fail(err, true)
+					w.fail(disconnectError("write peer message", err), true)
 				}
 				return
 			}

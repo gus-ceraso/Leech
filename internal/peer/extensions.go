@@ -41,11 +41,14 @@ var (
 // ExtensionHandshake is the supported portion of one BEP 10 handshake.
 // Extensions contains only names understood by Leech. Unknown names are
 // parsed and discarded, as required by BEP 10. MetadataSize is optional and
-// reports the peer's advertised BEP 9 size when present.
+// reports the peer's advertised BEP 9 size when present. ReqQ is the
+// peer's optional request limit, clamped to Leech's local cap.
 type ExtensionHandshake struct {
 	Extensions      map[string]byte
 	MetadataSize    int64
 	HasMetadataSize bool
+	ReqQ            uint32
+	HasReqQ         bool
 }
 
 // ExtensionState owns one connection's directional BEP 10 maps. localIDs
@@ -57,6 +60,8 @@ type ExtensionState struct {
 	remoteIDs       map[string]byte
 	metadataSize    int64
 	hasMetadataSize bool
+	reqQ            uint32
+	hasReqQ         bool
 }
 
 // NewExtensionState creates the standard Leech extension map. ID 1 is local
@@ -99,6 +104,15 @@ func (s *ExtensionState) RemoteMetadataSize() (int64, bool) {
 		return 0, false
 	}
 	return s.metadataSize, s.hasMetadataSize
+}
+
+// RemoteReqQ returns the latest explicitly advertised request limit. An
+// omitted hint leaves the previous value in place; zero is a present value.
+func (s *ExtensionState) RemoteReqQ() (uint32, bool) {
+	if s == nil {
+		return 0, false
+	}
+	return s.reqQ, s.hasReqQ
 }
 
 // EncodeMetadataRequest uses the current remote mapping. Callers cannot
@@ -179,6 +193,10 @@ func (s *ExtensionState) ApplyHandshake(body []byte) error {
 		s.metadataSize = handshake.MetadataSize
 		s.hasMetadataSize = true
 	}
+	if handshake.HasReqQ {
+		s.reqQ = handshake.ReqQ
+		s.hasReqQ = true
+	}
 	return nil
 }
 
@@ -232,6 +250,17 @@ func ParseExtensionHandshake(body []byte) (ExtensionHandshake, error) {
 		}
 		result.MetadataSize = size.Int
 		result.HasMetadataSize = true
+	}
+	if reqQ, ok := root.Lookup("reqq"); ok {
+		if reqQ.Type != bencode.Integer || reqQ.Int < 0 {
+			return ExtensionHandshake{}, extensionProtocol("reqq is not a nonnegative integer")
+		}
+		if reqQ.Int > limits.PeerRequests {
+			result.ReqQ = limits.PeerRequests
+		} else {
+			result.ReqQ = uint32(reqQ.Int)
+		}
+		result.HasReqQ = true
 	}
 	return result, nil
 }
