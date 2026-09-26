@@ -534,13 +534,40 @@ func TestTransferRunContinuesAfterDriveSeesClosedWorker(t *testing.T) {
 		firstDone <- nil
 	}()
 	second, secondDone := startFixturePeer(t, [20]byte{19, 19, 19}, []fixturePiece{{index: 0, data: data}}, false, false)
+	firstResult := make(chan error, 1)
+	firstReleased := make(chan struct{}, 1)
+	provided := false
 	transfer, err := NewTransfer(TransferConfig{
 		Selection: selection, Output: plan,
 		Stager:         storage.NewStager(storage.StagerConfig{CacheRoot: filepath.Join(t.TempDir(), "cache"), MaxPieces: 1, MaxBytes: int64(len(data))}),
 		LocalHandshake: peer.Handshake{InfoHash: [20]byte{19, 19, 19}, PeerID: [20]byte{4, 5, 6}},
-		Peers: []ConnectedPeer{
-			{ID: "closed-before-send", Endpoint: endpoint(66), Conn: first, Handshake: peer.Handshake{InfoHash: [20]byte{19, 19, 19}, PeerID: [20]byte{7, 7, 7}}},
-			{ID: "usable", Endpoint: endpoint(67), Conn: second, Handshake: peer.Handshake{InfoHash: [20]byte{19, 19, 19}, PeerID: [20]byte{3, 2, 1}}},
+		Peers:          []ConnectedPeer{{ID: "closed-before-send", Endpoint: endpoint(66), Conn: first, Handshake: peer.Handshake{InfoHash: [20]byte{19, 19, 19}, PeerID: [20]byte{7, 7, 7}}}},
+		AcquirePeer: func(ctx context.Context) (ConnectedPeer, error) {
+			if !provided {
+				select {
+				case firstErr := <-firstDone:
+					firstResult <- firstErr
+					if firstErr != nil {
+						return ConnectedPeer{}, firstErr
+					}
+				case <-ctx.Done():
+					return ConnectedPeer{}, ctx.Err()
+				}
+				select {
+				case <-firstReleased:
+				case <-ctx.Done():
+					return ConnectedPeer{}, ctx.Err()
+				}
+				provided = true
+				return ConnectedPeer{ID: "usable", Endpoint: endpoint(67), Conn: second, Handshake: peer.Handshake{InfoHash: [20]byte{19, 19, 19}, PeerID: [20]byte{3, 2, 1}}}, nil
+			}
+			<-ctx.Done()
+			return ConnectedPeer{}, ctx.Err()
+		},
+		ReleasePeer: func(input ConnectedPeer) {
+			if input.ID == "closed-before-send" {
+				firstReleased <- struct{}{}
+			}
 		},
 		PieceCount: 1, PieceLength: uint32(len(data)), LastPieceLength: uint32(len(data)),
 	})
@@ -551,11 +578,17 @@ func TestTransferRunContinuesAfterDriveSeesClosedWorker(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := transfer.Run(ctx); err != nil {
-		t.Fatalf("transfer: %v", err)
+	runErr := transfer.Run(ctx)
+	select {
+	case err := <-firstResult:
+		if err != nil {
+			t.Fatalf("first peer: %v", err)
+		}
+	default:
+		t.Fatal("first peer did not finish its frames before replacement")
 	}
-	if err := <-firstDone; err != nil {
-		t.Fatal(err)
+	if runErr != nil {
+		t.Fatalf("transfer: %v", runErr)
 	}
 	if err := <-secondDone; err != nil {
 		t.Fatal(err)
