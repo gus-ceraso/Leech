@@ -25,6 +25,30 @@ import (
 	"github.com/gus-ceraso/Leech/internal/tracker"
 )
 
+func TestTrackerWarningsCoalesceRecoverAndKeepFinalFailuresSecondary(t *testing.T) {
+	var warnings []string
+	var diagnostics []Diagnostic
+	coordinator := &coordinator{config: RunConfig{
+		OnWarning:    func(message string) { warnings = append(warnings, message) },
+		OnDiagnostic: func(event Diagnostic) { diagnostics = append(diagnostics, event) },
+	}}
+	endpoint := "https://user:password@example.test/private?token=secret"
+	failure := &tracker.HTTPError{Code: tracker.HTTPErrorTimeout, Err: errors.New("timeout")}
+	coordinator.observeTracker(tracker.Update{Tracker: endpoint, Phase: tracker.TransferPhase, Request: tracker.AnnounceRequest{Event: tracker.EventStarted}, Attempted: true, Transmitted: true, Err: failure})
+	coordinator.observeTracker(tracker.Update{Tracker: endpoint, Phase: tracker.TransferPhase, Request: tracker.AnnounceRequest{Event: tracker.EventNone}, Attempted: true, Err: failure})
+	coordinator.observeTracker(tracker.Update{Tracker: endpoint, Phase: tracker.TransferPhase, Request: tracker.AnnounceRequest{Event: tracker.EventNone}, Attempted: true, Activated: true})
+	coordinator.observeTracker(tracker.Update{Tracker: endpoint, Phase: tracker.TransferPhase, Request: tracker.AnnounceRequest{Event: tracker.EventStopped}, Attempted: true, Transmitted: true, Err: failure})
+	if len(warnings) != 2 || !strings.Contains(warnings[0], "retrying") || !strings.Contains(warnings[1], "recovered") {
+		t.Fatalf("coalesced failure/recovery warnings = %q", warnings)
+	}
+	if strings.Contains(strings.Join(warnings, " "), "password") || strings.Contains(strings.Join(warnings, " "), "token=secret") {
+		t.Fatalf("tracker warning leaked URL credentials: %q", warnings)
+	}
+	if len(diagnostics) != 4 || !strings.Contains(diagnostics[3].Detail, "stopped attempted, transmitted, response failed, final event") || strings.Contains(diagnostics[3].Detail, "retrying") {
+		t.Fatalf("tracker attempt diagnostics = %+v", diagnostics)
+	}
+}
+
 func TestRunKnownResumeCompletesBeforeTrackerActivity(t *testing.T) {
 	data := []byte("resume me")
 	pieces := sha1.Sum(data)

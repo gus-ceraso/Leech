@@ -65,11 +65,9 @@ func runWithReporter(ctx context.Context, opts Options, stdout io.Writer, depend
 	}
 	reportDiagnostic := func(diagnostic session.Diagnostic) {
 		renderDiagnostic(reporter, diagnostic)
-		if reporter.Level() == LogDebug {
-			statusMu.Lock()
-			pending = active
-			statusMu.Unlock()
-		}
+		statusMu.Lock()
+		pending = active
+		statusMu.Unlock()
 	}
 	diagnostics := newDiagnosticQueue()
 	diagnosticDone := make(chan struct{})
@@ -80,11 +78,9 @@ func runWithReporter(ctx context.Context, opts Options, stdout io.Writer, depend
 		}
 		if dropped := diagnostics.dropped.Load(); dropped != 0 {
 			_ = reporter.Debug("diagnostics: dropped %d debug records because the queue was full", dropped)
-			if reporter.Level() == LogDebug {
-				statusMu.Lock()
-				pending = active
-				statusMu.Unlock()
-			}
+			statusMu.Lock()
+			pending = active
+			statusMu.Unlock()
 		}
 	}()
 	stopDiagnostics := func() {

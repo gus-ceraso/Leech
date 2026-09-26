@@ -187,8 +187,8 @@ func TestRunWithSessionReportsRedactedProductionTrackerFailure(t *testing.T) {
 	go func() {
 		errCh <- RunWithSession(ctx, Options{Source: torrentPath, Output: t.TempDir(), LogLevel: LogDebug}, &bytes.Buffer{}, &stderr, session.RunConfig{
 			HTTP: failingDiagnosticTracker{called: called},
-			OnDiagnostic: func(event session.Diagnostic) {
-				if event.Kind == session.DiagnosticTrackerFailure && event.Endpoint.Host == "[2001:db8::1]:8080" {
+			OnWarning: func(message string) {
+				if strings.Contains(message, "[2001:db8::1]:8080") {
 					cancel()
 				}
 			},
@@ -209,7 +209,7 @@ func TestRunWithSessionReportsRedactedProductionTrackerFailure(t *testing.T) {
 		t.Fatal("session did not join after cancellation")
 	}
 	got := stderr.String()
-	if !strings.Contains(got, "warning: tracker failure phase=transfer tracker=http://[2001:db8::1]:8080") {
+	if !strings.Contains(got, "warning: tracker http://[2001:db8::1]:8080 tracker failure; retrying") {
 		t.Fatalf("tracker warning missing safe endpoint: %q", got)
 	}
 	if !strings.Contains(got, "debug: tracker attempt phase=transfer") || !strings.Contains(got, "retrying: transaction failed") {
@@ -219,6 +219,96 @@ func TestRunWithSessionReportsRedactedProductionTrackerFailure(t *testing.T) {
 		if strings.Contains(got, secret) {
 			t.Fatalf("tracker diagnostic leaked %q: %q", secret, got)
 		}
+	}
+}
+
+func TestRunDiagnosticsReportMetadataSelectionAndResumeFailureExits(t *testing.T) {
+	info, _ := v1Info(t, []byte("x"))
+	torrentPath := writeV1Torrent(t, v1Metainfo(t, info, ""))
+	tests := []struct {
+		name  string
+		phase string
+		run   func(*[]session.Diagnostic) error
+	}{
+		{name: "selection", phase: "selection", run: func(events *[]session.Diagnostic) error {
+			root := t.TempDir()
+			output := filepath.Join(root, "not-a-directory")
+			if err := os.WriteFile(output, []byte("x"), 0o600); err != nil {
+				return err
+			}
+			return RunWithSession(context.Background(), Options{Source: torrentPath, Output: output}, &bytes.Buffer{}, io.Discard, session.RunConfig{OnDiagnostic: func(event session.Diagnostic) { *events = append(*events, event) }})
+		}},
+		{name: "resume", phase: "resume", run: func(events *[]session.Diagnostic) error {
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			return RunWithSession(ctx, Options{Source: torrentPath, Output: t.TempDir(), Resume: true}, &bytes.Buffer{}, io.Discard, session.RunConfig{OnDiagnostic: func(event session.Diagnostic) { *events = append(*events, event) }})
+		}},
+		{name: "metadata", phase: "metadata", run: func(events *[]session.Diagnostic) error {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			return RunWithSession(ctx, Options{Source: strings.Repeat("0", 40), Output: t.TempDir()}, &bytes.Buffer{}, io.Discard, session.RunConfig{
+				HTTP: statusFailingTracker{}, OnWarning: func(string) { cancel() },
+				OnDiagnostic: func(event session.Diagnostic) { *events = append(*events, event) },
+				Resolver:     noNetworkResolver{}, TCPDial: noNetworkDial, UTPDial: noNetworkDial,
+			})
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var events []session.Diagnostic
+			if err := test.run(&events); err == nil {
+				t.Fatal("failure fixture unexpectedly succeeded")
+			}
+			for _, event := range events {
+				if event.Kind == session.DiagnosticLifecycle && event.Phase == test.phase && event.Detail == "phase exited with failure" {
+					return
+				}
+			}
+			t.Fatalf("missing %s phase failure event: %+v", test.phase, events)
+		})
+	}
+}
+
+func TestTransferDiagnosticsObserveCandidateAdmissionAndDialOutcome(t *testing.T) {
+	info, _ := v1Info(t, []byte("x"))
+	torrentPath := writeV1Torrent(t, v1Metainfo(t, info, ""))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	events := make(chan session.Diagnostic, 128)
+	done := make(chan error, 1)
+	go func() {
+		done <- RunWithSession(ctx, Options{Source: torrentPath, Output: t.TempDir()}, &bytes.Buffer{}, io.Discard, session.RunConfig{
+			HTTP: &v1Tracker{}, Resolver: noNetworkResolver{}, TCPDial: noNetworkDial, UTPDial: noNetworkDial,
+			OnDiagnostic: func(event session.Diagnostic) {
+				select {
+				case events <- event:
+				default:
+				}
+				if event.Kind == session.DiagnosticPeerSelection && event.Detail == "candidate dial failed" {
+					cancel()
+				}
+			},
+		})
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("canceled transfer unexpectedly succeeded")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("transfer candidate did not reach a dial outcome")
+	}
+	close(events)
+	admitted, dialFailed, phaseExited := false, false, false
+	for event := range events {
+		if event.Kind == session.DiagnosticPeerSelection && event.Phase == "transfer" {
+			admitted = admitted || event.Detail == "candidate admitted"
+			dialFailed = dialFailed || event.Detail == "candidate dial failed"
+		}
+		phaseExited = phaseExited || event.Kind == session.DiagnosticLifecycle && event.Phase == "transfer" && event.Detail == "phase exited with failure"
+	}
+	if !admitted || !dialFailed || !phaseExited {
+		t.Fatalf("transfer diagnostic outcomes admitted=%t dialFailed=%t phaseExited=%t", admitted, dialFailed, phaseExited)
 	}
 }
 

@@ -260,6 +260,52 @@ func TestCLIStatusReturnsAfterRapidResumeToStalledTransfer(t *testing.T) {
 	}
 }
 
+type statusFailingTracker struct{}
+
+func (statusFailingTracker) Announce(context.Context, string, tracker.AnnounceRequest) (tracker.HTTPAnnounceResult, error) {
+	return tracker.HTTPAnnounceResult{Transmitted: true}, &tracker.HTTPError{Class: tracker.HTTPFailureTransient, Code: tracker.HTTPErrorTimeout, Err: errors.New("fixture timeout")}
+}
+
+func TestInfoWarningRestoresInteractiveMetadataStatus(t *testing.T) {
+	stderr := &statusOutput{changed: make(chan struct{}, 1)}
+	var clock atomic.Int64
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	config := session.RunConfig{
+		HTTP: statusFailingTracker{}, Resolver: noNetworkResolver{}, TCPDial: noNetworkDial, UTPDial: noNetworkDial,
+		OnWarning: func(string) { clock.Add(int64(time.Second)) },
+	}
+	opts := Options{Source: strings.Repeat("0", 40), Output: t.TempDir(), LogLevel: LogInfo}
+	done := make(chan error, 1)
+	go func() {
+		done <- runWithReporter(ctx, opts, &bytes.Buffer{}, config, statusReporter(stderr, LogInfo, true, &clock))
+	}()
+	waitStatusOutput(t, stderr, `status: phase="metadata"`)
+	waitStatusOutput(t, stderr, "warning: tracker")
+	deadline := time.NewTimer(3 * time.Second)
+	defer deadline.Stop()
+	for {
+		output := stderr.String()
+		if strings.LastIndex(output, `status: phase="metadata"`) > strings.LastIndex(output, "warning: tracker") {
+			break
+		}
+		select {
+		case <-stderr.changed:
+		case <-deadline.C:
+			t.Fatalf("metadata status did not return after warning: %q", output)
+		}
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("session result = %v, want cancellation", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("metadata session did not join")
+	}
+}
+
 func TestCLIStatusRetainsCommittedPieceProgress(t *testing.T) {
 	data := []byte("x")
 	info, hash := v1Info(t, data)

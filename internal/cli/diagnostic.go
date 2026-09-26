@@ -85,16 +85,11 @@ func renderDiagnostic(reporter *Reporter, diagnostic session.Diagnostic) {
 		fields = append(fields, diagnostic.Detail)
 	}
 	var message string
-	level := LogDebug
 	switch diagnostic.Kind {
 	case session.DiagnosticPhaseTransition:
 		message = "session phase=" + diagnostic.Phase
 	case session.DiagnosticTrackerAttempt:
 		message = "tracker attempt phase=" + diagnostic.Phase
-	case session.DiagnosticTrackerFailure:
-		message, level = "tracker failure phase="+diagnostic.Phase, LogWarning
-	case session.DiagnosticTrackerRecovery:
-		message, level = "tracker recovery phase="+diagnostic.Phase, LogWarning
 	case session.DiagnosticMetadataRefusal:
 		message = "metadata refusal phase=" + diagnostic.Phase
 	case session.DiagnosticPeerSelection:
@@ -107,11 +102,7 @@ func renderDiagnostic(reporter *Reporter, diagnostic session.Diagnostic) {
 	if len(fields) != 0 {
 		message += " " + strings.Join(fields, " ")
 	}
-	if level == LogWarning {
-		_ = reporter.Warning("%s", message)
-	} else {
-		_ = reporter.Debug("%s", message)
-	}
+	_ = reporter.Debug("%s", message)
 }
 
 // formatDiagnosticPeer accepts only normalized numeric addresses without zones.

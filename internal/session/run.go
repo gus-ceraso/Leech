@@ -124,8 +124,6 @@ type DiagnosticKind uint8
 const (
 	DiagnosticPhaseTransition DiagnosticKind = iota + 1
 	DiagnosticTrackerAttempt
-	DiagnosticTrackerFailure
-	DiagnosticTrackerRecovery
 	DiagnosticMetadataRefusal
 	DiagnosticPeerSelection
 	DiagnosticLifecycle
@@ -267,6 +265,7 @@ func Run(ctx context.Context, config RunConfig) (result RunResult, err error) {
 			run.activePhase("metadata", RunProgress{})
 			metadata, discoverErr := run.discover(ctx, source)
 			if discoverErr != nil {
+				run.phaseExit("metadata", discoverErr)
 				return RunResult{}, discoverErr
 			}
 			meta = metadata
@@ -280,6 +279,7 @@ func Run(ctx context.Context, config RunConfig) (result RunResult, err error) {
 			run.activePhase("metadata", RunProgress{})
 			metadata, discoverErr := run.discover(ctx, source)
 			if discoverErr != nil {
+				run.phaseExit("metadata", discoverErr)
 				return RunResult{}, discoverErr
 			}
 			meta = metadata
@@ -288,7 +288,7 @@ func Run(ctx context.Context, config RunConfig) (result RunResult, err error) {
 		return RunResult{}, fmt.Errorf("%w: unknown source kind", ErrRunConfig)
 	}
 	if source.Kind == torrent.SourceMagnet || source.Kind == torrent.SourceInfoHash {
-		run.diagnostic(Diagnostic{Kind: DiagnosticLifecycle, Phase: "metadata", Detail: "phase exited successfully"})
+		run.phaseExit("metadata", nil)
 	}
 
 	if meta.Private {
@@ -307,8 +307,10 @@ func Run(ctx context.Context, config RunConfig) (result RunResult, err error) {
 	run.phase("selection")
 	plan, err := storage.Validate(config.OutputDir, meta, selection.SelectedIndices())
 	if err != nil {
+		run.phaseExit("selection", err)
 		return RunResult{}, err
 	}
+	run.phaseExit("selection", nil)
 
 	resumeResult := storage.ResumeResult{}
 	if config.Resume {
@@ -318,8 +320,10 @@ func Run(ctx context.Context, config RunConfig) (result RunResult, err error) {
 			verifiedOutput.Store(true)
 		}
 		if err != nil {
+			run.phaseExit("resume", err)
 			return RunResult{}, err
 		}
+		run.phaseExit("resume", nil)
 	}
 
 	account, err := tracker.NewAccounting(realTorrentBytes(meta))
@@ -376,10 +380,10 @@ func Run(ctx context.Context, config RunConfig) (result RunResult, err error) {
 	}
 	run.activePhase("transfer", RunProgress{VerifiedSelectedBytes: verifiedSelected, SelectedBytes: runSelectedBytes(selection)})
 	if err := run.startTransferPhase(ctx, source, meta, selection, plan, resumeResult); err != nil {
-		run.diagnostic(Diagnostic{Kind: DiagnosticLifecycle, Phase: "transfer", Detail: "phase exited with failure"})
+		run.phaseExit("transfer", err)
 		return RunResult{}, err
 	}
-	run.diagnostic(Diagnostic{Kind: DiagnosticLifecycle, Phase: "transfer", Detail: "phase exited successfully"})
+	run.phaseExit("transfer", nil)
 	return RunResult{Metainfo: meta, Selection: selection, SelectionComplete: true, TorrentComplete: fullSelection(meta, selection)}, nil
 }
 
@@ -462,6 +466,14 @@ func (c *coordinator) phase(name string) {
 	}
 }
 
+func (c *coordinator) phaseExit(name string, err error) {
+	detail := "phase exited successfully"
+	if err != nil {
+		detail = "phase exited with failure"
+	}
+	c.diagnostic(Diagnostic{Kind: DiagnosticLifecycle, Phase: name, Detail: detail})
+}
+
 func (c *coordinator) diagnostic(event Diagnostic) {
 	if c != nil && c.config.OnDiagnostic != nil {
 		c.config.OnDiagnostic(event)
@@ -527,6 +539,7 @@ func (c *coordinator) observeTracker(update tracker.Update) {
 	endpoint := diagnosticTrackerEndpoint(update.Tracker)
 	event := Diagnostic{Kind: DiagnosticTrackerAttempt, Phase: trackerPhaseName(update.Phase), Endpoint: endpoint,
 		Count: uint64(len(update.Peers)), IPv4Count: update.IPv4Compact, IPv6Count: update.IPv6Compact}
+	finalEvent := update.Request.Event == tracker.EventCompleted || update.Request.Event == tracker.EventStopped
 	if update.Attempted {
 		event.Detail = trackerEventName(update.Request.Event) + " attempted"
 		if update.Transmitted {
@@ -538,7 +551,9 @@ func (c *coordinator) observeTracker(update tracker.Update) {
 			event.Detail += ", response accepted"
 		} else if update.Err != nil {
 			event.Detail += ", response failed"
-			if update.Disabled {
+			if finalEvent {
+				event.Detail += ", final event"
+			} else if update.Disabled {
 				event.Detail += ", disabled"
 			} else {
 				event.Detail += ", retrying"
@@ -547,6 +562,9 @@ func (c *coordinator) observeTracker(update tracker.Update) {
 		}
 		c.diagnostic(event)
 	}
+	if finalEvent {
+		return
+	}
 	if update.Err == nil {
 		c.trackerDiagMu.Lock()
 		wasFailed := c.trackerFailed[update.Tracker]
@@ -554,8 +572,8 @@ func (c *coordinator) observeTracker(update tracker.Update) {
 			delete(c.trackerFailed, update.Tracker)
 		}
 		c.trackerDiagMu.Unlock()
-		if wasFailed {
-			c.diagnostic(Diagnostic{Kind: DiagnosticTrackerRecovery, Phase: trackerPhaseName(update.Phase), Endpoint: endpoint, Detail: "tracker recovered"})
+		if wasFailed && c.config.OnWarning != nil {
+			c.config.OnWarning("tracker " + endpoint.Scheme + "://" + endpoint.Host + " recovered")
 		}
 		return
 	}
@@ -578,7 +596,9 @@ func (c *coordinator) observeTracker(update tracker.Update) {
 	if update.Err != nil {
 		detail += ": " + trackerFailureDetail(update.Err)
 	}
-	c.diagnostic(Diagnostic{Kind: DiagnosticTrackerFailure, Phase: trackerPhaseName(update.Phase), Endpoint: endpoint, Detail: detail})
+	if c.config.OnWarning != nil {
+		c.config.OnWarning("tracker " + endpoint.Scheme + "://" + endpoint.Host + " " + detail)
+	}
 }
 
 func trackerFailureDetail(err error) string {
@@ -744,7 +764,7 @@ func (c *coordinator) startTransferPhase(ctx context.Context, source torrent.Sou
 	if err != nil {
 		return err
 	}
-	admission := newTrackerPeerResolver(runCtx, c.config.Resolver, c.updateQueue)
+	admission := newTrackerPeerResolver(runCtx, c.config.Resolver, c.updateQueue, c.config.OnDiagnostic)
 	defer c.updateQueue.clear()
 	quiesceAdmission := func() {
 		cancel()
@@ -782,12 +802,14 @@ func (c *coordinator) startTransferPhase(ctx context.Context, source torrent.Sou
 				admitted, dialErr := manager.Dial(dialCtx, candidate)
 				dialCancel()
 				if dialErr != nil {
+					c.diagnostic(Diagnostic{Kind: DiagnosticPeerSelection, Phase: "transfer", Peer: candidate.Endpoint, Detail: "candidate dial failed"})
 					var budgetErr *peer.EndpointBudgetError
 					if errors.As(dialErr, &budgetErr) {
 						return ConnectedPeer{}, budgetErr
 					}
 					continue
 				}
+				c.diagnostic(Diagnostic{Kind: DiagnosticPeerSelection, Phase: "transfer", Peer: admitted.Endpoint, Detail: "candidate connected"})
 				liveMu.Lock()
 				live[admitted.Conn] = admitted
 				liveMu.Unlock()

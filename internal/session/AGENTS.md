@@ -56,7 +56,10 @@ piece/request state, and `transfer.go` coordinates peer I/O and finalization.
   diagnostics. Tracker updates carry attempt/transmission/activation results and
   compact IPv4/IPv6 counts from response decoding; final attempts use the same
   callback after normal admission stops. The coordinator coalesces unchanged
-  tracker failures and reports recovery. The CLI drops debug records on pressure.
+  regular failures and reports recovery through `OnWarning`; final one-shot
+  failures remain secondary and never claim a retry. Tracker callbacks run after
+  transactions and outside coordinator/protocol locks; keep observers prompt. The
+  CLI drops debug records on pressure.
 - The coordinator alone mutates rarity, request ownership, provenance, strikes,
   and completion. Give the finalizer immutable coverage snapshots. Worker
   callbacks and command enqueueing must not stall coordination indefinitely.

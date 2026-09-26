@@ -589,8 +589,9 @@ func (a *trackerPeerResolver) pump(ctx context.Context, phase tracker.Phase, poo
 		case result := <-a.results:
 			if result.err == nil {
 				for _, candidate := range result.candidates {
+					before := pool.Len()
 					added, addErr := pool.AddFrom(result.peer.source, candidate)
-					observePeerSelection(a.onDiagnostic, candidate.Endpoint, added, addErr)
+					observePeerSelection(a.onDiagnostic, trackerPhaseName(result.peer.phase), candidate.Endpoint, added, added && before >= limits.Candidates, addErr)
 				}
 			}
 			a.queue.releasePeer(result.peer)
@@ -637,8 +638,9 @@ resultsDrained:
 			})
 			if err == nil {
 				for _, candidate := range candidates {
+					before := pool.Len()
 					added, addErr := pool.AddFrom(item.source, candidate)
-					observePeerSelection(a.onDiagnostic, candidate.Endpoint, added, addErr)
+					observePeerSelection(a.onDiagnostic, trackerPhaseName(item.phase), candidate.Endpoint, added, added && before >= limits.Candidates, addErr)
 				}
 			}
 			a.queue.releasePeer(item)
@@ -666,7 +668,7 @@ resultsDrained:
 	return work
 }
 
-func observePeerSelection(callback func(Diagnostic), endpoint peer.Endpoint, added bool, err error) {
+func observePeerSelection(callback func(Diagnostic), phase string, endpoint peer.Endpoint, added, replaced bool, err error) {
 	if callback == nil {
 		return
 	}
@@ -674,10 +676,13 @@ func observePeerSelection(callback func(Diagnostic), endpoint peer.Endpoint, add
 	if added {
 		detail = "candidate admitted"
 	}
+	if replaced {
+		detail = "candidate replaced at capacity"
+	}
 	if err != nil {
 		detail = "candidate rejected"
 	}
-	callback(Diagnostic{Kind: DiagnosticPeerSelection, Phase: "metadata", Peer: endpoint, Detail: detail})
+	callback(Diagnostic{Kind: DiagnosticPeerSelection, Phase: phase, Peer: endpoint, Detail: detail})
 }
 
 func (q *trackerPeerUpdateQueue) takeHostname() *queuedTrackerPeer {
