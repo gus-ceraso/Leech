@@ -393,6 +393,26 @@ func (s *Scheduler) AddPeerWithLimit(id string, endpoint peer.Endpoint, limit in
 	return nil
 }
 
+// SetPeerLimit applies a later reqq hint. Existing requests remain assigned;
+// a lower limit prevents new assignments until enough terminals arrive.
+func (s *Scheduler) SetPeerLimit(id string, limit int) error {
+	if s == nil {
+		return ErrSchedulerConfig
+	}
+	p, ok := s.peers[id]
+	if !ok {
+		return ErrUnknownPeer
+	}
+	if limit < 0 {
+		return fmt.Errorf("%w: request cap must not be negative", ErrSchedulerConfig)
+	}
+	if limit > s.cfg.MaxPerPeer {
+		limit = s.cfg.MaxPerPeer
+	}
+	p.limit = limit
+	return nil
+}
+
 // RemovePeer releases requests owned by id. Admitted staged pieces remain in
 // place so another connection can finish them without re-admitting storage.
 func (s *Scheduler) RemovePeer(id string) error {

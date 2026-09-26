@@ -131,6 +131,7 @@ type transferPeer struct {
 	input      ConnectedPeer
 	worker     *peer.ConnectionWorker
 	state      *peer.PeerState
+	extensions *peer.ExtensionState
 	active     map[peer.Block]time.Time
 	tombstoned map[peer.Block]struct{}
 	done       bool
@@ -461,25 +462,36 @@ func (t *Transfer) startPeer(ctx context.Context, input ConnectedPeer) (*transfe
 		return nil, err
 	}
 	if fast {
-		// The handshake has already completed, so this is the first and only
-		// peer-wire frame sent before worker ownership begins.
+		// Fast requires Have None immediately after the BEP 3 handshake.
 		if err := peer.WriteInitialAvailability(input.Conn, t.local, input.Handshake); err != nil {
 			_ = t.scheduler.RemovePeer(input.ID)
 			_ = input.Conn.Close()
 			return nil, err
 		}
 	}
+	var extensions *peer.ExtensionState
+	var metadataID byte
+	if t.local.Reserved[5]&metadataExtensionReservedBit != 0 && input.Handshake.Reserved[5]&metadataExtensionReservedBit != 0 {
+		extensions = peer.NewExtensionState()
+		metadataID, _ = extensions.LocalExtensionID(peer.UtMetadataExtension)
+		if err := extensions.WriteHandshake(input.Conn); err != nil {
+			_ = t.scheduler.RemovePeer(input.ID)
+			_ = input.Conn.Close()
+			return nil, err
+		}
+	}
 	worker := peer.NewConnectionWorker(input.Conn, peer.ReadOptions{
-		Fast:            fast,
-		PieceCount:      t.pieceCount,
-		ValidateIndices: true,
-		PieceLength:     t.pieceLength,
-		LastPieceLength: t.lastPieceLength,
+		Fast:                fast,
+		PieceCount:          t.pieceCount,
+		ValidateIndices:     true,
+		PieceLength:         t.pieceLength,
+		LastPieceLength:     t.lastPieceLength,
+		MetadataExtensionID: metadataID,
 	})
 	worker.Start(ctx)
 	now := t.clock()
 	return &transferPeer{
-		input: input, worker: worker, state: state,
+		input: input, worker: worker, state: state, extensions: extensions,
 		active: make(map[peer.Block]time.Time), tombstoned: make(map[peer.Block]struct{}),
 		lastUseful: now,
 	}, nil
@@ -804,6 +816,9 @@ func (t *Transfer) handleEventWithPeers(ctx context.Context, peers []*transferPe
 	if event.Message.KeepAlive {
 		return nil
 	}
+	if event.Message.ID == peer.ExtendedID {
+		return t.handleExtensionMessage(ctx, p, event.Message)
+	}
 	// ConnectionWorker has already checked the Piece frame and its payload
 	// bounds. Count file bytes before PeerState consumes the terminal so
 	// corrupt, duplicate, and tombstoned late payloads are included even when
@@ -912,6 +927,33 @@ func (t *Transfer) handleEventWithPeers(ctx context.Context, peers []*transferPe
 			// The request table consumed the bounded tombstone.  The payload
 			// cannot be attributed to a current scheduler assignment.
 			delete(p.tombstoned, block)
+		}
+	}
+	return nil
+}
+
+func (t *Transfer) handleExtensionMessage(ctx context.Context, p *transferPeer, message peer.Message) error {
+	if p.extensions == nil {
+		return nil
+	}
+	event, err := p.extensions.ApplyMessage(message)
+	if err != nil {
+		if peer.IsProtocolViolation(err) {
+			t.blacklistEndpoint(p.input.Endpoint)
+		}
+		return t.disconnectPeer(p, err)
+	}
+	if event.ID == peer.ExtensionHandshakeID {
+		if reqQ, present := p.extensions.RemoteReqQ(); present {
+			limit := p.state.SetReqQ(reqQ)
+			if err := t.scheduler.SetPeerLimit(p.input.ID, limit); err != nil {
+				return err
+			}
+		}
+	}
+	if event.Metadata != nil && event.Metadata.Type == peer.MetadataRequest && len(event.Response) != 0 {
+		if err := p.worker.SendMetadataRejectContext(ctx, p.extensions, event.Metadata.Piece); err != nil {
+			return t.disconnectPeer(p, err)
 		}
 	}
 	return nil
