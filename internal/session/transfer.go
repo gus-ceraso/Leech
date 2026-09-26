@@ -136,6 +136,7 @@ type transferPeer struct {
 	tombstoned map[peer.Block]struct{}
 	done       bool
 	removed    bool
+	deferDrive bool
 	lastUseful time.Time
 	released   bool
 }
@@ -153,11 +154,12 @@ func (p *transferPeer) sendMetadataReject(ctx context.Context, piece uint32) err
 }
 
 const (
-	peerRequestTimeout = 30 * time.Second
-	peerCommandTimeout = 100 * time.Millisecond
-	peerIdleLimit      = 60 * time.Second
-	peerAcquireBase    = 100 * time.Millisecond
-	peerAcquireMax     = 5 * time.Second
+	peerRequestTimeout  = 30 * time.Second
+	peerCommandTimeout  = 100 * time.Millisecond
+	peerIdleLimit       = 60 * time.Second
+	peerAcquireBase     = 100 * time.Millisecond
+	peerAcquireMax      = 5 * time.Second
+	peerEventDrainLimit = 16
 )
 
 // NewTransfer validates immutable transfer inputs and creates the scheduler.
@@ -429,24 +431,44 @@ func (t *Transfer) Run(ctx context.Context) error {
 	return t.stager.Cleanup(primary)
 }
 
-// Drain only the events already buffered at the start of each peer's turn.
-// Each worker queue is bounded, so a flooding peer cannot postpone scheduling
-// indefinitely; channel order preserves a queued reqq update behind Have.
+// Drain ready events, including one decoded event held behind a full worker
+// queue, before scheduling requests. The fixed cap keeps a flooding peer from
+// postponing all other work.
 func (t *Transfer) drainQueuedPeerEvents(ctx context.Context, peers []*transferPeer, canAcquire bool) error {
 	for index, p := range peers {
 		if p == nil || p.done {
 			continue
 		}
-		queued := len(p.worker.Events())
-		for i := 0; i < queued && !p.done; i++ {
-			event, ok := <-p.worker.Events()
-			if !ok {
-				break
-			}
-			if err := t.handleRunPeerEvent(ctx, peers, index, event, canAcquire); err != nil {
-				return err
+		p.deferDrive = false
+		processed := 0
+	drain:
+		for processed < peerEventDrainLimit && !p.done {
+			select {
+			case event, ok := <-p.worker.Events():
+				if !ok {
+					break drain
+				}
+				processed++
+				if err := t.handleRunPeerEvent(ctx, peers, index, event, canAcquire); err != nil {
+					return err
+				}
+			default:
+				break drain
 			}
 		}
+		if p.done {
+			continue
+		}
+		backlog := p.worker.PendingEvent() || len(p.worker.Events()) != 0
+		if processed == peerEventDrainLimit && backlog {
+			cause := fmt.Errorf("peer event backlog exceeded %d messages", peerEventDrainLimit)
+			_ = t.disconnectPeer(p, cause)
+			if countLive(peers) == 0 && !canAcquire {
+				return cause
+			}
+			continue
+		}
+		p.deferDrive = backlog
 	}
 	return nil
 }
@@ -544,7 +566,7 @@ func (t *Transfer) drive(ctx context.Context, peers *[]*transferPeer) error {
 		return err
 	}
 	for _, p := range *peers {
-		if p == nil || p.done {
+		if p == nil || p.done || p.deferDrive {
 			continue
 		}
 		if t.scheduler.IsBlacklisted(p.input.Endpoint) {

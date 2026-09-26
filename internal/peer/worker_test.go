@@ -87,6 +87,47 @@ func TestConnectionWorkerBackpressuresValidBurst(t *testing.T) {
 	}
 }
 
+func TestConnectionWorkerReportsDecodedEventHeldByBackpressure(t *testing.T) {
+	local, remote := net.Pipe()
+	defer remote.Close()
+	worker, err := NewConnectionWorkerWithCaps(local, ReadOptions{}, 1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker.Start(context.Background())
+	defer worker.Close()
+	if err := WriteChoke(remote); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteChoke(remote); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for !worker.PendingEvent() && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if !worker.PendingEvent() || len(worker.Events()) != 1 {
+		t.Fatalf("held decoded event = %t, buffered = %d", worker.PendingEvent(), len(worker.Events()))
+	}
+	for i := 0; i < 2; i++ {
+		select {
+		case event := <-worker.Events():
+			if event.Err != nil || event.Message.ID != ChokeID {
+				t.Fatalf("event %d = %#v", i, event)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("event %d was not delivered", i)
+		}
+	}
+	deadline = time.Now().Add(2 * time.Second)
+	for worker.PendingEvent() && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if worker.PendingEvent() {
+		t.Fatal("reader retained a delivered event")
+	}
+}
+
 func TestConnectionWorkerCloseUnblocksBackpressuredReader(t *testing.T) {
 	local, remote := net.Pipe()
 	defer remote.Close()

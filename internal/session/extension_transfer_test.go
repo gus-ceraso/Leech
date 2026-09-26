@@ -301,6 +301,11 @@ func TestTransferDrainsQueuedReqQBeforeScheduling(t *testing.T) {
 	if err := writeFixtureFrame(fixture.remote, peer.HaveID, []byte{0, 0, 0, 0}); err != nil {
 		t.Fatal(err)
 	}
+	for i := 0; i < 2; i++ {
+		if err := peer.WriteKeepAlive(fixture.remote); err != nil {
+			t.Fatal(err)
+		}
+	}
 	if err := writeTestFrame(fixture.remote, extensionFrame(0, []byte("d4:reqqi1ee"))); err != nil {
 		t.Fatal(err)
 	}
@@ -308,19 +313,38 @@ func TestTransferDrainsQueuedReqQBeforeScheduling(t *testing.T) {
 	defer timer.Stop()
 	tick := time.NewTicker(time.Millisecond)
 	defer tick.Stop()
-	for len(fixture.peer.worker.Events()) < 3 {
+	for len(fixture.peer.worker.Events()) < 4 || !fixture.peer.worker.PendingEvent() {
 		select {
 		case <-tick.C:
 		case <-timer.C:
-			t.Fatal("peer did not queue Unchoke, Have, and reqq before scheduling")
+			t.Fatal("four queued frames did not hold the fifth reqq frame behind backpressure")
 		}
 	}
 	peers := []*transferPeer{fixture.peer}
 	if err := fixture.transfer.drainQueuedPeerEvents(context.Background(), peers, false); err != nil {
 		t.Fatal(err)
 	}
+	if fixture.peer.deferDrive {
+		if err := fixture.transfer.drive(context.Background(), &peers); err != nil {
+			t.Fatal(err)
+		}
+		if active := fixture.transfer.scheduler.peers[fixture.peer.input.ID].active; active != 0 {
+			t.Fatalf("scheduled %d requests before the held reqq update", active)
+		}
+		select {
+		case event := <-fixture.peer.worker.Events():
+			if err := fixture.transfer.handleRunPeerEvent(context.Background(), peers, 0, event, false); err != nil {
+				t.Fatal(err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("held reqq frame was not delivered")
+		}
+		if err := fixture.transfer.drainQueuedPeerEvents(context.Background(), peers, false); err != nil {
+			t.Fatal(err)
+		}
+	}
 	if fixture.peer.state.ReqQ() != 1 {
-		t.Fatalf("queued reqq = %d, want 1", fixture.peer.state.ReqQ())
+		t.Fatalf("fifth-frame reqq = %d, want 1", fixture.peer.state.ReqQ())
 	}
 	if err := fixture.transfer.drive(context.Background(), &peers); err != nil {
 		t.Fatal(err)

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net"
 	"sync"
+	"sync/atomic"
 
 	"github.com/gus-ceraso/Leech/internal/limits"
 )
@@ -40,9 +41,11 @@ type ConnectionWorker struct {
 	options    ReadOptions
 	commands   chan []byte
 	events     chan PeerEvent
+	eventMu    sync.Mutex
 	finishOnce sync.Once
 	wg         sync.WaitGroup
 	done       chan struct{}
+	pending    atomic.Bool
 
 	mu       sync.Mutex
 	cancel   context.CancelFunc
@@ -106,6 +109,14 @@ func (w *ConnectionWorker) Run(ctx context.Context) error {
 }
 
 func (w *ConnectionWorker) Events() <-chan PeerEvent { return w.events }
+
+// PendingEvent reports whether the reader holds one decoded event while
+// waiting for queue capacity. The reader owns at most one such event.
+func (w *ConnectionWorker) PendingEvent() bool {
+	w.eventMu.Lock()
+	defer w.eventMu.Unlock()
+	return w.pending.Load()
+}
 
 // SendContext queues a permitted local command. It waits for queue capacity
 // only while ctx remains live; it never closes the queue from the producer.
@@ -249,10 +260,21 @@ func (w *ConnectionWorker) writeLoop(ctx context.Context) {
 }
 
 func (w *ConnectionWorker) emit(ctx context.Context, event PeerEvent) bool {
+	w.eventMu.Lock()
 	select {
 	case w.events <- event:
+		w.eventMu.Unlock()
+		return true
+	default:
+		w.pending.Store(true)
+		w.eventMu.Unlock()
+	}
+	select {
+	case w.events <- event:
+		w.pending.Store(false)
 		return true
 	case <-ctx.Done():
+		w.pending.Store(false)
 		return false
 	}
 }
