@@ -16,8 +16,11 @@ Read [DESIGN §14](../../DESIGN.md#14-utp),
   unsolicited SYN acceptance, or server API.
 - Filter unrelated connection IDs before parsing extension chains. Validate
   unknown extension framing without retaining ignored headers or bodies.
-  Check the current write deadline before accepting each new payload prefix;
-  recheck it after waking because another caller can extend or clear it.
+  Check the current read deadline under `Conn.mu` before consuming buffered
+  bytes; after any wake or timer, recheck current state under the mutex so a
+  stale timer cannot override a cleared or extended deadline. Check the current
+  write deadline before accepting each new payload prefix and recheck it after
+  waking for the same reason.
 - Sequence numbers count packets, not bytes. Use wrap-aware arithmetic and
   bounded ACK/SACK validation; release acknowledged bytes only once. Preserve
   bytes before FIN and settle FIN gaps before reporting EOF.

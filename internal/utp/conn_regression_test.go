@@ -73,6 +73,186 @@ func (f writeFixture) readData(t *testing.T) Packet {
 	}
 }
 
+// sendIndependentData sends one independently encoded BEP 29 DATA packet and
+// waits until the corresponding ACK proves ReceiveState accepted it.
+func (f writeFixture) sendIndependentData(t *testing.T, payload []byte) {
+	t.Helper()
+	const seq = uint16(201) // handshake STATE sequence 200, then DATA sequence 201
+	wire := make([]byte, HeaderBytes+len(payload))
+	wire[0] = byte(Data)<<4 | ProtocolVersion
+	binary.BigEndian.PutUint16(wire[2:4], f.id)
+	binary.BigEndian.PutUint32(wire[12:16], 4<<20)
+	binary.BigEndian.PutUint16(wire[16:18], seq)
+	copy(wire[HeaderBytes:], payload)
+	if _, err := f.server.WriteToUDP(wire, f.addr); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		packet, _, err := readPacket(f.server)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if packet.Type == State && packet.AckNr == Sequence(seq) {
+			return
+		}
+	}
+}
+
+func TestConnReadExpiredDeadlinePreservesBufferedData(t *testing.T) {
+	for _, mode := range []string{"cleared", "extended"} {
+		t.Run(mode, func(t *testing.T) {
+			f := newWriteFixture(t)
+			want := []byte("independent DATA bytes")
+			f.sendIndependentData(t, want)
+			if err := f.conn.SetReadDeadline(time.Now().Add(-time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			buf := make([]byte, len(want))
+			if n, err := f.conn.Read(buf); n != 0 || !errors.Is(err, os.ErrDeadlineExceeded) {
+				t.Fatalf("expired Read = %d, %v; want 0, deadline", n, err)
+			}
+			deadline := time.Time{}
+			if mode == "extended" {
+				deadline = time.Now().Add(time.Second)
+			}
+			if err := f.conn.SetReadDeadline(deadline); err != nil {
+				t.Fatal(err)
+			}
+			if n, err := f.conn.Read(buf); n != len(want) || err != nil || !bytes.Equal(buf, want) {
+				t.Fatalf("Read after %s = %d, %v, %q; want %q", mode, n, err, buf, want)
+			}
+			f.conn.mu.Lock()
+			_, buffered := f.conn.recv.Buffered()
+			f.conn.mu.Unlock()
+			if buffered != 0 {
+				t.Fatalf("Read left %d duplicate buffered bytes", buffered)
+			}
+		})
+	}
+}
+
+func TestConnReadEmptyBufferDeadline(t *testing.T) {
+	f := newWriteFixture(t)
+	if err := f.conn.SetReadDeadline(time.Now().Add(-time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := f.conn.Read(make([]byte, 1)); n != 0 || !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("empty Read = %d, %v; want 0, deadline", n, err)
+	}
+}
+
+func TestConnReadConcurrentDeadlineChanges(t *testing.T) {
+	f := newWriteFixture(t)
+	stop := make(chan struct{})
+	setterDone := make(chan struct{})
+	go func() {
+		defer close(setterDone)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			_ = f.conn.SetReadDeadline(time.Now().Add(time.Second))
+			_ = f.conn.SetReadDeadline(time.Time{})
+		}
+	}()
+	want := []byte("concurrent deadline update")
+	result := make(chan struct {
+		n    int
+		err  error
+		data []byte
+	}, 1)
+	go func() {
+		buf := make([]byte, len(want))
+		n, err := f.conn.Read(buf)
+		result <- struct {
+			n    int
+			err  error
+			data []byte
+		}{n, err, buf}
+	}()
+	f.sendIndependentData(t, want)
+	close(stop)
+	<-setterDone
+	select {
+	case got := <-result:
+		if got.n != len(want) || got.err != nil || !bytes.Equal(got.data, want) {
+			t.Fatalf("Read under concurrent deadline changes = %d, %v, %q", got.n, got.err, got.data)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Read did not complete after concurrent deadline changes")
+	}
+}
+
+func TestConnReadDeadlineChangesWhileBlocked(t *testing.T) {
+	for _, mode := range []string{"shortened", "extended", "cleared"} {
+		t.Run(mode, func(t *testing.T) {
+			f := newWriteFixture(t)
+			initial := time.Now().Add(3 * time.Second)
+			if mode != "shortened" {
+				initial = time.Now().Add(120 * time.Millisecond)
+			}
+			if err := f.conn.SetReadDeadline(initial); err != nil {
+				t.Fatal(err)
+			}
+			type readResult struct {
+				n    int
+				err  error
+				data []byte
+			}
+			result := make(chan readResult, 1)
+			want := []byte("read after deadline change")
+			go func() {
+				buf := make([]byte, len(want))
+				n, err := f.conn.Read(buf)
+				result <- readResult{n: n, err: err, data: buf}
+			}()
+			var next time.Time
+			switch mode {
+			case "shortened":
+				next = time.Now().Add(80 * time.Millisecond)
+			case "extended":
+				next = initial.Add(time.Second)
+			}
+			if err := f.conn.SetReadDeadline(next); err != nil {
+				t.Fatal(err)
+			}
+			if mode == "shortened" {
+				select {
+				case got := <-result:
+					if got.n != 0 || !errors.Is(got.err, os.ErrDeadlineExceeded) {
+						t.Fatalf("shortened blocked Read = %d, %v", got.n, got.err)
+					}
+				case <-time.After(time.Second):
+					t.Fatal("shortened deadline did not wake Read")
+				}
+				return
+			}
+			// Wait past the old deadline; a stale timer must not win over the
+			// replacement deadline. The subsequent DATA wakes this same Read.
+			wait := time.Until(initial.Add(80 * time.Millisecond))
+			if wait > 0 {
+				time.Sleep(wait)
+			}
+			select {
+			case got := <-result:
+				t.Fatalf("Read returned at old deadline: %d, %v", got.n, got.err)
+			default:
+			}
+			f.sendIndependentData(t, want)
+			select {
+			case got := <-result:
+				if got.n != len(want) || got.err != nil || !bytes.Equal(got.data, want) {
+					t.Fatalf("Read after %s = %d, %v, %q", mode, got.n, got.err, got.data)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("Read did not wake for DATA")
+			}
+		})
+	}
+}
+
 func (f writeFixture) limitQueue(bytes int) {
 	f.conn.mu.Lock()
 	f.conn.send.maxBuffered = bytes

@@ -122,6 +122,10 @@ func (c *Conn) Read(p []byte) (int, error) {
 	}
 	for {
 		c.mu.Lock()
+		if !c.readDeadline.IsZero() && !time.Now().Before(c.readDeadline) {
+			c.mu.Unlock()
+			return 0, os.ErrDeadlineExceeded
+		}
 		if c.recv != nil {
 			windowBefore := c.recv.WindowSize()
 			n, err := c.recv.Read(p)
@@ -149,9 +153,9 @@ func (c *Conn) Read(p []byte) (int, error) {
 		done := c.done
 		c.mu.Unlock()
 
-		if err := waitForWake(wake, done, deadline); err != nil {
-			return 0, err
-		}
+		// Recheck the current deadline under mu after either wakeup or timer.
+		// A concurrent deadline change can make this snapshot stale.
+		_ = waitForWake(wake, done, deadline)
 	}
 }
 
