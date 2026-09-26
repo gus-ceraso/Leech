@@ -574,12 +574,41 @@ func (s *SendState) retransmitLost(sequence Sequence, now time.Time, result *Sen
 	result.LostPackets++
 }
 
-// Tick checks the oldest outstanding packet and emits at most one timeout
-// retransmission. The timeout is exponentially backed off and capped to keep
-// duration arithmetic bounded. SYN and FIN records use the same path.
+// Tick retransmits the oldest timed-out packet. When no packet remains in
+// flight, it also restarts a zero congestion window or probes a zero remote
+// window. Timeout intervals are exponentially backed off and capped.
 func (s *SendState) Tick(now time.Time) []PacketAction {
-	if s == nil || s.terminal != nil || len(s.unacked) == 0 {
+	if s == nil || s.terminal != nil {
 		return nil
+	}
+	if len(s.unacked) == 0 {
+		if len(s.queue) == 0 || (s.remoteWindow != 0 && s.congestion.maxWindow != 0) {
+			return nil
+		}
+		if s.lastActivity.IsZero() {
+			s.lastActivity = now
+			return nil
+		}
+		backoff := time.Duration(1 << minUint(s.timeoutCount, 6))
+		if now.Sub(s.lastActivity) < saturatingDuration(s.congestion.RTO(), backoff) {
+			return nil
+		}
+		s.timeoutCount++
+		if s.congestion.maxWindow == 0 {
+			s.congestion.OnTimeout()
+		}
+		if s.remoteWindow == 0 {
+			// A STATE packet is only an ACK and need not elicit a reply. A
+			// one-byte DATA probe is the sole exception to the advertised
+			// zero window. Its ordinary retransmission record stays within the
+			// send byte budget and elicits the receiver's current window.
+			packet := s.header(Data, now)
+			packet.Payload = cloneBytes(s.queue[:1])
+			s.consumeQueue(1)
+			return []PacketAction{s.record(packet, now)}
+		}
+		s.lastActivity = now
+		return s.produce(now)
 	}
 	oldest := s.oldest()
 	if oldest == nil || oldest.sentAt.IsZero() {

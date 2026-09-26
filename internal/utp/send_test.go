@@ -1,6 +1,7 @@
 package utp
 
 import (
+	"context"
 	"errors"
 	"testing"
 	"time"
@@ -164,6 +165,57 @@ func TestSendTimeoutRetransmitsSYNAndBacksOff(t *testing.T) {
 	}
 	if got := s.Tick(now.Add(3 * rto)); len(got) != 1 {
 		t.Fatalf("backoff timeout = %+v", got)
+	}
+}
+
+func TestSendRestartsZeroCongestionWindowAfterAllACKs(t *testing.T) {
+	s, err := NewSendStateWithConfig(10, SendConfig{
+		MaxQueueBytes: 2_400,
+		MaxUnacked:    4,
+		RemoteWindow:  2_400,
+		Congestion: CongestionConfig{
+			InitialWindow: 1_200,
+			InitialPacket: 1_200,
+			MinPacket:     minimumPacketSize,
+			MaxPacket:     1_200,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Unix(100, 0)
+	if result := s.Handle(Packet{Type: State, AckNr: 9, WindowSize: 2_400}, now); result.Err != nil {
+		t.Fatalf("base-delay feedback = %+v", result)
+	}
+	if n, err := s.Queue(make([]byte, 2_400)); n != 2_400 || err != nil {
+		t.Fatalf("queue = %d, %v", n, err)
+	}
+	first := s.Produce(now.Add(time.Millisecond))
+	if len(first) != 1 || len(first[0].Packet.Payload) != 1_200 {
+		t.Fatalf("first send = %+v", first)
+	}
+	ackAt := now.Add(2 * time.Millisecond)
+	result := s.Handle(Packet{Type: State, AckNr: 10, WindowSize: 2_400, TimestampDifference: 1_000_000}, ackAt)
+	if result.Err != nil || len(result.Actions) != 0 || s.MaxWindow() != 0 || s.UnackedPackets() != 0 || s.PendingBytes() != 1_200 {
+		t.Fatalf("zero window after ACK = %+v, cwnd=%d unacked=%d queued=%d", result, s.MaxWindow(), s.UnackedPackets(), s.PendingBytes())
+	}
+	if actions := s.Tick(ackAt.Add(s.RTO() - time.Nanosecond)); len(actions) != 0 {
+		t.Fatalf("early restart = %+v", actions)
+	}
+	restart := s.Tick(ackAt.Add(s.RTO()))
+	if len(restart) != 1 || restart[0].Packet.Type != Data || len(restart[0].Packet.Payload) != minimumPacketSize || s.MaxWindow() != minimumPacketSize {
+		t.Fatalf("timeout restart = %+v, cwnd=%d", restart, s.MaxWindow())
+	}
+	if s.InFlightBytes() != minimumPacketSize || s.PendingBytes() != 1_200-minimumPacketSize || len(s.Produce(ackAt.Add(s.RTO()))) != 0 {
+		t.Fatalf("restart bounds: in-flight=%d queued=%d", s.InFlightBytes(), s.PendingBytes())
+	}
+	result = s.Handle(Packet{Type: State, AckNr: restart[0].Packet.SeqNr, WindowSize: 2_400}, ackAt.Add(s.RTO()+time.Millisecond))
+	if result.Err != nil || result.AckedBytes != minimumPacketSize || len(result.Actions) == 0 {
+		t.Fatalf("restarted send did not advance = %+v", result)
+	}
+	s.Close(context.Canceled)
+	if actions := s.Tick(ackAt.Add(10 * time.Second)); len(actions) != 0 {
+		t.Fatalf("closed sender emitted packets: %+v", actions)
 	}
 }
 
