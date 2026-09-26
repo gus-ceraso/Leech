@@ -242,7 +242,7 @@ type indexedPath struct {
 }
 
 func hasPatternMeta(pattern string) bool {
-	return strings.ContainsAny(pattern, "*?[")
+	return strings.ContainsAny(pattern, "*?[\\")
 }
 
 func selectExactPattern(pattern string, paths []indexedPath, selected []bool) {
@@ -345,6 +345,12 @@ func globToRegexp(pattern string) (string, error) {
 			}
 			expression.WriteString(class)
 			position = next
+		case '\\':
+			position++
+			if position == len(pattern) {
+				return "", fmt.Errorf("trailing escape")
+			}
+			fallthrough
 		default:
 			runeValue, width := utf8.DecodeRuneInString(pattern[position:])
 			if runeValue == utf8.RuneError && width == 1 {
@@ -378,7 +384,11 @@ func globClassToRegexp(pattern string, start int) (string, int, error) {
 			if len(ranges) == 0 {
 				// path.Match accepts descending ranges but they match no
 				// character. Metadata paths cannot contain NUL, so this
-				// represents an empty class in RE2.
+				// represents an empty class in RE2. Preserve its complement
+				// when the source class is negated.
+				if negated {
+					return `[^\x00]`, position + 1, nil
+				}
 				return `[\x00]`, position + 1, nil
 			}
 			var class strings.Builder
@@ -396,19 +406,19 @@ func globClassToRegexp(pattern string, start int) (string, int, error) {
 			class.WriteByte(']')
 			return class.String(), position + 1, nil
 		}
-		low, width := utf8.DecodeRuneInString(pattern[position:])
-		if low == utf8.RuneError && width == 1 {
-			return "", 0, fmt.Errorf("invalid UTF-8 in character class")
+		low, next, err := globClassRune(pattern, position)
+		if err != nil {
+			return "", 0, err
 		}
-		position += width
+		position = next
 		item := classRange{low: low}
 		if position < len(pattern) && pattern[position] == '-' {
 			position++
-			high, highWidth := utf8.DecodeRuneInString(pattern[position:])
-			if high == utf8.RuneError && highWidth == 1 {
-				return "", 0, fmt.Errorf("invalid UTF-8 in character class range")
+			high, after, err := globClassRune(pattern, position)
+			if err != nil {
+				return "", 0, err
 			}
-			position += highWidth
+			position = after
 			item.high = high
 			item.rangeEnd = true
 		}
@@ -417,6 +427,23 @@ func globClassToRegexp(pattern string, start int) (string, int, error) {
 			ranges = append(ranges, item)
 		}
 	}
+}
+
+func globClassRune(pattern string, position int) (rune, int, error) {
+	if position >= len(pattern) || pattern[position] == '-' || pattern[position] == ']' {
+		return 0, 0, fmt.Errorf("invalid character class")
+	}
+	if pattern[position] == '\\' {
+		position++
+		if position >= len(pattern) {
+			return 0, 0, fmt.Errorf("trailing class escape")
+		}
+	}
+	value, width := utf8.DecodeRuneInString(pattern[position:])
+	if value == utf8.RuneError && width == 1 {
+		return 0, 0, fmt.Errorf("invalid UTF-8 in character class")
+	}
+	return value, position + width, nil
 }
 
 func writeRegexpClassRune(expression *strings.Builder, value rune) {
@@ -430,13 +457,18 @@ func selectRanges(meta Metainfo, ranges []IndexRange, selected []bool) error {
 	if len(ranges) > limits.Files {
 		return fmt.Errorf("%w: too many BEP 53 ranges", ErrInvalidSelection)
 	}
+	delta := make([]int, len(meta.Files)+1)
 	for _, r := range ranges {
 		if r.Start < 0 || r.End < r.Start || r.End >= len(meta.Files) {
 			return fmt.Errorf("%w: BEP 53 range %d-%d is outside %d files", ErrInvalidSelection, r.Start, r.End, len(meta.Files))
 		}
-		for index := r.Start; index <= r.End; index++ {
-			selected[index] = true
-		}
+		delta[r.Start]++
+		delta[r.End+1]--
+	}
+	active := 0
+	for index := range selected {
+		active += delta[index]
+		selected[index] = active > 0
 	}
 	return nil
 }
@@ -527,25 +559,94 @@ func validatePattern(pattern string) error {
 	if pattern == "" || len(pattern) > limits.PathBytes || !utf8.ValidString(pattern) {
 		return fmt.Errorf("%w: pattern is empty, too long, or invalid UTF-8", ErrInvalidPattern)
 	}
-	if strings.Contains(pattern, "**") {
+	if hasDoubleStar(pattern) {
 		return fmt.Errorf("%w: ** is unsupported", ErrInvalidPattern)
 	}
-	if strings.ContainsAny(pattern, "\\\x00") || strings.HasPrefix(pattern, "/") {
+	if strings.ContainsRune(pattern, 0) || strings.HasPrefix(pattern, "/") || strings.HasPrefix(pattern, `\/`) {
 		return fmt.Errorf("%w: pattern must be relative and use '/' separators", ErrInvalidPattern)
 	}
-	parts := strings.Split(pattern, "/")
-	if len(parts) > limits.PathComponents {
-		return fmt.Errorf("%w: pattern has too many components", ErrInvalidPattern)
-	}
-	for _, part := range parts {
-		if part == "" || part == "." || part == ".." {
-			return fmt.Errorf("%w: pattern has an unsafe path component", ErrInvalidPattern)
-		}
+	if err := validatePatternComponents(pattern); err != nil {
+		return err
 	}
 	if _, err := pathpkg.Match(pattern, ""); err != nil {
 		return fmt.Errorf("%w: %v", ErrInvalidPattern, err)
 	}
 	return nil
+}
+
+func validatePatternComponents(pattern string) error {
+	start, count := 0, 1
+	inClass, escaped := false, false
+	check := func(end int) error {
+		part := pattern[start:end]
+		if part == "" || part == "." || part == ".." {
+			return fmt.Errorf("%w: pattern has an unsafe path component", ErrInvalidPattern)
+		}
+		return nil
+	}
+	for i := 0; i < len(pattern); i++ {
+		if escaped {
+			escaped = false
+			if pattern[i] == '/' && !inClass {
+				if err := check(i - 1); err != nil {
+					return err
+				}
+				start = i + 1
+				count++
+			}
+			continue
+		}
+		switch pattern[i] {
+		case '\\':
+			escaped = true
+		case '[':
+			if !inClass {
+				inClass = true
+			}
+		case ']':
+			inClass = false
+		case '/':
+			if !inClass {
+				if err := check(i); err != nil {
+					return err
+				}
+				start = i + 1
+				count++
+			}
+		}
+	}
+	if count > limits.PathComponents {
+		return fmt.Errorf("%w: pattern has too many components", ErrInvalidPattern)
+	}
+	return check(len(pattern))
+}
+
+func hasDoubleStar(pattern string) bool {
+	escaped, inClass, previousStar := false, false, false
+	for i := 0; i < len(pattern); i++ {
+		switch {
+		case escaped:
+			escaped = false
+			previousStar = false
+		case pattern[i] == '\\':
+			escaped = true
+			previousStar = false
+		case pattern[i] == '[' && !inClass:
+			inClass = true
+			previousStar = false
+		case pattern[i] == ']' && inClass:
+			inClass = false
+			previousStar = false
+		case pattern[i] == '*' && !inClass:
+			if previousStar {
+				return true
+			}
+			previousStar = true
+		default:
+			previousStar = false
+		}
+	}
+	return false
 }
 
 func pathPatternMatches(pattern, candidate string) bool {

@@ -44,18 +44,12 @@ func TestSelectPatternsAndDirectoryDescendants(t *testing.T) {
 		{name: "directory", patterns: []string{"dir"}, want: []int{0, 1}},
 		{name: "star directory", patterns: []string{"dir/*"}, want: []int{0, 1}},
 		{name: "question", patterns: []string{"dir/?.txt"}, want: []int{0}},
-		{name: "class", patterns: []string{"dir/[a]\\.txt"}, want: nil},
+		{name: "class and escape", patterns: []string{"dir/[a]\\.txt"}, want: []int{0}},
 		{name: "class match", patterns: []string{"dir/[a].txt"}, want: []int{0}},
 		{name: "union overlap", patterns: []string{"dir", "dir/a.txt", "root.dat"}, want: []int{0, 1, 2}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if strings.Contains(test.patterns[0], `\`) {
-				if _, err := Select(meta, test.patterns, nil); !errors.Is(err, ErrInvalidPattern) {
-					t.Fatalf("error = %v, want ErrInvalidPattern", err)
-				}
-				return
-			}
 			plan, err := Select(meta, test.patterns, nil)
 			if err != nil {
 				t.Fatal(err)
@@ -266,6 +260,10 @@ func FuzzSelectPattern(f *testing.F) {
 	f.Add("dir/*")
 	f.Add("dir/[a-z]?.bin")
 	f.Add("dir/**")
+	f.Add(`dir/\*.bin`)
+	f.Add(`dir/[\-].bin`)
+	f.Add(`dir/\[x\]`)
+	f.Add(`dir/\`)
 	meta := selectionMeta([]File{selectionFile(0, "dir/a.bin", 0, 1, RegularFile)}, []Piece{selectionPiece(0, 0, 1)})
 	f.Fuzz(func(t *testing.T, pattern string) {
 		_, _ = Select(meta, []string{pattern}, nil)
@@ -273,10 +271,10 @@ func FuzzSelectPattern(f *testing.F) {
 }
 
 func FuzzGlobRegexMatchesPathMatch(f *testing.F) {
-	for _, seed := range []string{"*", "a/?", "a/[b-d]", "a/[^x]b", "unicode/é*", "[a-bd]", "[a-0a]", "[z-a0]"} {
+	for _, seed := range []string{"*", "a/?", "a/[b-d]", "a/[^x]b", "unicode/é*", "[a-bd]", "[a-0a]", "[z-a0]", "[z-a]", "[^z-a]", "[^z-a0]", "[z-a^]", "[z-a[]", "a[^z-a]b", `a[//]b`, `[\-]`, `[\]]`, `[\--z]`, `[\[-z]`, `[a-\]]`, `[\]-z]`, `\*`, `\**`, `[**]`, `a/\[x\]`, `a/[a\-]`, `a/\`} {
 		f.Add(seed)
 	}
-	candidates := []string{"", "a", "a/b", "a/c", "a/c/d", "a/bb", "a/bx", "unicode/éclair", "x/y"}
+	candidates := []string{"", "a", "a/b", "a/c", "a/c/d", "a/bb", "a/bx", "a/[x]", "a/-", "unicode/éclair", "x/y", "^", "[", "]", "-", "*", "*wild", "é", "é/child"}
 	f.Fuzz(func(t *testing.T, pattern string) {
 		if err := validatePattern(pattern); err != nil {
 			return

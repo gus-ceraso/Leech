@@ -2,13 +2,11 @@
 
 - **Status:** Approved
 - **Design date:** 2026-09-19
-- **Implementation status:** Unresolved work is tracked in [TODO.md](TODO.md).
 - **Primary specifications:** [`beps/`](beps/), especially BEP 3
 
 This document defines Leech's required behavior. Present-tense descriptions are
-contracts, not claims that every requirement is implemented. [TODO.md](TODO.md)
-records known gaps and their acceptance checks; task sequencing does not relax
-these contracts. [README.md](README.md) provides build and usage instructions.
+contracts, not claims that every requirement is implemented.
+[README.md](README.md) provides build and usage instructions.
 
 | Topic | Sections |
 | --- | --- |
@@ -821,7 +819,6 @@ Accepted residual risks are:
 Validation is local and deterministic; it never uses existing clients or live trackers.
 
 The checks below are required evidence, not a record of completed validation.
-Outstanding work belongs in [TODO.md](TODO.md).
 
 ### 19.1 Command-line boundary
 

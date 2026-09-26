@@ -409,6 +409,7 @@ func FuzzSchedulerEvents(f *testing.F) {
 		}
 		for _, event := range events {
 			requests, _ := s.NextRequests("p", int(event%4))
+			assertSchedulerWork(t, s)
 			if len(requests) > 0 && event&1 == 0 {
 				_, _ = s.AcceptBlock("p", requests[0].Block)
 			} else if len(requests) > 0 {
@@ -417,6 +418,7 @@ func FuzzSchedulerEvents(f *testing.F) {
 			if s.active < 0 || s.active > 4 || s.staged < 0 || s.staged > 1 || s.stagedBytes < 0 || s.stagedBytes > 32768 {
 				t.Fatalf("state out of bounds: %#v", s)
 			}
+			assertSchedulerWork(t, s)
 		}
 	})
 }
@@ -451,6 +453,7 @@ func FuzzSchedulerEndgameEvents(f *testing.F) {
 		for _, event := range events {
 			one, _ := s.NextRequests("one", int(event%3))
 			two, _ := s.NextRequests("two", int(event>>2)%3)
+			assertSchedulerWork(t, s)
 			if event&1 == 0 && len(one) > 0 {
 				_, _ = s.AcceptBlock("one", one[0].Block)
 			} else if len(one) > 0 {
@@ -467,6 +470,7 @@ func FuzzSchedulerEndgameEvents(f *testing.F) {
 			if s.active < 0 || s.active > 4 || s.pieces[0].blocks[0].active && len(s.pieces[0].blocks[0].assignments) == 0 {
 				t.Fatalf("invalid endgame state: %#v", s)
 			}
+			assertSchedulerWork(t, s)
 		}
 	})
 }

@@ -245,7 +245,7 @@ func (f *closeFailureFile) Close() error {
 	return *f.closeErr
 }
 
-func TestPrepareReportsEveryCloseFailure(t *testing.T) {
+func TestPrepareReportsImmediateCloseFailure(t *testing.T) {
 	root := t.TempDir()
 	meta := testMeta("bundle", true, regular(0, "a", 0, 1), regular(1, "b", 1, 2))
 	plan, err := Validate(root, meta, []int{0, 1})
@@ -260,17 +260,11 @@ func TestPrepareReportsEveryCloseFailure(t *testing.T) {
 	}
 	defer func() { openOutputFile = previous }()
 	prepared, err := plan.Prepare(Resume)
-	if err != nil {
-		t.Fatal(err)
+	if !errors.Is(err, closeErr) || prepared != nil {
+		t.Fatalf("Prepare = (%v, %v), want close failure", prepared, err)
 	}
-	if err := prepared.Close(); !errors.Is(err, closeErr) {
-		t.Fatalf("Close error = %v, want %v", err, closeErr)
-	}
-	if closes != 2 {
-		t.Fatalf("closed handles = %d, want 2", closes)
-	}
-	if err := prepared.Close(); !errors.Is(err, closeErr) {
-		t.Fatalf("second Close error = %v, want %v", err, closeErr)
+	if closes != 1 {
+		t.Fatalf("closed handles = %d, want 1 before stopping on failure", closes)
 	}
 }
 

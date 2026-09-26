@@ -62,17 +62,16 @@ func ParseMetadataMessage(body []byte) (MetadataMessage, error) {
 		return MetadataMessage{}, metadataProtocol("metadata header is not a dictionary")
 	}
 	msgType, ok := header.Lookup("msg_type")
-	if !ok || msgType.Type != bencode.Integer || msgType.Int < 0 || msgType.Int > 255 {
+	if !ok || msgType.Type != bencode.Integer {
 		return MetadataMessage{}, metadataProtocol("metadata msg_type is missing or invalid")
 	}
-	message := MetadataMessage{Type: MetadataMessageType(msgType.Int)}
-	if message.Type != MetadataRequest && message.Type != MetadataData && message.Type != MetadataReject {
+	if msgType.Int != int64(MetadataRequest) && msgType.Int != int64(MetadataData) && msgType.Int != int64(MetadataReject) {
 		// BEP 9 requires unknown message types to be ignored. The outer peer
 		// frame already bounds the message, so no interpretation of optional
 		// fields or binary data is needed here.
-		message.Type = MetadataUnknown
-		return message, nil
+		return MetadataMessage{Type: MetadataUnknown}, nil
 	}
+	message := MetadataMessage{Type: MetadataMessageType(msgType.Int)}
 	piece, ok := header.Lookup("piece")
 	if !ok || piece.Type != bencode.Integer || piece.Int < 0 || piece.Int > int64(^uint32(0)) {
 		return MetadataMessage{}, metadataProtocol("metadata piece is missing or invalid")

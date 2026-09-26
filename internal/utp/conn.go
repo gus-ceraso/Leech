@@ -3,6 +3,7 @@ package utp
 import (
 	"context"
 	"crypto/rand"
+	"encoding/binary"
 	"errors"
 	"io"
 	"net"
@@ -177,6 +178,10 @@ func (c *Conn) Write(p []byte) (int, error) {
 			c.mu.Unlock()
 			return written, io.ErrClosedPipe
 		}
+		if !c.writeDeadline.IsZero() && !time.Now().Before(c.writeDeadline) {
+			c.mu.Unlock()
+			return written, os.ErrDeadlineExceeded
+		}
 		accepted, queueErr := c.send.Queue(p[written:])
 		written += accepted
 		if accepted != 0 {
@@ -193,9 +198,9 @@ func (c *Conn) Write(p []byte) (int, error) {
 		if queueErr != nil && !errors.Is(queueErr, ErrSendQueueFull) {
 			return written, queueErr
 		}
-		if err := waitForWake(wake, done, deadline); err != nil {
-			return written, err
-		}
+		// A concurrent SetWriteDeadline may have extended or cleared the
+		// deadline while the old timer fired. Recheck it under mu above.
+		_ = waitForWake(wake, done, deadline)
 	}
 	return written, nil
 }
@@ -389,6 +394,11 @@ func (c *Conn) service() {
 }
 
 func (c *Conn) handleDatagram(wire []byte) {
+	// Every inbound packet, including handshake STATE and RESET, uses recvID.
+	// Reject unrelated IDs before walking a potentially long extension chain.
+	if len(wire) < HeaderBytes || binary.BigEndian.Uint16(wire[2:4]) != c.recvID {
+		return
+	}
 	packet, err := ParsePacket(wire)
 	if err != nil {
 		// A connected UDP socket can still receive a malformed datagram from
@@ -398,9 +408,6 @@ func (c *Conn) handleDatagram(wire []byte) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.closed || c.terminal != nil {
-		return
-	}
-	if packet.ConnectionID != c.recvID {
 		return
 	}
 	now := time.Now()

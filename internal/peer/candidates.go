@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -153,7 +154,7 @@ func resolveCandidate(ctx context.Context, resolver Resolver, candidate Candidat
 	if addr, err := netip.ParseAddr(candidate.Host); err == nil {
 		endpoint, ok := normalizedEndpoint(addr, candidate.Port)
 		if !ok {
-			return nil, fmt.Errorf("%w: address is unspecified or multicast", ErrCandidate)
+			return nil, fmt.Errorf("%w: address or interface is invalid", ErrCandidate)
 		}
 		return []ResolvedCandidate{withExpected(endpoint, candidate)}, nil
 	}
@@ -209,7 +210,8 @@ func validCandidateHost(host string) bool {
 }
 
 // NormalizeEndpoint validates an already resolved endpoint. IPv4-mapped IPv6
-// values are unmapped so they share identity with their IPv4 form.
+// values share their IPv4 identity; IPv6 zones are retained only when they
+// select a link-local interface.
 func NormalizeEndpoint(endpoint Endpoint) (Endpoint, error) {
 	normalized, ok := normalizedEndpoint(endpoint.Addr, endpoint.Port)
 	if !ok {
@@ -219,12 +221,54 @@ func NormalizeEndpoint(endpoint Endpoint) (Endpoint, error) {
 }
 
 func normalizedEndpoint(addr netip.Addr, port uint16) (Endpoint, bool) {
+	return normalizedEndpointWithInterfaces(addr, port, net.InterfaceByName, net.InterfaceByIndex)
+}
+
+func normalizedEndpointWithInterfaces(addr netip.Addr, port uint16, byName func(string) (*net.Interface, error), byIndex func(int) (*net.Interface, error)) (Endpoint, bool) {
 	addr = addr.Unmap()
 	if port == 0 || !addr.IsValid() || addr.IsUnspecified() || addr.IsMulticast() ||
 		(!addr.IsGlobalUnicast() && !addr.IsLoopback() && !addr.IsLinkLocalUnicast()) {
 		return Endpoint{}, false
 	}
+	if !addr.Is6() || !addr.IsLinkLocalUnicast() {
+		addr = addr.WithZone("")
+	} else if addr.Zone() != "" {
+		zone, ok := canonicalInterfaceZone(addr.Zone(), byName, byIndex)
+		if !ok {
+			return Endpoint{}, false
+		}
+		addr = addr.WithZone(zone)
+	}
 	return Endpoint{Addr: addr, Port: port}, true
+}
+
+// Go's socket conversion resolves an interface name before falling back to a
+// leading decimal index. Use the same order, then keep the interface's name
+// so name and numeric aliases also dial with the same scope.
+func canonicalInterfaceZone(zone string, byName func(string) (*net.Interface, error), byIndex func(int) (*net.Interface, error)) (string, bool) {
+	ifi, err := byName(zone)
+	if err != nil {
+		index := 0
+		for i := 0; i < len(zone) && zone[i] >= '0' && zone[i] <= '9'; i++ {
+			index = index*10 + int(zone[i]-'0')
+			if index >= 0xFFFFFF {
+				return "", false
+			}
+		}
+		if index == 0 {
+			return "", false
+		}
+		ifi, err = byIndex(index)
+	} else if ifi != nil {
+		ifi, err = byIndex(ifi.Index)
+	}
+	if err != nil || ifi == nil || ifi.Index <= 0 {
+		return "", false
+	}
+	if ifi.Name != "" {
+		return ifi.Name, true
+	}
+	return strconv.Itoa(ifi.Index), true
 }
 
 func withExpected(endpoint Endpoint, candidate Candidate) ResolvedCandidate {

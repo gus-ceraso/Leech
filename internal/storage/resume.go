@@ -120,7 +120,7 @@ func ScanResume(ctx context.Context, selection *torrent.SelectionPlan, output *P
 			return result, err
 		}
 		if file.complete {
-			if err := output.TruncateSelected(index, file.expected); err != nil {
+			if err := output.truncateSelected(ctx, index, file.expected); err != nil {
 				return result, err
 			}
 			continue
@@ -248,6 +248,10 @@ func hashResumePiece(ctx context.Context, mapping torrent.PiecePlan, files map[i
 // equal the file's torrent length; the operation remains confined to the
 // validated output path.
 func (p *Plan) TruncateSelected(index int, size int64) error {
+	return p.truncateSelected(context.Background(), index, size)
+}
+
+func (p *Plan) truncateSelected(ctx context.Context, index int, size int64) error {
 	position, ok := p.byIndex[index]
 	if !ok {
 		return fmt.Errorf("%w: file index %d is absent from output plan", ErrResumeInvalid, index)
@@ -258,6 +262,9 @@ func (p *Plan) TruncateSelected(index int, size int64) error {
 		return fmt.Errorf("%w: file index %d has truncation size %d, want %d", ErrResumeInvalid, index, size, expected)
 	}
 	if err := p.checkPath(position); err != nil {
+		return err
+	}
+	if err := detachOutput(ctx, entry.Path, size); err != nil {
 		return err
 	}
 	handle, err := openOutputFile(entry.Path, os.O_WRONLY, 0)

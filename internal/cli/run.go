@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sync"
+	"time"
 
 	"github.com/gus-ceraso/Leech/internal/session"
 	"github.com/gus-ceraso/Leech/internal/torrent"
@@ -34,18 +36,18 @@ func RunContext(ctx context.Context, opts Options, stdout, stderr io.Writer) err
 // is the deterministic acceptance seam for local trackers, resolvers, and
 // transport dialers; the executable uses RunContext with production defaults.
 func RunWithSession(ctx context.Context, opts Options, stdout, stderr io.Writer, dependencies session.RunConfig) error {
+	return runWithReporter(ctx, opts, stdout, dependencies, NewReporter(opts.LogLevel, stderr))
+}
+
+func runWithReporter(ctx context.Context, opts Options, stdout io.Writer, dependencies session.RunConfig, reporter *Reporter) error {
 	if stdout == nil {
 		return fmt.Errorf("cli: nil output writer")
 	}
-	if stderr == nil {
-		stderr = io.Discard
-	}
 	source, err := torrent.ParseSource(opts.Source)
 	if err != nil {
-		NewReporter(opts.LogLevel, stderr).PrimaryFailure(err, false)
+		reporter.PrimaryFailure(err, false)
 		return err
 	}
-	reporter := NewReporter(opts.LogLevel, stderr)
 	dependencies.Source = source
 	dependencies.SourceRaw = opts.Source
 	dependencies.OutputDir = opts.Output
@@ -54,33 +56,89 @@ func RunWithSession(ctx context.Context, opts Options, stdout, stderr io.Writer,
 	dependencies.Resume = opts.Resume
 	dependencies.Streaming = opts.Stream
 	dependencies.Timeout = opts.Timeout
+	var statusMu sync.Mutex
+	var activeStatus Status
+	active, pending := false, false
+	renderStatus := func() {
+		shown, err := reporter.renderStatus(activeStatus)
+		pending = !shown && err == nil
+	}
+	stopStatus := func() {}
+	if reporter.statusEnabled() {
+		stop := make(chan struct{})
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			ticker := time.NewTicker(statusInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					statusMu.Lock()
+					if active && pending {
+						renderStatus()
+					}
+					statusMu.Unlock()
+				case <-stop:
+					return
+				}
+			}
+		}()
+		stopStatus = func() { close(stop); <-done }
+	}
 	oldPhase, oldProgress := dependencies.OnPhase, dependencies.OnProgress
+	oldPhaseStatus := dependencies.OnPhaseStatus
 	oldWarning, oldSecondary := dependencies.OnWarning, dependencies.OnSecondary
 	dependencies.OnPhase = func(phase string) {
 		if oldPhase != nil {
 			oldPhase(phase)
 		}
+		statusMu.Lock()
+		active = false
+		pending = false
 		_ = reporter.Phase(phase)
+		statusMu.Unlock()
+	}
+	dependencies.OnPhaseStatus = func(phase string, progress session.RunProgress) {
+		if oldPhaseStatus != nil {
+			oldPhaseStatus(phase, progress)
+		}
+		statusMu.Lock()
+		activeStatus = Status{Phase: phase, VerifiedSelectedBytes: uint64(maxInt64(0, progress.VerifiedSelectedBytes)), SelectedBytes: uint64(maxInt64(0, progress.SelectedBytes))}
+		active = true
+		renderStatus()
+		statusMu.Unlock()
 	}
 	dependencies.OnProgress = func(progress session.RunProgress) {
 		if oldProgress != nil {
 			oldProgress(progress)
 		}
-		_ = reporter.Status(Status{Phase: "transfer", VerifiedSelectedBytes: uint64(maxInt64(0, progress.VerifiedSelectedBytes)), SelectedBytes: uint64(maxInt64(0, progress.SelectedBytes)), ActivePeers: progress.ActivePeers, RecentRateBytesPerSec: progress.RecentRateBytesPerSec})
+		statusMu.Lock()
+		activeStatus = Status{Phase: "transfer", VerifiedSelectedBytes: uint64(maxInt64(0, progress.VerifiedSelectedBytes)), SelectedBytes: uint64(maxInt64(0, progress.SelectedBytes)), ActivePeers: progress.ActivePeers, RecentRateBytesPerSec: progress.RecentRateBytesPerSec}
+		active = true
+		renderStatus()
+		statusMu.Unlock()
 	}
 	dependencies.OnWarning = func(message string) {
 		if oldWarning != nil {
 			oldWarning(message)
 		}
+		statusMu.Lock()
 		_ = reporter.Warning("%s", message)
+		pending = active
+		statusMu.Unlock()
 	}
 	dependencies.OnSecondary = func(shutdownErr error) {
 		if oldSecondary != nil {
 			oldSecondary(shutdownErr)
 		}
+		statusMu.Lock()
 		_ = reporter.SecondaryFailure(shutdownErr)
+		pending = active
+		statusMu.Unlock()
 	}
 	result, err := session.Run(ctx, dependencies)
+	stopStatus()
 	if err != nil {
 		_ = reporter.PrimaryFailure(err, result.HasVerifiedOutput)
 		return err
@@ -90,7 +148,9 @@ func RunWithSession(ctx context.Context, opts Options, stdout, stderr io.Writer,
 		encoder.SetEscapeHTML(false)
 		for _, filePath := range result.Listed {
 			if err := encoder.Encode(filePath); err != nil {
-				return fmt.Errorf("cli: write file listing: %w", err)
+				failure := fmt.Errorf("cli: write file listing: %w", err)
+				_ = reporter.PrimaryFailure(failure, false)
+				return failure
 			}
 		}
 		return nil

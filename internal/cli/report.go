@@ -49,6 +49,7 @@ type Reporter struct {
 
 type statusState struct {
 	shown    bool
+	updated  bool
 	lastTime time.Time
 	lastLen  int
 }
@@ -168,33 +169,43 @@ type Status struct {
 // Status renders one replaceable line at info/debug level on an interactive
 // stderr. Calls made less than one second apart do nothing.
 func (r *Reporter) Status(snapshot Status) error {
+	_, err := r.renderStatus(snapshot)
+	return err
+}
+
+func (r *Reporter) renderStatus(snapshot Status) (bool, error) {
 	if r == nil || !r.statusEnabled() {
-		return nil
+		return false, nil
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	now := r.now()
-	if r.status.shown && now.Sub(r.status.lastTime) < statusInterval {
-		return nil
+	if r.status.updated && now.Sub(r.status.lastTime) < statusInterval {
+		return false, nil
 	}
 	if snapshot.ActivePeers < 0 {
 		snapshot.ActivePeers = 0
 	}
-	line := fmt.Sprintf("status: phase=%s verified=%d/%d bytes peers=%d rate=%d B/s",
-		QuoteName(snapshot.Phase, r.maxBytes), snapshot.VerifiedSelectedBytes,
-		snapshot.SelectedBytes, snapshot.ActivePeers, snapshot.RecentRateBytesPerSec)
+	line := "status: phase=" + QuoteName(snapshot.Phase, r.maxBytes)
+	if snapshot.Phase == "resume" || snapshot.Phase == "transfer" {
+		line += fmt.Sprintf(" verified=%d/%d bytes", snapshot.VerifiedSelectedBytes, snapshot.SelectedBytes)
+	}
+	if snapshot.Phase == "transfer" {
+		line += fmt.Sprintf(" peers=%d rate=%d B/s", snapshot.ActivePeers, snapshot.RecentRateBytesPerSec)
+	}
 	line = truncateString(line, r.maxBytes)
 	if r.status.shown {
 		if _, err := io.WriteString(r.stderr, "\r"+line+strings.Repeat(" ", maxInt(0, r.status.lastLen-len(line)))+"\r"); err != nil {
-			return err
+			return false, err
 		}
 	} else if _, err := io.WriteString(r.stderr, "\r"+line+"\r"); err != nil {
-		return err
+		return false, err
 	}
 	r.status.shown = true
+	r.status.updated = true
 	r.status.lastTime = now
 	r.status.lastLen = len(line)
-	return nil
+	return true, nil
 }
 
 // Result describes a successful terminal result. SelectionComplete and
@@ -265,7 +276,8 @@ func (r *Reporter) writePermanent(level LogLevel, message string) error {
 		if _, err := io.WriteString(r.stderr, "\r"+strings.Repeat(" ", r.status.lastLen)+"\r"); err != nil {
 			return err
 		}
-		r.status = statusState{}
+		r.status.shown = false
+		r.status.lastLen = 0
 	}
 	_, err := fmt.Fprintf(r.stderr, "%s: %s\n", level, message)
 	return err

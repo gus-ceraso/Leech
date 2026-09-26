@@ -177,7 +177,8 @@ func FuzzDecodeBounded(f *testing.F) {
 	for _, seed := range []string{
 		"0:", "i0e", "l1:a1:be", "d3:cow3:moo4:spam4:eggse",
 		"d8:msg_typei1e5:piecei2ee0000",
-		"d1:a1:1e", "i-9223372036854775808e",
+		"d1:a1:1e", "i-9223372036854775808e", "d0:i0e0:i1ee",
+		"9223372036854775808:", "d0:i0e1:ai1ee",
 	} {
 		f.Add([]byte(seed))
 	}

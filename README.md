@@ -5,9 +5,7 @@ at a time, stages pieces on disk, verifies them before writing selected data to
 final paths, and never uploads file payload or torrent metadata. Linux is the
 first supported environment.
 
-The CLI is implemented, but known correctness and resource-handling defects
-remain. [TODO.md](TODO.md) tracks unresolved work; [DESIGN.md](DESIGN.md) defines
-the required behavior.
+[DESIGN.md](DESIGN.md) defines the required behavior.
 
 ## Build
 

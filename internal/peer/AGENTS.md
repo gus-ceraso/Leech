@@ -26,6 +26,8 @@ BEPs [3](../../beps/bep_0003.rst), [6](../../beps/bep_0006.rst),
 - BEP 10 mappings are directional and per connection: local IDs receive, remote
   IDs send. Repeated handshakes update state. Preserve the distinction between
   absent `reqq` and explicit zero; metadata rejects use the current remote ID.
+- Compare metadata message types at their full decoded integer width before
+  narrowing. Unknown integer types remain ignorable within parser/frame bounds.
 
 ## Identity and racing
 
@@ -33,6 +35,9 @@ BEPs [3](../../beps/bep_0003.rst), [6](../../beps/bep_0006.rst),
   strikes, and blacklists. Tracker peer IDs are only expected handshake values;
   their mismatch is not a peer-origin violation. Live-ID collisions retain the
   older connection and release its ID when it closes.
+  Discard zones outside link-local IPv6. Resolve meaningful name/numeric scope
+  aliases to one interface name using Go's name-first socket semantics; invalid
+  interfaces are ordinary candidate failures.
 - `CandidatePool` owns source-fair retention with numeric source keys.
   `EndpointBackoff` owns the 100,000 distinct attempted-endpoint budget shared
   across phases. Retrying known endpoints costs no new entry; candidate churn

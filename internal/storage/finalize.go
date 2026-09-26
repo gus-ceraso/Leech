@@ -321,53 +321,37 @@ func writeSelected(ctx context.Context, stage *PieceStage, selected []torrent.Fi
 	if plan == nil {
 		return errors.New("storage: nil output plan")
 	}
-	// Open only files intersected by this piece. This keeps finalization
-	// bounded by one piece instead of reopening every selected file for every
-	// piece, while still closing every handle before stage removal.
-	indices := make(map[int]struct{}, len(selected))
+	// Validate every intersection before any write, then keep just one output
+	// handle open at a time, even when a piece spans many tiny files.
 	for _, span := range selected {
-		if _, ok := plan.Entry(span.Index); !ok {
+		entry, ok := plan.Entry(span.Index)
+		if !ok {
 			return fmt.Errorf("storage: selected piece range references file %d outside output plan", span.Index)
 		}
-		indices[span.Index] = struct{}{}
-	}
-	for index := range indices {
-		position := plan.byIndex[index]
-		if err := plan.checkPath(position); err != nil {
+		if span.Range.Begin < entry.File.Range.Begin || span.Range.End > entry.File.Range.End || span.Range.End < span.Range.Begin {
+			return errors.New("storage: selected piece range exceeds output file")
+		}
+		if err := plan.checkPath(plan.byIndex[span.Index]); err != nil {
 			return err
 		}
-		entry := plan.entries[position]
+	}
+	buf := make([]byte, limits.BlockBytes)
+	for _, span := range selected {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		entry, _ := plan.Entry(span.Index)
 		if err := os.MkdirAll(filepath.Dir(entry.Path), 0o755); err != nil {
 			return fmt.Errorf("storage: create output directory for %q: %w", entry.Path, err)
 		}
-	}
-	for index := range indices {
-		if err := plan.checkPath(plan.byIndex[index]); err != nil {
+		if err := detachOutput(ctx, entry.Path, -1); err != nil {
 			return err
 		}
-	}
-	handles := make(map[int]outputFile, len(indices))
-	closeHandles := func() error {
-		var closeErr error
-		for _, handle := range handles {
-			closeErr = errors.Join(closeErr, handle.Close())
-		}
-		return closeErr
-	}
-	for index := range indices {
-		entry, _ := plan.Entry(index)
-		handle, err := openOutputFile(entry.Path, os.O_WRONLY|os.O_CREATE, 0o666)
+		handle, err := openOutput(entry.Path, os.O_WRONLY|os.O_CREATE)
 		if err != nil {
-			return errors.Join(fmt.Errorf("storage: open %q: %w", entry.Path, err), closeHandles())
+			return err
 		}
-		if handle == nil {
-			return errors.Join(fmt.Errorf("storage: open %q returned a nil handle", entry.Path), closeHandles())
-		}
-		handles[index] = handle
-	}
-	writeErr := error(nil)
-	buf := make([]byte, limits.BlockBytes)
-	for _, span := range selected {
+		var writeErr error
 		for offset := span.Range.Begin; offset < span.Range.End; {
 			if err := ctx.Err(); err != nil {
 				writeErr = err
@@ -380,7 +364,7 @@ func writeSelected(ctx context.Context, stage *PieceStage, selected []torrent.Fi
 			}
 			n, err := stage.ReadAt(buf[:int(amount)], offset-stage.piece.Range.Begin)
 			if n > 0 {
-				if err := writeOutputRange(plan, handles[span.Index], span.Index, offset, buf[:n]); err != nil {
+				if err := writeOutputRange(plan, handle, span.Index, offset, buf[:n]); err != nil {
 					writeErr = err
 					break
 				}
@@ -395,11 +379,11 @@ func writeSelected(ctx context.Context, stage *PieceStage, selected []torrent.Fi
 				break
 			}
 		}
-		if writeErr != nil {
-			break
+		if err := errors.Join(writeErr, handle.Close()); err != nil {
+			return err
 		}
 	}
-	return errors.Join(writeErr, closeHandles())
+	return nil
 }
 
 func writeOutputRange(plan *Plan, handle outputFile, index int, globalOffset int64, data []byte) error {

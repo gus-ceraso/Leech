@@ -8,7 +8,15 @@ Read [DESIGN §§8–9](../../DESIGN.md#8-selection-and-storage-mapping),
   output. Check the complete plan before destructive preparation. Resolve the
   destination root once, then refuse descendant symlinks and unsafe or colliding
   paths. Torrent-relative limits and filesystem representability are separate
-  concerns; hostile concurrent local races remain outside scope.
+  concerns: relative limits exclude `info.name`, while Linux also checks absolute
+  syscall path length and component length. Hostile concurrent local races remain
+  outside scope.
+- Selected mutations must not modify another pathname's inode. Detach hardlinked
+  files before overwrite, verified writes, or resume truncation. Copy with one
+  block of memory and an initial-size bound; preserve resume suffixes until
+  verification permits truncation, and honor cancellation when context is available.
+- Preparation and writes close each output before opening the next. `Prepared`
+  retains no file descriptors; each operation reports its own close failures.
 - Consume the immutable selection plan: selected regular-file intersections
   reach output, padding is synthetic, and unwanted real bytes stay in staging.
   Preparation creates selected zero-length files because no piece commit will.

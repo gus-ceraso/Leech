@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -325,11 +326,8 @@ func TestTransferReqQPresencePreservesExplicitZero(t *testing.T) {
 		t.Fatal(err)
 	}
 	offer, ok, err := transfer.scheduler.ReservePiece(p.input.ID)
-	if err != nil || !ok {
-		t.Fatalf("zero reqq reserve = %#v, %v", offer, err)
-	}
-	if err := transfer.scheduler.AdmitPiece(offer); err != nil {
-		t.Fatal(err)
+	if err != nil || ok {
+		t.Fatalf("zero reqq reserve = %#v, %t, %v; want no reservation", offer, ok, err)
 	}
 	requests, err := transfer.scheduler.NextRequests(p.input.ID, p.state.ReqQ())
 	if err != nil {
@@ -1273,20 +1271,23 @@ func TestTransferEndgameDuplicateWinnerDoesNotDoubleCommit(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := transfer.Run(ctx); err != nil {
-		t.Fatal(err)
-	}
-	if err := <-firstDone; err != nil {
-		t.Fatal(err)
-	}
-	if err := <-secondDone; err != nil {
-		t.Fatal(err)
+	runErr := transfer.Run(ctx)
+	firstErr, secondErr := <-firstDone, <-secondDone
+	if runErr != nil {
+		t.Fatalf("transfer = %v; fixture peers = %v, %v", runErr, firstErr, secondErr)
 	}
 	if got, err := os.ReadFile(filepath.Join(root, "fixture")); err != nil || string(got) != string(data) {
 		t.Fatalf("output = %q, %v", got, err)
 	}
 	if progress := transfer.Progress(); progress.Verified != int64(len(data)) {
 		t.Fatalf("progress = %#v", progress)
+	}
+	// The winner can commit while the other fixture peer is writing its
+	// redundant response. Closing that connection may interrupt the write.
+	for _, err := range []error{firstErr, secondErr} {
+		if err != nil && !errors.Is(err, syscall.EPIPE) && !errors.Is(err, syscall.ECONNRESET) {
+			t.Fatalf("fixture peer = %v", err)
+		}
 	}
 }
 

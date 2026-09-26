@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/netip"
 	"reflect"
+	"slices"
 	"sync"
 	"time"
 
@@ -33,7 +34,8 @@ var (
 
 // PeerAcquire returns one already-handshaken candidate. The callback must
 // honor ctx so Transfer can join it during cancellation and shutdown. A
-// temporary lack of candidates should return ErrNoPeer.
+// temporary lack of candidates should return ErrNoPeer. Errors with Temporary()
+// returning true are also retried with backoff; all other errors end the transfer.
 type PeerAcquire func(context.Context) (ConnectedPeer, error)
 
 // PieceVerified is emitted after a staged piece has passed SHA-1 verification
@@ -348,6 +350,9 @@ func (t *Transfer) Run(ctx context.Context) error {
 			primary = err
 			break
 		}
+		if t.scheduler.IsComplete() {
+			break
+		}
 		if err := t.drive(ctx, &peers); err != nil {
 			if errors.Is(err, peer.ErrWorkerClosed) && (countLive(peers) > 0 || acquired != nil) {
 				continue
@@ -478,7 +483,7 @@ func (t *Transfer) handleRunPeerEvent(ctx context.Context, peers []*transferPeer
 	err := t.handleEventWithPeers(ctx, peers, peers[index], event)
 	// A single endpoint failure is recoverable when another connected peer or
 	// the admission loop can finish the work.
-	if err != nil && peers[index].done && (countLive(peers) > 0 || canAcquire) && !errors.Is(err, storage.ErrStagingFatal) {
+	if err != nil && peers[index].done && (t.scheduler.IsComplete() || countLive(peers) > 0 || canAcquire) && !errors.Is(err, storage.ErrStagingFatal) {
 		return nil
 	}
 	return err
@@ -563,6 +568,11 @@ func (t *Transfer) startPeer(ctx context.Context, input ConnectedPeer) (*transfe
 }
 
 func (t *Transfer) drive(ctx context.Context, peers *[]*transferPeer) error {
+	// Disconnect joins the worker and releases its ownership. Retire entries
+	// after this pass, when no event index or peer iteration can be invalidated.
+	defer func() {
+		*peers = slices.DeleteFunc(*peers, func(p *transferPeer) bool { return p == nil || p.done })
+	}()
 	if err := t.rotateUnproductive(ctx, peers); err != nil {
 		return err
 	}
@@ -574,18 +584,25 @@ func (t *Transfer) drive(ctx context.Context, peers *[]*transferPeer) error {
 			_ = t.disconnectPeer(p, fmt.Errorf("peer endpoint blacklisted"))
 			continue
 		}
-		if p.state.RequestableCount() == 0 {
+		if p.state.RequestableCount() == 0 || !t.scheduler.hasRequestCapacity(t.scheduler.peers[p.input.ID]) {
 			continue
 		}
 		// Admission is separate from assignment.  A stage must exist before
 		// any request can be sent, and a failed admission is fatal storage
 		// failure rather than a peer-local retry.
 		for {
-			offer, ok, err := t.scheduler.ReservePiece(p.input.ID)
+			offer, ok, err := t.scheduler.reservePieceExcluding(p.input.ID, p.tombstoned)
 			if err != nil {
 				return err
 			}
 			if !ok {
+				reclaimed, err := t.reclaimUnusableStages(*peers, p)
+				if err != nil {
+					return err
+				}
+				if reclaimed {
+					continue
+				}
 				break
 			}
 			mapping, exists := t.selection.Piece(offer.PieceIndex)
@@ -649,6 +666,69 @@ func (t *Transfer) drive(ctx context.Context, peers *[]*transferPeer) error {
 	return nil
 }
 
+// Reclaim only when an eligible new piece cannot fit. A temporarily full peer
+// pipeline still protects its partial stages; only zero capacity, unavailable
+// pieces, and exact outstanding terminal obligations prevent future progress.
+func (t *Transfer) reclaimUnusableStages(peers []*transferPeer, waiting *transferPeer) (bool, error) {
+	s := t.scheduler
+	p := s.peers[waiting.input.ID]
+	_, _, _, found, err := s.nextReservation(p, waiting.input.ID, waiting.tombstoned)
+	if err != nil || !found {
+		return false, err
+	}
+	reclaimed := false
+	indices := make([]int, 0, len(t.stages))
+	for index := range t.stages {
+		indices = append(indices, index)
+	}
+	// Empty stages cost no accepted data. Keep partial stages for a future
+	// replacement when freeing an empty one is enough.
+	slices.SortFunc(indices, func(a, b int) int {
+		acceptedA := len(s.pieces[a].blocks) - s.pieces[a].remaining
+		acceptedB := len(s.pieces[b].blocks) - s.pieces[b].remaining
+		if acceptedA != acceptedB {
+			return acceptedA - acceptedB
+		}
+		return a - b
+	})
+	for _, index := range indices {
+		stage := t.stages[index]
+		piece := s.pieces[index]
+		if anyActive(piece) || allDone(piece) {
+			continue
+		}
+		useful := false
+		for _, live := range peers {
+			if live.done || live.state.ReqQ() == 0 || s.IsBlacklisted(live.input.Endpoint) || !live.state.CanRequest(uint32(index)) {
+				continue
+			}
+			if firstAssignableBlock(piece, live.input.ID, false, live.tombstoned) >= 0 {
+				useful = true
+				break
+			}
+		}
+		if useful {
+			continue
+		}
+		if err := stage.Abort(); err != nil {
+			return false, fmt.Errorf("%w: reclaim piece %d: %w", storage.ErrStagingFatal, index, err)
+		}
+		delete(t.stages, index)
+		if err := s.discardPiece(index); err != nil {
+			return false, err
+		}
+		reclaimed = true
+		_, fit, _, _, err := s.nextReservation(p, waiting.input.ID, waiting.tombstoned)
+		if err != nil {
+			return false, err
+		}
+		if fit {
+			break
+		}
+	}
+	return reclaimed, nil
+}
+
 type acquireResult struct {
 	peer ConnectedPeer
 	err  error
@@ -672,18 +752,16 @@ func (t *Transfer) acquireLoop(ctx context.Context, results chan<- acquireResult
 			delay = peerAcquireBase
 			continue
 		}
-		var budgetErr *peer.EndpointBudgetError
-		if errors.As(err, &budgetErr) {
+		if ctx.Err() != nil {
+			return
+		}
+		var temporary interface{ Temporary() bool }
+		if !errors.Is(err, ErrNoPeer) && !(errors.As(err, &temporary) && temporary.Temporary()) {
 			select {
-			case results <- acquireResult{err: budgetErr}:
+			case results <- acquireResult{err: err}:
 			case <-ctx.Done():
 			}
 			return
-		}
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			if ctx.Err() != nil {
-				return
-			}
 		}
 		timer := time.NewTimer(delay)
 		select {

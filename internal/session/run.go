@@ -65,10 +65,13 @@ type RunConfig struct {
 	Updates    <-chan tracker.Update
 	backoff    *peer.EndpointBackoff
 
-	OnPhase     func(string)
-	OnProgress  func(RunProgress)
-	OnWarning   func(string)
-	OnSecondary func(error)
+	OnPhase func(string)
+	// OnPhaseStatus follows OnPhase for metadata, resume, and transfer entry.
+	// It is separate from OnProgress, which reports committed pieces only.
+	OnPhaseStatus func(string, RunProgress)
+	OnProgress    func(RunProgress)
+	OnWarning     func(string)
+	OnSecondary   func(error)
 }
 
 // RunResult describes the validated session result.  Metainfo and Selection
@@ -201,7 +204,7 @@ func Run(ctx context.Context, config RunConfig) (result RunResult, err error) {
 		}
 	case torrent.SourceMagnet, torrent.SourceInfoHash:
 		if config.TrackerSet == nil {
-			run.phase("metadata")
+			run.activePhase("metadata", RunProgress{})
 			metadata, discoverErr := run.discover(ctx, source)
 			if discoverErr != nil {
 				return RunResult{}, discoverErr
@@ -214,7 +217,7 @@ func Run(ctx context.Context, config RunConfig) (result RunResult, err error) {
 		} else {
 			// An injected set still needs the ordinary metadata phase for a
 			// magnet/hash source; its caller owns set construction and callbacks.
-			run.phase("metadata")
+			run.activePhase("metadata", RunProgress{})
 			metadata, discoverErr := run.discover(ctx, source)
 			if discoverErr != nil {
 				return RunResult{}, discoverErr
@@ -246,7 +249,7 @@ func Run(ctx context.Context, config RunConfig) (result RunResult, err error) {
 
 	resumeResult := storage.ResumeResult{}
 	if config.Resume {
-		run.phase("resume")
+		run.activePhase("resume", RunProgress{SelectedBytes: runSelectedBytes(selection)})
 		resumeResult, err = storage.ScanResume(ctx, selection, plan)
 		if len(resumeResult.VerifiedPieces) > 0 {
 			verifiedOutput.Store(true)
@@ -304,7 +307,11 @@ func Run(ctx context.Context, config RunConfig) (result RunResult, err error) {
 		return RunResult{Metainfo: meta, Selection: selection, SelectionComplete: true, TorrentComplete: fullSelection(meta, selection)}, nil
 	}
 
-	run.phase("transfer")
+	verifiedSelected := int64(0)
+	for _, span := range resumeResult.VerifiedRanges {
+		verifiedSelected += span.Range.End - span.Range.Begin
+	}
+	run.activePhase("transfer", RunProgress{VerifiedSelectedBytes: verifiedSelected, SelectedBytes: runSelectedBytes(selection)})
 	if err := run.startTransferPhase(ctx, source, meta, selection, plan, resumeResult); err != nil {
 		return RunResult{}, err
 	}
@@ -381,6 +388,13 @@ type coordinator struct {
 func (c *coordinator) phase(name string) {
 	if c != nil && c.config.OnPhase != nil {
 		c.config.OnPhase(name)
+	}
+}
+
+func (c *coordinator) activePhase(name string, progress RunProgress) {
+	c.phase(name)
+	if c.config.OnPhaseStatus != nil {
+		c.config.OnPhaseStatus(name, progress)
 	}
 }
 
@@ -552,41 +566,34 @@ func (c *coordinator) startTransferPhase(ctx context.Context, source torrent.Sou
 		return err
 	}
 	admission := newTrackerPeerResolver(runCtx, c.config.Resolver, c.updateQueue)
-	defer func() {
+	defer c.updateQueue.clear()
+	quiesceAdmission := func() {
+		cancel()
+		trackerRun.Wait()
 		admission.close()
 		c.updateQueue.clear()
-	}()
+	}
 	var liveMu sync.Mutex
 	live := make(map[net.Conn]*peer.LivePeer)
-	var candidateCursorMu sync.Mutex
 	candidateCursor := 0
 	acquire := func(acquireCtx context.Context) (ConnectedPeer, error) {
 		for {
 			if c.overflow.Load() {
-				return ConnectedPeer{}, errors.New("session tracker event queue is full")
+				return ConnectedPeer{}, ErrTrackerUpdateQueue
 			}
 			admission.pump(acquireCtx, tracker.TransferPhase, pool)
-			select {
-			case <-c.updateQueue.notify:
-				candidateCursorMu.Lock()
-				candidateCursor = 0
-				candidateCursorMu.Unlock()
-			default:
-			}
 			snapshot := pool.Snapshot()
-			candidateCursorMu.Lock()
-			start := 0
-			if len(snapshot) > 0 {
-				start = candidateCursor % len(snapshot)
-				candidateCursor = (start + trackerAdmissionBatch) % len(snapshot)
-			}
-			candidateCursorMu.Unlock()
 			checked := len(snapshot)
 			if checked > trackerAdmissionBatch {
 				checked = trackerAdmissionBatch
 			}
 			for i := 0; i < checked; i++ {
-				candidate := snapshot[(start+i)%len(snapshot)]
+				if err := acquireCtx.Err(); err != nil {
+					return ConnectedPeer{}, err
+				}
+				index := candidateCursor % len(snapshot)
+				candidate := snapshot[index]
+				candidateCursor = (index + 1) % len(snapshot)
 				if !c.backoff.Ready(candidate.Endpoint, time.Now()) {
 					continue
 				}
@@ -598,7 +605,7 @@ func (c *coordinator) startTransferPhase(ctx context.Context, source torrent.Sou
 					if errors.As(dialErr, &budgetErr) {
 						return ConnectedPeer{}, budgetErr
 					}
-					break
+					continue
 				}
 				liveMu.Lock()
 				live[admitted.Conn] = admitted
@@ -614,15 +621,9 @@ func (c *coordinator) startTransferPhase(ctx context.Context, source torrent.Sou
 				}
 				if enqueueErr := c.updateQueue.enqueue(update); enqueueErr != nil {
 					c.overflow.Store(true)
-					return ConnectedPeer{}, errors.New("session tracker event queue is full")
+					return ConnectedPeer{}, ErrTrackerUpdateQueue
 				}
-				candidateCursorMu.Lock()
-				candidateCursor = 0
-				candidateCursorMu.Unlock()
 			case <-c.updateQueue.notify:
-				candidateCursorMu.Lock()
-				candidateCursor = 0
-				candidateCursorMu.Unlock()
 			case <-time.After(100 * time.Millisecond):
 			}
 		}
@@ -695,6 +696,7 @@ func (c *coordinator) startTransferPhase(ctx context.Context, source torrent.Sou
 		},
 	})
 	if err != nil {
+		quiesceAdmission()
 		_ = trackerRun.Finalize(context.Background(), false)
 		return err
 	}
@@ -772,10 +774,9 @@ func (c *coordinator) startTransferPhase(ctx context.Context, source torrent.Sou
 		}
 	}
 	full := err == nil && fullSelection(meta, selection)
-	// Transfer.Run has joined every peer and finalizer worker.  Cancel and join
-	// regular tracker loops before entering the one-shot terminal sequence so a
-	// normal announce cannot race a stopped event.
-	trackerRun.Wait()
+	// Transfer.Run has joined every peer and finalizer worker. Join admission
+	// too, and discard queued peers before the one-shot terminal sequence.
+	quiesceAdmission()
 	if finalErr := trackerRun.Finalize(context.Background(), full); finalErr != nil && c.config.OnSecondary != nil {
 		c.config.OnSecondary(finalErr)
 	}

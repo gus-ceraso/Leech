@@ -11,8 +11,8 @@ Leech is a stateless, single-torrent, download-only BitTorrent v1 CLI in Go.
 ## Read first
 
 - [DESIGN.md](DESIGN.md) is the authoritative behavior contract. Read relevant
-  sections before changing a boundary. [TODO.md](TODO.md) tracks unresolved work;
-  passing tests or completed historical tasks do not establish full conformance.
+  sections before changing a boundary. Passing tests or completed historical
+  tasks do not establish full conformance.
 - [beps/](beps/) contains the authoritative local protocol specifications. Start
   with BEP 3 and the relevant extensions; DESIGN records intentional overrides.
 - [README.md](README.md) is the user-facing build and usage guide.
@@ -38,7 +38,7 @@ internal/
 `cmd/leech` is the process adapter; read the CLI guide when changing it.
 `internal/limits` holds shared supported-domain limits from DESIGN §16.
 Keep this map complete. Record durable decisions and pitfalls in their owning
-guide and unresolved findings in TODO. Omit task history from working guidance.
+guide. Omit task history from working guidance.
 
 ## Shared guardrails
 

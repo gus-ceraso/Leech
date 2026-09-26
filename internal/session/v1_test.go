@@ -51,6 +51,7 @@ func FuzzSchedulerStrikeAccounting(f *testing.F) {
 			if err := scheduler.AdmitPiece(offer); err != nil {
 				t.Fatal(err)
 			}
+			assertSchedulerWork(t, scheduler)
 			first, err := scheduler.NextRequests("first", 1)
 			if err != nil || len(first) != 1 {
 				t.Fatalf("round %d first requests = %#v, %v", round, first, err)
@@ -65,6 +66,7 @@ func FuzzSchedulerStrikeAccounting(f *testing.F) {
 			if _, err := scheduler.AcceptBlock("second", second[0].Block); err != nil {
 				t.Fatal(err)
 			}
+			assertSchedulerWork(t, scheduler)
 			verification, err := scheduler.VerifyPiece(0, false)
 			if err != nil {
 				t.Fatal(err)
@@ -76,6 +78,7 @@ func FuzzSchedulerStrikeAccounting(f *testing.F) {
 			if len(verification.Contributors) != wantContributors || len(verification.Strikes) != wantContributors {
 				t.Fatalf("round %d contributors/strikes = %v/%v, want %d", round, verification.Contributors, verification.Strikes, wantContributors)
 			}
+			assertSchedulerWork(t, scheduler)
 		}
 		if got := scheduler.StrikeCount(endpoint(1)); got != attempts {
 			t.Fatalf("first endpoint strikes=%d, want %d", got, attempts)

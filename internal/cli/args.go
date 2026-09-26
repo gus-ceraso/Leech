@@ -83,7 +83,7 @@ type UsageError struct {
 func (e *UsageError) Error() string { return e.Message }
 
 func usageError(format string, args ...any) error {
-	return &UsageError{Message: fmt.Sprintf(format, args...)}
+	return &UsageError{Message: SanitizeDiagnostic(fmt.Sprintf(format, args...))}
 }
 
 // ParseArgs parses arguments after argv[0]. It performs no filesystem,
@@ -215,7 +215,7 @@ func parseLongOption(arg string, argv []string, index *int, opts *Options) error
 		}
 		opts.Timeout, opts.TimeoutSet = duration, true
 	default:
-		return usageError("unknown option %s", name)
+		return usageError("unknown option %q", name)
 	}
 	return nil
 }
@@ -270,7 +270,7 @@ func parseShortOption(arg string, argv []string, index *int, opts *Options) erro
 		}
 		opts.Timeout, opts.TimeoutSet = duration, true
 	default:
-		return usageError("unknown or combined short option %s", arg)
+		return usageError("unknown or combined short option %q", arg)
 	}
 	return nil
 }

@@ -244,11 +244,20 @@ func TestReadMetainfoBoundsInput(t *testing.T) {
 }
 
 func FuzzParseMetainfoBounded(f *testing.F) {
+	f.Add([]byte("d6:lengthi0e4:name1:x12:piece lengthi1e6:pieces0:e"))
+	f.Add([]byte("d4:infod6:lengthi0e4:name1:x12:piece lengthi1e6:pieces0:1:ud0:2:\x00\xffeee"))
+	f.Add([]byte("d4:infod6:lengthi274877906945e4:name1:x12:piece lengthi1e6:pieces0:ee"))
 	f.Add([]byte("d4:infod6:lengthi0e4:name5:empty12:piece lengthi16384e6:pieces0:ee"))
 	f.Add([]byte("d4:infod6:lengthi1e4:name1:x12:piece lengthi1e6:pieces20:aaaaaaaaaaaaaaaaaaaaee"))
 	f.Fuzz(func(t *testing.T, input []byte) {
-		_, _ = ParseMetainfo(input)
-		_, _ = ParseInfoDictionary(input, InfoHash{}, nil)
+		if meta, err := ParseMetainfo(input); err == nil {
+			assertInputReviewMetainfo(t, meta)
+		}
+		// Match the supplied bytes so valid fetched dictionaries reach full
+		// normalization instead of always stopping at the info-hash check.
+		if meta, err := ParseInfoDictionary(input, InfoHash(sha1.Sum(input)), nil); err == nil {
+			assertInputReviewMetainfo(t, meta)
+		}
 	})
 }
 

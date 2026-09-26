@@ -21,8 +21,8 @@ func TestPacketBEP29Vector(t *testing.T) {
 		got.WindowSize != 0x11223344 || got.SeqNr != Sequence(0xfffe) || got.AckNr != Sequence(0xffff) {
 		t.Fatalf("decoded header: %+v", got)
 	}
-	if len(got.Extensions) != 2 || got.Extensions[0].Type != 2 || !bytes.Equal(got.Extensions[0].Data, []byte{0xaa, 0xbb, 0xcc}) ||
-		got.Extensions[1].Type != SelectiveACKExtension || !bytes.Equal(got.Extensions[1].Data, []byte{1, 0, 0, 0}) {
+	if len(got.Extensions) != 1 || got.Extensions[0].Type != SelectiveACKExtension ||
+		!bytes.Equal(got.Extensions[0].Data, []byte{1, 0, 0, 0}) {
 		t.Fatalf("decoded extensions: %+v", got.Extensions)
 	}
 	if !bytes.Equal(got.Payload, []byte("xy")) {
@@ -32,8 +32,10 @@ func TestPacketBEP29Vector(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MarshalBinary: %v", err)
 	}
-	if !bytes.Equal(encoded, wire) {
-		t.Fatalf("round trip differs:\n got  %x\n want %x", encoded, wire)
+	// The unknown extension is valid framing, but is omitted on re-encoding.
+	want, _ := hex.DecodeString("01011234010203040506070811223344fffeffff0004010000007879")
+	if !bytes.Equal(encoded, want) {
+		t.Fatalf("encoded known fields differ:\n got  %x\n want %x", encoded, want)
 	}
 }
 
@@ -128,6 +130,13 @@ func FuzzParsePacketBounded(f *testing.F) {
 	seed[HeaderBytes] = 1
 	f.Add(seed)
 	f.Add([]byte{0, 1, 2})
+	f.Add([]byte{0x21, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 4, 0x81, 0, 0, 0})
+	unknownChain := make([]byte, HeaderBytes+2*32757)
+	unknownChain[0], unknownChain[1] = byte(State)<<4|ProtocolVersion, 2
+	for i := HeaderBytes; i < len(unknownChain)-2; i += 2 {
+		unknownChain[i] = 2
+	}
+	f.Add(unknownChain)
 	f.Fuzz(func(t *testing.T, wire []byte) {
 		if len(wire) > (1<<16)+1 {
 			wire = wire[:(1<<16)+1]

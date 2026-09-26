@@ -7,6 +7,8 @@ exit; this package adapts arguments, reporting, and signals to `session.Run`.
 - Parsing has no network or output/cache mutations. Preserve source precedence
   and explicit-option tracking: a list-mode conflict remains an error even when
   the supplied option equals its default.
+- Construct parser usage errors through `usageError`, which bounds and sanitizes
+  their text before the process adapter prints it.
 - Listing ends after metadata validation and does not validate a destination or
   prepare output. Keep its JSON on stdout and diagnostics/status on stderr;
   help and usage follow their separate DESIGN rules.
@@ -17,6 +19,10 @@ exit; this package adapts arguments, reporting, and signals to `session.Run`.
   and between completed selection, completed torrent, already-valid resume, and
   retained verified partial output.
 - Keep phase/progress reporting testable with controlled time and TTY state.
+  Phase-entry status uses `OnPhaseStatus`; `OnProgress` remains commit-only.
+  Permanent lines clear the displayed status without resetting its one-second
+  throttle. One CLI-owned worker retries the latest deferred snapshot and joins
+  before final output, so a stalled phase still gets status after a fast change.
   Isolate platform terminal checks in `signals_terminal_*`.
 - Keep the signal owner live during graceful cleanup so a second signal can
   exit immediately. Reusable session code must not call `os.Exit`.

@@ -62,15 +62,15 @@ var (
 )
 
 // Extension is one node in the BEP 29 extension chain. Type is the type of
-// this node, not the type of the next node. Unknown types are retained so the
-// state layer can ignore them without losing framing.
+// this node, not the type of the next node. ParsePacket retains only SACK;
+// unknown types are skipped after their framing has been checked.
 type Extension struct {
 	Type uint8
 	Data []byte
 }
 
-// Packet is a decoded version 1 uTP datagram. Payload and extension Data are
-// copied by ParsePacket and are owned by the returned Packet.
+// Packet is a decoded version 1 uTP datagram. Payload and supported extension
+// Data are copied by ParsePacket and are owned by the returned Packet.
 //
 // A zero Version means version 1 when encoding, which keeps packet literals
 // concise while still exposing the version received on the wire.
@@ -155,8 +155,11 @@ func ParsePacket(data []byte) (Packet, error) {
 			}
 			seenSACK = true
 		}
-		payload := cloneBytes(data[offset : offset+length])
-		packet.Extensions = append(packet.Extensions, Extension{Type: current, Data: payload})
+		if current == SelectiveACKExtension {
+			packet.Extensions = append(packet.Extensions, Extension{
+				Type: current, Data: cloneBytes(data[offset : offset+length]),
+			})
+		}
 		offset += length
 	}
 

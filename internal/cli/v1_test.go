@@ -819,11 +819,17 @@ func TestV1MagnetAndBareHashRunMetadataThenTransferThroughCLI(t *testing.T) {
 			trackerFixture := &v1Tracker{}
 			peers := newV1Peers(t, infoHash, infoBytes, data, true)
 			opts := parseV1Options(t, "--output", output, test.source)
+			config := v1SessionConfig(t, trackerFixture, peers)
+			var phases []string
+			config.OnPhase = func(phase string) { phases = append(phases, phase) }
 			ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 			defer cancel()
-			err := RunWithSession(ctx, opts, &bytes.Buffer{}, &bytes.Buffer{}, v1SessionConfig(t, trackerFixture, peers))
+			err := RunWithSession(ctx, opts, &bytes.Buffer{}, &bytes.Buffer{}, config)
 			if err != nil {
 				t.Fatalf("CLI run: %v", err)
+			}
+			if got := strings.Join(phases, ","); got != "metadata,selection,transfer" {
+				t.Fatalf("CLI phases = %q, want metadata,selection,transfer", got)
 			}
 			if err := peers.wait(t); err != nil {
 				t.Fatal(err)
@@ -833,7 +839,9 @@ func TestV1MagnetAndBareHashRunMetadataThenTransferThroughCLI(t *testing.T) {
 				t.Fatalf("output = %q, %v; want %q", got, err, data)
 			}
 			urls, requests := trackerFixture.snapshot()
-			assertV1TrackerTrace(t, urls, requests, []string{torrent.DefaultTracker}, int64(len(data)), true)
+			// An embedded magnet peer can finish metadata before the tracker
+			// announces. A bare hash needs the tracker to find its supplier.
+			assertV1TrackerTrace(t, urls, requests, []string{torrent.DefaultTracker}, int64(len(data)), test.name == "bare hash")
 			peers.assertNoUpload(t)
 		})
 	}
@@ -902,8 +910,8 @@ func assertV1TrackerTrace(t *testing.T, urls []string, requests []tracker.Announ
 			t.Errorf("tracker %s missing started/completed/stopped trace: %v", rawURL, sequence)
 		}
 	}
-	if metadataPhase && (!seenMetadataLeft || !seenTransferLeft) {
-		t.Errorf("metadata and transfer left accounting absent: metadata=%v transfer=%v; requests=%+v", seenMetadataLeft, seenTransferLeft, requests)
+	if !seenTransferLeft || metadataPhase && !seenMetadataLeft {
+		t.Errorf("tracker left accounting absent: metadata=%v transfer=%v; requests=%+v", seenMetadataLeft, seenTransferLeft, requests)
 	}
 }
 

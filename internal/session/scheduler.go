@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"maps"
 	"math/big"
 	"math/bits"
 	"sort"
@@ -128,6 +129,7 @@ type blockState struct {
 	// access; assignments is authoritative once endgame duplicates exist.
 	assignments map[string]peer.Endpoint
 	done        bool
+	pendingPos  int
 }
 
 type pieceStage uint8
@@ -141,6 +143,9 @@ const (
 type pieceState struct {
 	plan         torrent.PiecePlan
 	blocks       []blockState
+	pending      []int
+	activeBlocks map[uint32]int
+	remaining    int
 	rarity       int
 	stage        pieceStage
 	reservation  uint64
@@ -149,10 +154,16 @@ type pieceState struct {
 }
 
 type schedulerPeer struct {
-	endpoint  peer.Endpoint
-	limit     int
-	available []uint64
-	active    int
+	endpoint        peer.Endpoint
+	limit           int
+	available       map[int]uint64
+	active          int
+	offerGeneration uint64
+	offerIndex      int
+	offerFound      bool
+	pressureIndex   int
+	pressureFound   bool
+	offerExcluded   map[peer.Block]struct{}
 }
 
 // Scheduler is a single-owner, pure state coordinator. Callers must serialize
@@ -162,21 +173,22 @@ type Scheduler struct {
 	cfg       Config
 	shuffle   ShuffleFunc
 	pieces    map[int]*pieceState
-	order     []int
 	peers     map[string]*schedulerPeer
 	strikes   map[peer.Endpoint]int
 	blacklist map[peer.Endpoint]struct{}
 
-	reservation       uint64
-	active            int
-	staged            int
-	reserved          int
-	stagedBytes       int64
-	reservedBytes     int64
-	verified          int64
-	selected          int64
-	pieceCount        int
-	availabilityWords int
+	reservation     uint64
+	active          int
+	staged          int
+	reserved        int
+	stagedBytes     int64
+	reservedBytes   int64
+	verified        int64
+	selected        int64
+	admitted        map[int]*pieceState
+	remainingBlocks int
+	pendingTotal    int
+	generation      uint64
 }
 
 // NewScheduler validates and copies a selection plan into a fresh coordinator.
@@ -191,12 +203,14 @@ func NewScheduler(plan *torrent.SelectionPlan, config Config) (*Scheduler, error
 		return nil, err
 	}
 	s := &Scheduler{
-		cfg:       cfg,
-		shuffle:   cfg.Shuffle,
-		pieces:    make(map[int]*pieceState),
-		peers:     make(map[string]*schedulerPeer),
-		strikes:   make(map[peer.Endpoint]int),
-		blacklist: make(map[peer.Endpoint]struct{}),
+		cfg:        cfg,
+		shuffle:    cfg.Shuffle,
+		pieces:     make(map[int]*pieceState),
+		peers:      make(map[string]*schedulerPeer),
+		strikes:    make(map[peer.Endpoint]int),
+		blacklist:  make(map[peer.Endpoint]struct{}),
+		admitted:   make(map[int]*pieceState),
+		generation: 1,
 	}
 	for _, pp := range plan.PiecePlans() {
 		if pp.Piece.Index < 0 || pp.Piece.Index >= limits.Pieces {
@@ -217,6 +231,9 @@ func NewScheduler(plan *torrent.SelectionPlan, config Config) (*Scheduler, error
 			blocks:       blocks,
 			contributors: make(map[peer.Endpoint]struct{}),
 		}
+		p.resetBlocks()
+		s.remainingBlocks += p.remaining
+		s.pendingTotal += len(p.pending)
 		// Keep this check close to the derived value. SelectionPlan has already
 		// validated it, but scheduler state is a trust boundary as well.
 		if selected < 0 {
@@ -224,15 +241,10 @@ func NewScheduler(plan *torrent.SelectionPlan, config Config) (*Scheduler, error
 		}
 		s.selected += selected
 		s.pieces[pp.Piece.Index] = p
-		s.order = append(s.order, pp.Piece.Index)
-		if pp.Piece.Index+1 > s.pieceCount {
-			s.pieceCount = pp.Piece.Index + 1
-		}
 	}
 	if len(s.pieces) == 0 {
 		return nil, fmt.Errorf("%w: selection has no wanted pieces", ErrSchedulerConfig)
 	}
-	s.availabilityWords = (s.pieceCount + 63) / 64
 	return s, nil
 }
 
@@ -301,18 +313,16 @@ func makeBlocks(pp torrent.PiecePlan) ([]blockState, int64, error) {
 			return nil, 0, fmt.Errorf("%w: selected byte count overflows", ErrSchedulerConfig)
 		}
 	}
-	for _, span := range pp.Data {
-		for cursor := span.Range.Begin; cursor < span.Range.End; {
-			remaining := span.Range.End - cursor
-			n := remaining
-			if n > limits.BlockBytes {
-				n = limits.BlockBytes
-			}
-			offset := cursor - begin
-			if offset < 0 || n <= 0 {
-				return nil, 0, fmt.Errorf("%w: block arithmetic overflows", ErrSchedulerConfig)
-			}
-			blocks = append(blocks, blockState{block: peer.Block{Index: uint32(pp.Piece.Index), Begin: uint32(offset), Length: uint32(n)}})
+	for i := 0; i < len(pp.Data); {
+		spanBegin, spanEnd := pp.Data[i].Range.Begin, pp.Data[i].Range.End
+		i++
+		for i < len(pp.Data) && pp.Data[i].Range.Begin == spanEnd {
+			spanEnd = pp.Data[i].Range.End
+			i++
+		}
+		for cursor := spanBegin; cursor < spanEnd; {
+			n := min(spanEnd-cursor, int64(limits.BlockBytes))
+			blocks = append(blocks, blockState{block: peer.Block{Index: uint32(pp.Piece.Index), Begin: uint32(cursor - begin), Length: uint32(n)}})
 			cursor += n
 		}
 	}
@@ -389,7 +399,7 @@ func (s *Scheduler) AddPeerWithLimit(id string, endpoint peer.Endpoint, limit in
 	if limit > s.cfg.MaxPerPeer {
 		limit = s.cfg.MaxPerPeer
 	}
-	s.peers[id] = &schedulerPeer{endpoint: endpoint, limit: limit, available: make([]uint64, s.availabilityWords)}
+	s.peers[id] = &schedulerPeer{endpoint: endpoint, limit: limit, available: make(map[int]uint64)}
 	return nil
 }
 
@@ -420,18 +430,7 @@ func (s *Scheduler) RemovePeer(id string) error {
 	if !ok {
 		return ErrUnknownPeer
 	}
-	for _, piece := range s.pieces {
-		for i := range piece.blocks {
-			b := &piece.blocks[i]
-			if !b.active || !hasAssignment(b, id) {
-				continue
-			}
-			delete(b.assignments, id)
-			s.active--
-			p.active--
-			refreshAssignments(b)
-		}
-	}
+	s.releasePeerAssignments(id, p)
 	for word, value := range p.available {
 		for value != 0 {
 			bit := bits.TrailingZeros64(value)
@@ -453,26 +452,26 @@ func (s *Scheduler) SetAvailability(id string, indices []int) error {
 	if !ok {
 		return ErrUnknownPeer
 	}
-	for word := range p.available {
-		value := p.available[word]
-		for value != 0 {
-			bit := bits.TrailingZeros64(value)
-			index := word*64 + bit
-			if piece := s.pieces[index]; piece != nil && piece.rarity > 0 {
-				piece.rarity--
-			}
-			value &^= uint64(1) << bit
-		}
-		p.available[word] = 0
-	}
+	next := make(map[int]uint64)
 	for _, index := range indices {
-		piece, exists := s.pieces[index]
-		if !exists {
-			continue
+		if _, exists := s.pieces[index]; exists {
+			setBit(next, index)
 		}
-		if !hasBit(p.available, index) {
-			setBit(p.available, index)
-			piece.rarity++
+	}
+	for word, value := range p.available {
+		for removed := value &^ next[word]; removed != 0; removed &= removed - 1 {
+			index := word*64 + bits.TrailingZeros64(removed)
+			if err := s.SetPieceAvailability(id, index, false); err != nil {
+				return err
+			}
+		}
+	}
+	for word, value := range next {
+		for added := value &^ p.available[word]; added != 0; added &= added - 1 {
+			index := word*64 + bits.TrailingZeros64(added)
+			if err := s.SetPieceAvailability(id, index, true); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -491,8 +490,10 @@ func (s *Scheduler) SetPieceAvailability(id string, index int, available bool) e
 	if available && !has {
 		setBit(p.available, index)
 		s.pieces[index].rarity++
+		p.offerGeneration = 0
 	} else if !available && has {
 		clearBit(p.available, index)
+		p.offerGeneration = 0
 		if s.pieces[index].rarity > 0 {
 			s.pieces[index].rarity--
 		}
@@ -503,14 +504,21 @@ func (s *Scheduler) SetPieceAvailability(id string, index int, available bool) e
 // ReservePiece chooses a rarest available wanted piece and reserves its whole
 // stage budget. Call AdmitPiece after S2 has created the cache file.
 func (s *Scheduler) ReservePiece(peerID string) (PieceOffer, bool, error) {
+	return s.reservePieceExcluding(peerID, nil)
+}
+
+func (s *Scheduler) reservePieceExcluding(peerID string, excluded map[peer.Block]struct{}) (PieceOffer, bool, error) {
 	p, ok := s.peers[peerID]
 	if !ok {
 		return PieceOffer{}, false, ErrUnknownPeer
 	}
+	if !s.hasRequestCapacity(p) {
+		return PieceOffer{}, false, nil
+	}
 	if s.staged+s.reserved >= s.cfg.MaxStagedPieces {
 		return PieceOffer{}, false, nil
 	}
-	index, ok, err := s.choosePiece(p, peerID, false, false, nil)
+	index, ok, _, _, err := s.nextReservation(p, peerID, excluded)
 	if err != nil || !ok {
 		return PieceOffer{}, false, err
 	}
@@ -527,6 +535,7 @@ func (s *Scheduler) ReservePiece(peerID string) (PieceOffer, bool, error) {
 		s.reservation++
 	}
 	piece.stage = stageReserved
+	s.generation++
 	piece.reservation = s.reservation
 	s.reserved++
 	s.reservedBytes += length
@@ -547,6 +556,7 @@ func (s *Scheduler) AdmitPiece(offer PieceOffer) error {
 		return ErrUnknownReservation
 	}
 	piece.stage = stageAdmitted
+	s.admitted[offer.PieceIndex] = piece
 	piece.reservation = 0
 	s.reserved--
 	s.reservedBytes -= length
@@ -567,6 +577,7 @@ func (s *Scheduler) RejectPiece(offer PieceOffer) error {
 	}
 	length := piece.plan.Piece.Range.End - piece.plan.Piece.Range.Begin
 	piece.stage = stageNone
+	s.generation++
 	piece.reservation = 0
 	s.reserved--
 	s.reservedBytes -= length
@@ -608,10 +619,10 @@ func (s *Scheduler) nextRequestsExcluding(peerID string, max int, excluded map[p
 	if remaining <= 0 {
 		return nil, nil
 	}
-	requests := make([]Request, 0, remaining)
+	var requests []Request
 	endgame := s.endgameReady()
 	for len(requests) < remaining {
-		index, found, err := s.choosePiece(p, peerID, true, endgame, excluded)
+		index, found, err := s.choosePiece(p, peerID, true, endgame, excluded, -1)
 		if err != nil {
 			return nil, err
 		}
@@ -625,9 +636,20 @@ func (s *Scheduler) nextRequestsExcluding(peerID string, max int, excluded map[p
 				break
 			}
 			block := &piece.blocks[blockIndex]
+			if !block.active {
+				piece.removePending(blockIndex)
+				s.pendingTotal--
+				if piece.activeBlocks == nil {
+					piece.activeBlocks = make(map[uint32]int)
+				}
+				piece.activeBlocks[block.block.Begin] = blockIndex
+			}
 			assignBlock(block, peerID, p.endpoint)
 			p.active++
 			s.active++
+			if requests == nil {
+				requests = make([]Request, 0, remaining)
+			}
 			requests = append(requests, Request{Peer: peerID, Endpoint: p.endpoint, Block: block.block})
 		}
 	}
@@ -642,74 +664,92 @@ func (s *Scheduler) Endgame() bool {
 }
 
 func (s *Scheduler) endgameReady() bool {
-	if s == nil || s.IsComplete() {
-		return false
-	}
-	remaining := false
-	for _, piece := range s.pieces {
-		if piece.complete {
-			continue
-		}
-		if piece.stage != stageAdmitted {
-			return false
-		}
-		for _, block := range piece.blocks {
-			if !block.done {
-				remaining = true
-				if !block.active {
-					return false
-				}
-			}
-		}
-	}
-	return remaining
+	return s != nil && s.remainingBlocks > 0 && s.pendingTotal == 0
 }
 
-func (s *Scheduler) choosePiece(p *schedulerPeer, peerID string, admittedOnly, endgame bool, excluded map[peer.Block]struct{}) (int, bool, error) {
+func (s *Scheduler) hasRequestCapacity(p *schedulerPeer) bool {
+	return p != nil && !s.IsBlacklisted(p.endpoint) && p.active < p.limit && s.active < min(s.cfg.MaxGlobal, s.cfg.MaxQueue)
+}
+
+func (s *Scheduler) nextReservation(p *schedulerPeer, peerID string, excluded map[peer.Block]struct{}) (int, bool, int, bool, error) {
+	// A cached pressure candidate only establishes that this peer has an
+	// unstaged, assignable piece. Other peers can change its rarity, but do
+	// not change its eligibility. Reclamation changes the stage generation,
+	// so the subsequent fitting reservation ranks rarity again.
+	if p.offerGeneration == s.generation && maps.Equal(p.offerExcluded, excluded) {
+		return p.offerIndex, p.offerFound, p.pressureIndex, p.pressureFound, nil
+	}
+	var index int
+	var found bool
+	var err error
+	if s.staged+s.reserved < s.cfg.MaxStagedPieces {
+		freeBytes := s.cfg.MaxStagedBytes - s.stagedBytes - s.reservedBytes
+		index, found, err = s.choosePiece(p, peerID, false, false, excluded, freeBytes)
+		if err != nil {
+			return 0, false, 0, false, err
+		}
+	}
+	var pressureIndex int
+	var pressureFound bool
+	if !found {
+		pressureIndex, pressureFound, err = s.choosePiece(p, peerID, false, false, excluded, -1)
+		if err != nil {
+			return 0, false, 0, false, err
+		}
+	}
+	p.offerGeneration, p.offerIndex, p.offerFound = s.generation, index, found
+	p.pressureIndex, p.pressureFound = pressureIndex, pressureFound
+	p.offerExcluded = maps.Clone(excluded)
+	return index, found, pressureIndex, pressureFound, nil
+}
+
+func (s *Scheduler) choosePiece(p *schedulerPeer, peerID string, admittedOnly, endgame bool, excluded map[peer.Block]struct{}, maxLength int64) (int, bool, error) {
 	bestRarity := int(^uint(0) >> 1)
 	bestIndex := int(^uint(0) >> 1)
 	candidates := make([]int, 0)
-	for _, index := range s.order {
-		piece := s.pieces[index]
-		if piece.complete || !peerHas(p, index) {
-			continue
+	consider := func(index int, piece *pieceState) {
+		if piece.complete || !peerHas(p, index) || (admittedOnly && piece.stage != stageAdmitted) || (!admittedOnly && piece.stage != stageNone) {
+			return
 		}
-		if admittedOnly {
-			if piece.stage != stageAdmitted {
-				continue
-			}
-		} else if piece.stage != stageNone {
-			continue
+		if maxLength >= 0 && piece.plan.Piece.Range.End-piece.plan.Piece.Range.Begin > maxLength {
+			return
 		}
-		if endgame {
-			if !hasAssignableBlock(piece, peerID, true, excluded) {
-				continue
-			}
-		} else if pendingBlocksExcluding(piece, excluded) == 0 {
-			continue
+		if firstAssignableBlock(piece, peerID, endgame, excluded) < 0 {
+			return
 		}
-		rarity := s.rarity(index)
+		rarity := piece.rarity
 		if s.cfg.Streaming {
 			if index < bestIndex {
 				bestIndex = index
 				candidates = candidates[:0]
 			} else if index > bestIndex {
-				continue
+				return
 			}
-		}
-		if !s.cfg.Streaming && rarity < bestRarity {
+		} else if rarity < bestRarity {
 			bestRarity = rarity
 			candidates = candidates[:0]
+		} else if rarity > bestRarity {
+			return
 		}
-		if s.cfg.Streaming {
-			candidates = append(candidates, index)
-		} else if rarity == bestRarity {
-			candidates = append(candidates, index)
+		candidates = append(candidates, index)
+	}
+	if admittedOnly {
+		for index, piece := range s.admitted {
+			consider(index, piece)
+		}
+	} else {
+		for word, value := range p.available {
+			for value != 0 {
+				index := word*64 + bits.TrailingZeros64(value)
+				consider(index, s.pieces[index])
+				value &= value - 1
+			}
 		}
 	}
 	if len(candidates) == 0 {
 		return 0, false, nil
 	}
+	sort.Ints(candidates)
 	if err := s.shuffle(candidates); err != nil {
 		return 0, false, err
 	}
@@ -720,80 +760,76 @@ func peerHas(p *schedulerPeer, index int) bool {
 	return hasBit(p.available, index)
 }
 
-func (s *Scheduler) rarity(index int) int {
-	if piece := s.pieces[index]; piece != nil {
-		return piece.rarity
-	}
-	return 0
+func hasBit(words map[int]uint64, index int) bool {
+	return index >= 0 && words[index/64]&(uint64(1)<<uint(index%64)) != 0
 }
 
-func hasBit(words []uint64, index int) bool {
-	if index < 0 || index/64 >= len(words) {
-		return false
-	}
-	return words[index/64]&(uint64(1)<<uint(index%64)) != 0
+func setBit(words map[int]uint64, index int) {
+	words[index/64] |= uint64(1) << uint(index%64)
 }
 
-func setBit(words []uint64, index int) {
-	if index >= 0 && index/64 < len(words) {
-		words[index/64] |= uint64(1) << uint(index%64)
+func clearBit(words map[int]uint64, index int) {
+	word := index / 64
+	words[word] &^= uint64(1) << uint(index%64)
+	if words[word] == 0 {
+		delete(words, word)
 	}
 }
 
-func clearBit(words []uint64, index int) {
-	if index >= 0 && index/64 < len(words) {
-		words[index/64] &^= uint64(1) << uint(index%64)
-	}
-}
-
-func pendingBlocksExcluding(piece *pieceState, excluded map[peer.Block]struct{}) int {
-	n := 0
-	for _, block := range piece.blocks {
-		if !block.done && !block.active && !blockExcluded(excluded, block.block) {
-			n++
-		}
-	}
-	return n
-}
-
-func pendingBlocks(piece *pieceState) int {
-	return pendingBlocksExcluding(piece, nil)
-}
+func pendingBlocks(piece *pieceState) int { return len(piece.pending) }
 
 func firstAssignableBlock(piece *pieceState, peerID string, endgame bool, excluded map[peer.Block]struct{}) int {
-	for i := range piece.blocks {
-		block := &piece.blocks[i]
-		if block.done || blockExcluded(excluded, block.block) {
-			continue
-		}
-		if !endgame {
-			if !block.active {
-				return i
-			}
-			continue
-		}
-		if !hasAssignment(block, peerID) {
-			return i
+	// Each skipped pending tuple belongs to the peer's bounded tombstone set.
+	for i := len(piece.pending) - 1; i >= 0; i-- {
+		index := piece.pending[i]
+		if !blockExcluded(excluded, piece.blocks[index].block) {
+			return index
 		}
 	}
-	return -1
+	if !endgame {
+		return -1
+	}
+	best := -1
+	for _, index := range piece.activeBlocks {
+		block := &piece.blocks[index]
+		if hasAssignment(block, peerID) || blockExcluded(excluded, block.block) {
+			continue
+		}
+		if best < 0 || index < best {
+			best = index
+		}
+	}
+	return best
 }
 
-func hasAssignableBlock(piece *pieceState, peerID string, endgame bool, excluded map[peer.Block]struct{}) bool {
+// Pending descriptors are a stack with inverse positions for constant-time
+// removal; active descriptors are bounded by the global request cap.
+func (piece *pieceState) resetBlocks() {
+	piece.pending = make([]int, len(piece.blocks))
+	piece.activeBlocks = nil
+	piece.remaining = len(piece.blocks)
 	for i := range piece.blocks {
-		block := &piece.blocks[i]
-		if block.done || blockExcluded(excluded, block.block) {
-			continue
-		}
-		if !endgame && block.active {
-			continue
-		}
-		if endgame && hasAssignment(block, peerID) {
-			continue
-		}
-		return true
+		block := piece.blocks[i].block
+		piece.blocks[i] = blockState{block: block, pendingPos: len(piece.blocks) - 1 - i}
+		piece.pending[len(piece.blocks)-1-i] = i
 	}
-	return false
+	clear(piece.contributors)
+}
+
+func (piece *pieceState) removePending(index int) {
+	pos := piece.blocks[index].pendingPos
+	last := piece.pending[len(piece.pending)-1]
+	piece.pending[pos] = last
+	piece.blocks[last].pendingPos = pos
+	piece.pending = piece.pending[:len(piece.pending)-1]
+	piece.blocks[index].pendingPos = -1
+}
+
+func (piece *pieceState) addPending(block *blockState) {
+	index := piece.activeBlocks[block.block.Begin]
+	block.pendingPos = len(piece.pending)
+	piece.pending = append(piece.pending, index)
+	delete(piece.activeBlocks, block.block.Begin)
 }
 
 func blockExcluded(excluded map[peer.Block]struct{}, block peer.Block) bool {
@@ -836,15 +872,6 @@ func refreshAssignments(block *blockState) {
 			break
 		}
 	}
-}
-
-func firstPendingBlock(piece *pieceState) int {
-	for i := range piece.blocks {
-		if !piece.blocks[i].done && !piece.blocks[i].active {
-			return i
-		}
-	}
-	return -1
 }
 
 // Snapshot returns a copy of the completed block coverage for a staged piece.
@@ -905,6 +932,9 @@ func (s *Scheduler) AcceptBlock(peerID string, block peer.Block) (BlockResult, e
 	b.assignments = nil
 	b.active = false
 	b.done = true
+	delete(piece.activeBlocks, b.block.Begin)
+	piece.remaining--
+	s.remainingBlocks--
 	p.active--
 	s.active--
 	b.peerID = peerID
@@ -921,12 +951,16 @@ func (s *Scheduler) RejectBlock(peerID string, block peer.Block) error {
 	if !ok {
 		return ErrUnknownPeer
 	}
-	_, b, ok := s.findActive(peerID, block)
+	piece, b, ok := s.findActive(peerID, block)
 	if !ok {
 		return ErrBlockNotOutstanding
 	}
 	delete(b.assignments, peerID)
 	refreshAssignments(b)
+	if !b.active {
+		piece.addPending(b)
+		s.pendingTotal++
+	}
 	p.active--
 	s.active--
 	return nil
@@ -937,23 +971,18 @@ func (s *Scheduler) findActive(peerID string, block peer.Block) (*pieceState, *b
 	if !ok {
 		return nil, nil, false
 	}
-	for i := range piece.blocks {
-		b := &piece.blocks[i]
-		if b.block == block && hasAssignment(b, peerID) {
-			return piece, b, true
-		}
+	index, exists := piece.activeBlocks[block.Begin]
+	if !exists {
+		return nil, nil, false
+	}
+	b := &piece.blocks[index]
+	if b.block == block && hasAssignment(b, peerID) {
+		return piece, b, true
 	}
 	return nil, nil, false
 }
 
-func allDone(piece *pieceState) bool {
-	for _, b := range piece.blocks {
-		if !b.done {
-			return false
-		}
-	}
-	return true
-}
+func allDone(piece *pieceState) bool { return piece.remaining == 0 }
 
 // VerifyPiece settles a staged piece after S2 has verified and committed its
 // complete cache image. A mismatch frees the stage budget, resets all blocks,
@@ -983,18 +1012,30 @@ func (s *Scheduler) VerifyPiece(index int, valid bool) (VerificationResult, erro
 			result.Blacklisted = append(result.Blacklisted, endpoint)
 		}
 	}
-	for i := range piece.blocks {
-		piece.blocks[i].active = false
-		piece.blocks[i].done = false
-		piece.blocks[i].peerID = ""
-		piece.blocks[i].endpoint = peer.Endpoint{}
-	}
-	piece.contributors = make(map[peer.Endpoint]struct{})
+	s.resetPiece(piece)
 	s.releaseStage(piece)
 	return result, nil
 }
 
+func (s *Scheduler) resetPiece(piece *pieceState) {
+	s.remainingBlocks += len(piece.blocks) - piece.remaining
+	s.pendingTotal += len(piece.blocks) - len(piece.pending)
+	piece.resetBlocks()
+}
+
+func (s *Scheduler) discardPiece(index int) error {
+	piece := s.pieces[index]
+	if piece == nil || piece.stage != stageAdmitted || anyActive(piece) || allDone(piece) {
+		return ErrPieceNotReady
+	}
+	s.resetPiece(piece)
+	s.releaseStage(piece)
+	return nil
+}
+
 func (s *Scheduler) releaseStage(piece *pieceState) {
+	delete(s.admitted, piece.plan.Piece.Index)
+	s.generation++
 	length := piece.plan.Piece.Range.End - piece.plan.Piece.Range.Begin
 	if piece.stage == stageAdmitted {
 		s.staged--
@@ -1056,17 +1097,25 @@ func (s *Scheduler) releaseEndpoint(endpoint peer.Endpoint) {
 		if p.endpoint != endpoint {
 			continue
 		}
-		for _, piece := range s.pieces {
-			for i := range piece.blocks {
-				block := &piece.blocks[i]
-				if !hasAssignment(block, peerID) {
-					continue
-				}
-				delete(block.assignments, peerID)
-				refreshAssignments(block)
-				p.active--
-				s.active--
+		s.releasePeerAssignments(peerID, p)
+	}
+}
+
+func (s *Scheduler) releasePeerAssignments(peerID string, p *schedulerPeer) {
+	for _, piece := range s.admitted {
+		for _, index := range piece.activeBlocks {
+			block := &piece.blocks[index]
+			if !hasAssignment(block, peerID) {
+				continue
 			}
+			delete(block.assignments, peerID)
+			refreshAssignments(block)
+			if !block.active {
+				piece.addPending(block)
+				s.pendingTotal++
+			}
+			p.active--
+			s.active--
 		}
 	}
 }
@@ -1091,18 +1140,14 @@ func (s *Scheduler) MarkComplete(index int) error {
 		return ErrPieceNotReady
 	}
 	piece.complete = true
+	s.generation++
+	s.remainingBlocks -= piece.remaining
+	s.pendingTotal -= len(piece.pending)
 	s.verified += selectedBytes(piece.plan)
 	return nil
 }
 
-func anyActive(piece *pieceState) bool {
-	for _, b := range piece.blocks {
-		if b.active {
-			return true
-		}
-	}
-	return false
-}
+func anyActive(piece *pieceState) bool { return len(piece.activeBlocks) != 0 }
 
 // IsComplete reports whether every wanted piece has verified selected output.
 func (s *Scheduler) IsComplete() bool { return s != nil && s.verified == s.selected }

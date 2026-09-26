@@ -19,6 +19,9 @@ piece/request state, and `transfer.go` coordinates peer I/O and finalization.
   encoding before normalization; retain no network worker in the result. Keep
   invalid complete metadata, severe messages, and ordinary refusal/timeouts
   distinct when assigning penalties.
+- Metadata keeps one request outstanding. Only matching valid data renews its
+  inactivity deadline; other messages remain bounded without extending the wait.
+  Match terminal replies before classifying a reject as ordinary refusal.
 - `TransferConfig.PrepareMode` defaults to `storage.Overwrite`. A partial resume
   must explicitly pass `storage.Resume` or verified output will be truncated.
   Preserve verified pieces and pending truncations from
@@ -27,15 +30,29 @@ piece/request state, and `transfer.go` coordinates peer I/O and finalization.
   and bytes and preserve source fairness before candidate admission. Keep DNS
   work off the coordinator, with bounded workers and per-lookup deadlines, so
   already-admitted peers remain schedulable.
+- Acquisition retries only `ErrNoPeer` or errors reporting `Temporary() == true`;
+  other errors terminate transfer. Advance the candidate cursor only for examined
+  candidates, preserving it across tracker notifications.
 - The coordinator alone mutates rarity, request ownership, provenance, strikes,
   and completion. Give the finalizer immutable coverage snapshots. Worker
   callbacks and command enqueueing must not stall coordination indefinitely.
+- Retire disconnected peers after a drive pass, once their workers have joined
+  and no event index or iteration is in use. Clear removed slice references;
+  keep endpoint penalties separately.
 
 ## Scheduling and results
 
 - Apply request, queue, staged-count, and staged-byte budgets together. Bound
   scheduler work as well as peer-state updates: small unchanged events must not
-  force full wanted-piece scans. TODO tracks unresolved cases.
+  force full wanted-piece scans. Request assignment visits admitted stages;
+  reservation eligibility caches must survive unrelated peers' sparse changes.
+  Re-rank fitting reservations by current rarity after stage credits change.
+- Reserve stages only with request capacity. Under staging pressure, abort
+  stages that current peers cannot advance before releasing their credits.
+  Preserve useful partial stages, active requests, and pending verification.
+- Coalesce contiguous data across file boundaries, stopping at padding and the
+  block limit. Keep pending positions, active block lookup, and remaining-work
+  counters consistent when requests settle, peers leave, or pieces reset.
 - Apply queued extension handshakes before assigning more blocks, including
   repeated `reqq` changes and zero capacity. Keep endgame winner/cancel handling
   consistent with peer terminal-response and tombstone obligations.
@@ -44,9 +61,10 @@ piece/request state, and `transfer.go` coordinates peer I/O and finalization.
   one strike per distinct contributor; three strikes blacklist. Invalid complete
   metadata strikes its sole supplier; severe violations blacklist immediately.
 - Count every received file-payload byte for tracker accounting, including
-  discarded data. Advance completion and the no-progress timer only after a
-  newly verified file piece commits. Whole-torrent `left` differs from selected
-  progress; see [tracker guidance](../tracker/AGENTS.md).
+  discarded data. Draining queued events can complete the download; recheck
+  completion before scheduling again. Advance completion and the no-progress
+  timer only after a newly verified file piece commits. Whole-torrent `left`
+  differs from selected progress; see [tracker guidance](../tracker/AGENTS.md).
 - Preserve primary errors. Cleanup failure replaces success, while final tracker
   event failures remain secondary. Honor committed-output reporting even when
   later staged-file removal fails.

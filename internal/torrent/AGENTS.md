@@ -11,6 +11,8 @@ Read [DESIGN §§7–9](../../DESIGN.md#7-input-and-metadata) and BEPs
   list positions, including padding and symlinks; ranges are half-open in the
   concatenated v1 byte space. File identity and output-path presence are separate,
   so pathless padding must not shift BEP 53 indices.
+  Union BEP 53 ranges in work bounded by range and file counts, preserving the
+  caller's ranges and inclusive original indices.
 - Use the [bencode exact-span contract](../bencode/AGENTS.md) for info hashing.
   Unknown keys stay in the hash even when ignored semantically. Reject hybrid
   input rather than accepting its v1 portion.
@@ -22,9 +24,12 @@ Read [DESIGN §§7–9](../../DESIGN.md#7-input-and-metadata) and BEPs
   globs or paths. Keep original indexing distinct from output selection.
 - Differential-test accelerated selection against Go's `path.Match`: a bracket
   class can consume `/`; `*` and `?` cannot. Include negation, descending ranges,
-  malformed classes, and Unicode. Preserve the supported selection domain while
-  bounding work across many files/patterns.
+  escapes, malformed classes, and Unicode. Interpret escapes and classes when
+  checking separators and `**`; escaped selectors still use the accelerated
+  matcher. Preserve the supported domain while bounding work across files and
+  patterns.
 
 Use independent literal metainfo/hash vectors and range/index properties, not
 only Leech-encoded values. Fuzz sources, metadata, and selection with useful
-valid seeds and near-limit malformed cases.
+valid seeds and near-limit malformed cases. Fetched-info fuzzing needs a matching
+expected hash to reach normalization; test hash mismatches separately.

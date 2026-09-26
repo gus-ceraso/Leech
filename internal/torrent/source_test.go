@@ -185,6 +185,8 @@ func TestParsePeerAddress(t *testing.T) {
 }
 
 func FuzzParseMagnet(f *testing.F) {
+	f.Add("magnet:?xt=urn:btih:" + testHashHex + "&so=0-99999&so=0-99999")
+	f.Add("magnet:?xt=urn:btih:" + testHashHex + "&xt=urn:btmh:1220deadbeef")
 	f.Add("magnet:?xt=urn:btih:" + testHashHex)
 	f.Add("magnet:?xt=urn%3Abtih%3A" + testHashHex + "&so=0-3")
 	f.Fuzz(func(t *testing.T, raw string) {
@@ -193,6 +195,8 @@ func FuzzParseMagnet(f *testing.F) {
 }
 
 func FuzzParseSource(f *testing.F) {
+	f.Add("./magnet:?not-a-query")
+	f.Add(strings.Repeat("g", 40))
 	f.Add(testHashHex)
 	f.Add("./" + testHashHex)
 	f.Add("magnet:?xt=urn:btih:" + testHashHex)

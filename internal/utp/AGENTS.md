@@ -14,6 +14,10 @@ Read [DESIGN §14](../../DESIGN.md#14-utp),
 - Use one connected UDP socket per connection. Preserve concurrent `net.Conn`
   read/write/deadline/close semantics and joined closure. Do not add a listener,
   unsolicited SYN acceptance, or server API.
+- Filter unrelated connection IDs before parsing extension chains. Validate
+  unknown extension framing without retaining ignored headers or bodies.
+  Check the current write deadline before accepting each new payload prefix;
+  recheck it after waking because another caller can extend or clear it.
 - Sequence numbers count packets, not bytes. Use wrap-aware arithmetic and
   bounded ACK/SACK validation; release acknowledged bytes only once. Preserve
   bytes before FIN and settle FIN gaps before reporting EOF.

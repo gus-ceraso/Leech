@@ -3,6 +3,7 @@
 package storage
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -122,15 +123,12 @@ func Validate(root string, meta torrent.Metainfo, selected []int) (*Plan, error)
 			}
 			pathParts = append(pathParts, fileParts...)
 		}
-		if len(pathParts) > limits.PathComponents {
-			return nil, fmt.Errorf("storage: selected file index %d exceeds path component limit", index)
-		}
-		if pathBytes(pathParts) > limits.PathBytes {
-			return nil, fmt.Errorf("storage: selected file index %d exceeds path byte limit", index)
-		}
 		path := resolved
 		for _, part := range pathParts {
 			path = filepath.Join(path, part)
+		}
+		if err := filesystemPath(path, pathParts); err != nil {
+			return nil, fmt.Errorf("storage: selected file index %d: %w", index, err)
 		}
 		byIndex[index] = len(entries)
 		entries = append(entries, Entry{Index: index, File: file, Path: path})
@@ -223,10 +221,8 @@ func (p *Plan) ReadAt(index int, globalOffset int64, dst []byte) (int, error) {
 	return n, readErr
 }
 
-// Prepare creates selected parent directories and opens only selected regular
-// files. Overwrite truncation happens after every selected handle is opened;
-// Resume leaves existing contents untouched. A failed operation closes every
-// handle it already opened.
+// Prepare validates the complete plan, creates selected files, and truncates
+// them in overwrite mode. Each handle is closed before opening the next file.
 func (p *Plan) Prepare(mode PrepareMode) (*Prepared, error) {
 	if mode != Overwrite && mode != Resume {
 		return nil, fmt.Errorf("storage: unknown prepare mode %d", mode)
@@ -239,46 +235,34 @@ func (p *Plan) Prepare(mode PrepareMode) (*Prepared, error) {
 			return nil, fmt.Errorf("storage: create output directory for %q: %w", entry.Path, err)
 		}
 	}
-	// Recheck after directory creation so an existing incompatible entry is
-	// reported before any file is opened or truncated.
 	if err := p.checkPaths(); err != nil {
 		return nil, err
 	}
-
-	handles := make(map[int]outputFile, len(p.entries))
-	closeOpened := func() error {
-		var closeErr error
-		for _, handle := range handles {
-			closeErr = errors.Join(closeErr, handle.Close())
-		}
-		return closeErr
-	}
 	for _, entry := range p.entries {
-		handle, err := openOutputFile(entry.Path, os.O_WRONLY|os.O_CREATE, 0o666)
-		if err != nil {
-			return nil, errors.Join(fmt.Errorf("storage: open %q: %w", entry.Path, err), closeOpened())
-		}
-		if handle == nil {
-			return nil, errors.Join(fmt.Errorf("storage: open %q returned a nil handle", entry.Path), closeOpened())
-		}
-		handles[entry.Index] = handle
-	}
-	if mode == Overwrite {
-		for _, entry := range p.entries {
-			if err := handles[entry.Index].Truncate(0); err != nil {
-				return nil, errors.Join(fmt.Errorf("storage: truncate %q: %w", entry.Path, err), closeOpened())
+		if mode == Overwrite {
+			if err := detachOutput(context.Background(), entry.Path, 0); err != nil {
+				return nil, err
 			}
 		}
+		handle, err := openOutput(entry.Path, os.O_WRONLY|os.O_CREATE)
+		if err != nil {
+			return nil, err
+		}
+		var truncateErr error
+		if mode == Overwrite {
+			truncateErr = handle.Truncate(0)
+		}
+		if err := errors.Join(truncateErr, handle.Close()); err != nil {
+			return nil, fmt.Errorf("storage: prepare %q: %w", entry.Path, err)
+		}
 	}
-	return &Prepared{plan: p, handles: handles}, nil
+	return &Prepared{plan: p}, nil
 }
 
-// Prepared owns one output handle for every selected file until Close.
+// Prepared permits verified writes until Close, without retaining file handles.
 type Prepared struct {
-	plan     *Plan
-	handles  map[int]outputFile
-	closed   bool
-	closeErr error
+	plan   *Plan
+	closed bool
 }
 
 // WriteRange writes verified data into a selected file. globalOffset is in
@@ -299,41 +283,35 @@ func (p *Prepared) WriteRange(index int, globalOffset int64, data []byte) error 
 	if len(data) == 0 {
 		return nil
 	}
-	handle := p.handles[index]
-	if handle == nil {
-		return fmt.Errorf("storage: file index %d has no output handle", index)
+	if err := p.plan.checkPath(position); err != nil {
+		return err
 	}
-	offset := globalOffset - entry.File.Range.Begin
-	for len(data) > 0 {
-		n, err := handle.WriteAt(data, offset)
-		if n < 0 || n > len(data) {
-			return fmt.Errorf("storage: invalid short write count %d", n)
-		}
-		if n > 0 {
-			data = data[n:]
-			offset += int64(n)
-		}
-		if err != nil {
-			return fmt.Errorf("storage: write %q: %w", entry.Path, err)
-		}
-		if n == 0 {
-			return io.ErrShortWrite
-		}
+	if err := detachOutput(context.Background(), entry.Path, -1); err != nil {
+		return err
 	}
+	handle, err := openOutput(entry.Path, os.O_WRONLY)
+	if err != nil {
+		return err
+	}
+	return errors.Join(writeOutputRange(p.plan, handle, index, globalOffset, data), handle.Close())
+}
+
+// Close ends this prepared output's writable lifetime. It is idempotent;
+// operation failures, including close failures, are returned by each operation.
+func (p *Prepared) Close() error {
+	p.closed = true
 	return nil
 }
 
-// Close closes every selected output handle and returns any close failures.
-// It is idempotent and repeats the first aggregate result on later calls.
-func (p *Prepared) Close() error {
-	if p.closed {
-		return p.closeErr
+func openOutput(path string, flags int) (outputFile, error) {
+	handle, err := openOutputFile(path, flags, 0o666)
+	if err != nil {
+		return nil, fmt.Errorf("storage: open %q: %w", path, err)
 	}
-	p.closed = true
-	for _, handle := range p.handles {
-		p.closeErr = errors.Join(p.closeErr, handle.Close())
+	if handle == nil {
+		return nil, fmt.Errorf("storage: open %q returned a nil handle", path)
 	}
-	return p.closeErr
+	return handle, nil
 }
 
 func resolveRoot(root string) (string, error) {
@@ -458,6 +436,9 @@ func relativeParts(value, label string) ([]string, error) {
 	if value == "" {
 		return nil, fmt.Errorf("%s is empty", label)
 	}
+	if len(value) > limits.PathBytes {
+		return nil, fmt.Errorf("%s exceeds path byte limit", label)
+	}
 	if strings.HasPrefix(value, "/") || strings.Contains(value, "\\") {
 		return nil, fmt.Errorf("%s is absolute or uses an unsupported separator", label)
 	}
@@ -481,17 +462,6 @@ func oneName(value, label string) (string, error) {
 		return "", fmt.Errorf("%s contains an unrepresentable path component", label)
 	}
 	return value, nil
-}
-
-func pathBytes(parts []string) int {
-	bytes := 0
-	for i, part := range parts {
-		if i > 0 {
-			bytes++
-		}
-		bytes += len(part)
-	}
-	return bytes
 }
 
 func validRange(r torrent.ByteRange, total int64) error {

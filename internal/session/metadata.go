@@ -958,6 +958,10 @@ func (d *MetadataDiscovery) Run(ctx context.Context) (result MetadataResult, pri
 		if run == nil {
 			return
 		}
+		cancel()
+		run.Wait()
+		resolver.close()
+		updateQueue.clear()
 		finalErr := run.Finalize(context.Background(), false)
 		run = nil
 		if finalErr != nil && config.OnSecondary != nil {
@@ -967,9 +971,6 @@ func (d *MetadataDiscovery) Run(ctx context.Context) (result MetadataResult, pri
 	defer func() {
 		cancel()
 		finalize()
-		if resolver != nil {
-			resolver.close()
-		}
 		if ownSet {
 			_ = set.Close(context.Background())
 		}
@@ -1190,8 +1191,8 @@ func fetchMetadata(ctx context.Context, conn net.Conn, timeout time.Duration) ([
 				return nil, err
 			}
 		}
-		if event.Metadata != nil && event.Metadata.Type == peer.MetadataReject {
-			return nil, ErrMetadataRejected
+		if event.Metadata != nil && (event.Metadata.Type == peer.MetadataReject || event.Metadata.Type == peer.MetadataData) {
+			return nil, fmt.Errorf("%w: metadata response before any request", peer.ErrProtocolViolation)
 		}
 		if advertised, ok := state.RemoteMetadataSize(); ok {
 			size = advertised
@@ -1206,6 +1207,8 @@ func fetchMetadata(ctx context.Context, conn net.Conn, timeout time.Duration) ([
 		return nil, err
 	}
 	blocks := (size + int64(limits.BlockBytes) - 1) / int64(limits.BlockBytes)
+	// Keep exactly one request outstanding. Only its valid data response
+	// renews the idle deadline; other messages cannot prolong a stalled block.
 	for piece := int64(0); piece < blocks; piece++ {
 		if err := requestMetadataPiece(ctx, conn, state, uint32(piece), deadline); err != nil {
 			return nil, err
@@ -1234,16 +1237,20 @@ func fetchMetadata(ctx context.Context, conn net.Conn, timeout time.Duration) ([
 			switch event.Metadata.Type {
 			case peer.MetadataUnknown:
 				continue
-			case peer.MetadataReject:
-				return nil, ErrMetadataRejected
-			case peer.MetadataData:
+			case peer.MetadataReject, peer.MetadataData:
 				if int64(event.Metadata.Piece) != piece {
-					return nil, fmt.Errorf("%w: unsolicited metadata piece %d", ErrMetadataRejected, event.Metadata.Piece)
+					return nil, fmt.Errorf("%w: unsolicited metadata response for piece %d", peer.ErrProtocolViolation, event.Metadata.Piece)
+				}
+				if event.Metadata.Type == peer.MetadataReject {
+					return nil, ErrMetadataRejected
 				}
 				if err := assembler.AddMessage(*event.Metadata); err != nil {
 					return nil, err
 				}
 				received = true
+				if timeout > 0 {
+					deadline = time.Now().Add(timeout)
+				}
 			}
 			if received {
 				break
@@ -1308,7 +1315,7 @@ func readPeerMessage(ctx context.Context, conn net.Conn, deadline time.Time) (pe
 
 // writeWithContext makes a bounded write joinable even when a test or custom
 // transport does not unblock its Write method on context cancellation. The
-// ordinary net.Conn deadline remains the candidate-wide timeout.
+// ordinary net.Conn deadline bounds each wait for useful metadata progress.
 func writeWithContext(ctx context.Context, conn net.Conn, data []byte, deadline time.Time) error {
 	if !deadline.IsZero() {
 		_ = conn.SetWriteDeadline(deadline)

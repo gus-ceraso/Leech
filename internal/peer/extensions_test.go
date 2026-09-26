@@ -210,6 +210,9 @@ func TestExtensionReqQRejectsInvalidValues(t *testing.T) {
 }
 
 func FuzzExtensionTransitions(f *testing.F) {
+	for _, typ := range []string{"-1", "256", "257", "258", "9223372036854775807"} {
+		f.Add(byte(1), []byte("d1:md11:ut_metadatai9eee"), []byte("d8:msg_typei"+typ+"ee"))
+	}
 	f.Add(byte(1), []byte("d1:md11:ut_metadatai9eee"), []byte("d8:msg_typei0e5:piecei0ee"))
 	f.Add(byte(255), []byte("d1:md11:ut_metadatai0eee"), []byte("garbage"))
 	f.Add(byte(7), []byte("d4:reqqi0ee"), []byte("d8:msg_typei0e5:piecei0ee"))
@@ -228,7 +231,10 @@ func FuzzExtensionTransitions(f *testing.F) {
 				t.Fatalf("remote reqq = %d, %t; parsed %d, %t", got, present, parsed.ReqQ, parsed.HasReqQ)
 			}
 		}
-		_, _ = state.ApplyMessage(Message{ID: ExtendedID, Payload: append([]byte{extensionID}, body...)})
+		event, err := state.ApplyMessage(Message{ID: ExtendedID, Payload: append([]byte{extensionID}, body...)})
+		if err == nil && event.Metadata != nil && event.Metadata.Type == MetadataUnknown && len(event.Response) != 0 {
+			t.Fatal("unknown metadata type produced a response")
+		}
 	})
 }
 

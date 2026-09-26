@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/gus-ceraso/Leech/internal/bencode"
+	"github.com/gus-ceraso/Leech/internal/limits"
 )
 
 func TestMetadataDataUsesExactBEP9BlockGeometry(t *testing.T) {
@@ -94,12 +95,26 @@ func TestMetadataControlEncodingAndNoUploadBoundary(t *testing.T) {
 }
 
 func TestUnknownMetadataMessageCanBeIgnored(t *testing.T) {
-	message, err := ParseMetadataMessage(metadataBody(t, MetadataMessageType(99), 3, 0, nil))
-	if err != nil {
-		t.Fatal(err)
+	for _, typ := range []string{"-9223372036854775808", "-1", "3", "99", "255", "256", "257", "258", "9223372036854775807"} {
+		t.Run(typ, func(t *testing.T) {
+			message, err := ParseMetadataMessage([]byte("d8:msg_typei" + typ + "ee"))
+			if err != nil || message.Type != MetadataUnknown || len(message.Block) != 0 {
+				t.Fatalf("unknown metadata message = %#v, %v", message, err)
+			}
+		})
 	}
-	if message.Type != MetadataUnknown {
-		t.Fatalf("unknown metadata message = %#v", message)
+}
+
+func TestMalformedKnownMetadataMessagesRemainViolations(t *testing.T) {
+	for _, body := range []string{
+		"d8:msg_typei0ee", "d8:msg_typei1ee", "d8:msg_typei2ee",
+		"d8:msg_typei1e5:piecei0e10:total_sizei1ee",
+		"d8:msg_typei2e5:piecei-1ee", "d8:msg_type3:256e",
+		"d8:msg_typei0256ee", "d8:msg_typei9223372036854775808ee",
+	} {
+		if _, err := ParseMetadataMessage([]byte(body)); !IsProtocolViolation(err) {
+			t.Fatalf("%q: %v, want protocol violation", body, err)
+		}
 	}
 }
 
@@ -113,9 +128,26 @@ func TestOverLimitMetadataSizeIsUnsupported(t *testing.T) {
 func FuzzMetadataMessages(f *testing.F) {
 	f.Add([]byte("d8:msg_typei1e5:piecei0e10:total_sizei1ee"), []byte{0})
 	f.Add([]byte("d8:msg_typei0e5:piecei0ee"), []byte{})
+	for _, typ := range []string{"-9223372036854775808", "-1", "256", "257", "258", "9223372036854775807"} {
+		f.Add([]byte("d8:msg_typei"+typ+"ee"), []byte{})
+	}
 	f.Fuzz(func(t *testing.T, header, block []byte) {
 		body := append(append([]byte(nil), header...), block...)
-		_, _ = ParseMetadataMessage(body)
+		message, err := ParseMetadataMessage(body)
+		if err == nil {
+			switch message.Type {
+			case MetadataUnknown, MetadataRequest, MetadataReject:
+				if len(message.Block) != 0 {
+					t.Fatal("control or unknown type retained a block")
+				}
+			case MetadataData:
+				if len(message.Block) == 0 || len(message.Block) > limits.BlockBytes {
+					t.Fatal("unbounded data block")
+				}
+			default:
+				t.Fatalf("unclassified type %d", message.Type)
+			}
+		}
 		assembler := NewMetadataAssembler()
 		_ = assembler.Add(body)
 	})
