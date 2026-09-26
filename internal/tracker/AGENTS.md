@@ -35,8 +35,10 @@ Read [DESIGN §10](../../DESIGN.md#10-tracker-subsystem),
   synthetic padding. Received payload includes duplicates/corruption in
   `downloaded`; metadata and transport overhead do not.
 - Join regular loops before one-shot final events. A transmitted `started` can
-  require `stopped` without any successful response. Full verified retention
-  sends `completed` then `stopped`; partial selection never sends `completed`.
+  require `stopped` without any successful response. Successful full transfer,
+  including cache cleanup, sends `completed` then `stopped`. A cache cleanup
+  failure suppresses `completed`, even after all output verifies, but not an
+  otherwise applicable `stopped`. Partial selection never sends `completed`.
   Reserve a bounded opportunity for `stopped` if `completed` stalls. No regular
   announce may follow the final-event sequence.
 

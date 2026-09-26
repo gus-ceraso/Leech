@@ -15,6 +15,9 @@ piece/request state, and `transfer.go` coordinates peer I/O and finalization.
   workers also belong to phase shutdown and must join before final tracker
   events and normalization. Follow §15's complete shutdown order, not merely
   eventual joining before return.
+- During transfer shutdown, join peers and the finalizer, close cache resources,
+  and remove this run's workspace before final tracker events. Announcements do
+  not need the workspace; early cleanup avoids retaining it through that wait.
 - A metadata candidate has one supplier. Verify its complete hash and canonical
   encoding before normalization; retain no network worker in the result. Keep
   invalid complete metadata, severe messages, and ordinary refusal/timeouts
@@ -22,6 +25,10 @@ piece/request state, and `transfer.go` coordinates peer I/O and finalization.
 - Metadata keeps one request outstanding. Only matching valid data renews its
   inactivity deadline; other messages remain bounded without extending the wait.
   Match terminal replies before classifying a reject as ordinary refusal.
+- Metadata discovery uses the approved Fast exception in
+  [DESIGN §7.4](../../DESIGN.md#74-metadata-acquisition): extension handshake first,
+  no initial availability or file-request replies, and structural framing without
+  Fast-negotiation enforcement. Do not apply transfer-phase Fast state here.
 - `TransferConfig.PrepareMode` defaults to `storage.Overwrite`. A partial resume
   must explicitly pass `storage.Resume` or verified output will be truncated.
   Preserve verified pieces and pending truncations from

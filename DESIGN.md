@@ -2,6 +2,7 @@
 
 - **Status:** Approved
 - **Design date:** 2026-09-19
+- **Last revised:** 2026-09-26
 - **Primary specifications:** [`beps/`](beps/), especially BEP 3
 
 This document defines Leech's required behavior. Present-tense descriptions are
@@ -318,6 +319,7 @@ These are product decisions, not claims of full BEP compliance:
 - **Tracker tiers:** BEP 12 tiers are flattened; every unique tracker runs independently.
 - **Announced port:** Leech announces an unbound random nonzero port despite BEP 3 and BEP 7 describing a listening endpoint.
 - **Availability:** Leech advertises no pieces and never sends `Have`, despite possessing verified output.
+- **Metadata-only Fast behavior:** Metadata discovery advertises Fast but omits initial availability, ignores file requests, and does not enforce Fast negotiation on incoming frames. This intentionally departs from BEP 6; §7.4 defines the phase boundary.
 - **Padding upload:** Leech understands BEP 47 padding for downloading and verification but never services padding or other payload requests.
 
 Unknown metainfo keys remain part of the exact info-hash bytes but are otherwise ignored. Out-of-scope protocols are not represented as dormant extension points.
@@ -433,6 +435,20 @@ A magnet or bare-hash session uses this metadata-only profile:
 7. Give the sole endpoint one corruption strike after a complete invalid candidate, then try another peer or advertised size.
 8. After candidate hash and bencoding validation, quiesce and join metadata-discovery workers and send bounded `stopped` announces before full v1 normalization, selection, and resume.
 
+During this phase, Leech advertises Fast and BEP 10 but sends the extension
+handshake first, without `Have None` or another availability message. It reads
+non-extension frames with structural and byte bounds, then ignores them,
+including file requests. It does not enforce Fast negotiation on those frames
+or maintain file availability and request state. Metadata requests still receive
+the responses defined below. The no-upload boundary applies throughout.
+
+This deliberate BEP 6 exception keeps metadata discovery small. Source review of
+[libtorrent 2.1.2](https://github.com/arvidn/libtorrent/blob/6da363d2994f17c0b3c0450d124cf73a31a73847/src/ut_metadata.cpp#L268-L343)
+and [Transmission 4.1.3](https://github.com/transmission/transmission/blob/838877323facc4cc2b677fe817e203779c437bb1/libtransmission/peer-msgs.cc#L1993-L2019)
+found metadata-serving paths compatible with this exchange. This is a source
+deduction, not a live interoperability result or a guarantee for other clients
+and configurations. File transfer follows the Fast behavior in §12.
+
 Leech advertises its own local `ut_metadata` ID so the peer can send extension messages to it. Incoming extension dispatch uses Leech's advertised ID; outbound requests and rejects use the remote peer's advertised ID. IDs and enable/disable state are per connection. Repeated BEP 10 handshakes update that connection's mapping according to BEP 10.
 
 Leech never sends metadata data blocks. An incoming metadata request receives a reject if the peer still advertises a usable remote `ut_metadata` ID; otherwise it is ignored.
@@ -495,6 +511,9 @@ announced port is not probed, bound, or reserved. `uploaded` is always zero.
 
 After metadata is known, `left` is the number of real torrent bytes not retained, not merely the selected amount. Skipped non-padding bytes remain left; padding is locally available as synthetic zeros. A partial selection never sends `completed`. Leech sends `completed` only when all regular-file bytes are retained and verified, then sends `stopped` because it exits instead of seeding.
 
+A cache cleanup failure suppresses `completed`, even when all output was
+verified. It does not suppress an otherwise applicable `stopped`.
+
 During metadata-only discovery, approved profile exception `left=1` replaces exact accounting. This value has no BEP-defined sentinel meaning and can be false for an empty torrent.
 
 `downloaded` counts received file-payload bytes, including data later discarded or redownloaded. Metadata and transport overhead are excluded.
@@ -534,7 +553,7 @@ For each phase and tracker:
 Definitive HTTP client-error classification survives a body-read or body-size
 failure unless a parsed applicable retry hint changes it.
 
-On a phase transition or final shutdown, the session first cancels and joins every regular announce loop. It then uses a separate bounded context to send at most one announce for each applicable final event per tracker: full completion sends `completed` and then `stopped`; every other exit sends only `stopped`. `stopped` is attempted for every nonpermanently-disabled tracker to which a `started` request was transmitted, whether or not a response arrived. No regular announce may begin after the final-event sequence starts. Final announce failure is secondary and never changes an existing primary result.
+On a phase transition or final shutdown, the session first cancels and joins every regular announce loop. It then uses a separate bounded context to send at most one announce for each applicable final event per tracker: successful full completion, including cache cleanup, sends `completed` and then `stopped`; every other exit sends only `stopped`. `stopped` is attempted for every nonpermanently-disabled tracker to which a `started` request was transmitted, whether or not a response arrived. No regular announce may begin after the final-event sequence starts. Final announce failure is secondary and never changes an existing primary result.
 
 `stopped` has its own bounded transmission opportunity if `completed` stalls;
 the total final-event sequence remains bounded.
@@ -589,17 +608,24 @@ Blacklisted endpoints are not retried in the run. Ordinary failures and timeouts
 
 ## 12. Peer-wire behavior
 
-The peer layer consumes a reliable `net.Conn` stream from TCP or uTP and runs one framing/state machine.
+The peer layer consumes a reliable `net.Conn` stream from TCP or uTP. Both
+phases share bounded frame decoding; metadata-only discovery uses the explicit
+message-handling exception in §7.4. The no-upload restrictions apply in both phases.
 
 ### 12.1 Local state and no-upload boundary
 
-Leech always keeps the remote choked and advertises no availability:
+Leech always keeps the remote choked and never sends `Have`, `Bitfield`,
+`Have All`, or `Unchoke`. During file transfer:
 
 - with Fast negotiated, send `Have None` as the sole Fast availability message immediately after the handshake;
-- otherwise omit the initial bitfield;
-- never send `Have`, `Bitfield`, `Have All`, or `Unchoke`.
+- otherwise omit the initial bitfield.
 
-Leech sends `interested` only while the remote advertises a wanted piece and `not interested` otherwise. Incoming file requests cannot read payload, cache, or output storage. With Fast they receive `Reject Request`; without Fast they are ignored. Repeated abusive requests are a protocol violation.
+During file transfer, Leech sends `interested` only while the remote advertises
+a wanted piece and `not interested` otherwise. Incoming file requests cannot
+read payload, cache, or output storage. In file transfer, Fast requests receive
+`Reject Request`, non-Fast requests are ignored, and repeated abusive requests
+are a protocol violation. Metadata-only discovery ignores file requests as
+specified in §7.4.
 
 The outbound peer-message API contains no file `piece` encoder and no metadata `data` encoder. Transport ACKs, tracker requests, peer control messages, metadata requests/rejects, and block requests are permitted; torrent payload responses are impossible through the API.
 
@@ -628,7 +654,8 @@ Extension IDs are directional and per connection:
   handshakes apply before more blocks are assigned.
 - Piece messages must match an outstanding or tombstoned request exactly.
 - Duplicate endgame responses after one winner are consumed and discarded safely.
-- Keepalives preserve otherwise useful idle connections.
+- Incoming keepalives are accepted and ignored. Leech does not schedule outgoing
+  keepalives.
 - Bounded, well-framed unknown core IDs are ignored.
 - Invalid handshakes, impossible indices, malformed bitfields, invalid reserved-bit-dependent messages, and oversized frames immediately blacklist the endpoint.
 
@@ -722,10 +749,14 @@ Ordinary transfer shutdown is ordered:
 2. Cancel and join regular tracker loops so no normal announce can follow `stopped`.
 3. Cancel and join dials and peers.
 4. Finish or abort the bounded current output operation and join the finalizer.
-5. Send `completed` when applicable, then bounded `stopped` announces through separate one-shot operations.
-6. Close all remaining owned cache resources.
-7. Remove the current workspace.
+5. Close all remaining owned cache resources.
+6. Remove the current workspace.
+7. Send `completed` when applicable under §10.1, then bounded `stopped` announces through separate one-shot operations.
 8. Return the primary result, applying the cleanup-error rule from §13.1.
+
+Early cache cleanup releases resources before waiting for final tracker events.
+Cleanup errors are included in the result used to decide whether `completed`
+applies; final announcements do not need the workspace.
 
 Metadata-only phase transition uses the same quiescence rule but sends only `stopped` and creates no cache workspace. A second termination signal may bypass cleanup.
 
@@ -862,7 +893,8 @@ The checks below are required evidence, not a record of completed validation.
 ### 19.4 No-upload and terminal-response invariants
 
 - wire and storage assertions that an incoming payload or metadata request causes no payload, cache, or output disk read and never emits file `piece` or metadata `data`;
-- terminal-response assertions that each admissible Fast payload request and each rejectable metadata request produces exactly one rejection, while ignored cases produce none;
+- terminal-response assertions that each admissible Fast payload request during file transfer and each rejectable metadata request in either phase produces exactly one rejection, while ignored cases produce none;
+- metadata-discovery assertions for the §7.4 exception: the extension handshake is first, initial availability is omitted, structurally valid bounded non-extension messages are ignored, and file requests receive no response or storage access;
 - tombstone assertions that an exact late `Piece` or `Reject Request` consumes its tombstone once, or the connection closes before the bounded tombstone is forgotten;
 - wire assertions that Leech never emits `Unchoke`, `Have`, `Bitfield`, or `Have All`, never requests an unavailable Allowed Fast piece, and reports tracker `uploaded=0` on every announce.
 

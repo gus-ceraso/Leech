@@ -10,12 +10,17 @@ BEPs [3](../../beps/bep_0003.rst), [6](../../beps/bep_0006.rst),
   I/O; queued events own their payload until consumed. Bound aggregate retained
   payload, use cancellation-safe backpressure, and preserve the first terminal
   error even when its notification cannot enqueue.
+- Outgoing keepalives are intentionally unscheduled
+  ([DESIGN §12.4](../../DESIGN.md#124-requests-and-framing)). Incoming keepalives
+  do not count as useful progress.
 - The outbound API must contain no file `piece` or metadata `data` encoder.
   Keep incoming requests independent of storage. Fast `Have None` and request
   rejection are control behavior, not permission to expose payload access.
 - Availability and Allowed Fast are separate sets; choked requests require both.
-  `Have None` clears only availability. Preserve initial availability-message
-  ordering and use one validator for every spare bit in an initial bitfield.
+  `Have None` clears only availability. During file transfer, preserve initial
+  availability-message ordering and use one validator for every spare bit in an
+  initial bitfield. Metadata discovery follows the exception in
+  [DESIGN §7.4](../../DESIGN.md#74-metadata-acquisition).
 - Initialize wanted state in a batch and propagate changed bits. Preserve sparse
   update order so small messages need neither whole-torrent scans nor full-set
   sorting. Scheduler work is a separate concern owned by session.
