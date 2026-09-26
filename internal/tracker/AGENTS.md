@@ -19,7 +19,11 @@ Read [DESIGN §10](../../DESIGN.md#10-tracker-subsystem),
   endpoint order. Validate the entire compact stride before dropping records.
 - UDP transaction retries follow BEP 15 independently of tracker-loop backoff;
   refresh expired connection IDs before announce retransmission. Family
-  transactions are independent and both must join on cancellation.
+  transactions are independent and both must join on cancellation. Retained UDP
+  endpoint sessions are capped at `2 * limits.Trackers`; a session's user count
+  includes callers waiting for its per-endpoint transaction lock. Retire only
+  unused sessions, closing their socket before freeing capacity. Capacity waiters
+  are cancellable and wake when the client closes.
 - Tracker destinations may resolve to any address, including private/loopback.
   Returned peer endpoints use the stricter [peer boundary](../peer/AGENTS.md).
 

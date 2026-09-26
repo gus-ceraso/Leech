@@ -25,6 +25,7 @@ const (
 	familyAnnounceGrace          = 2 * time.Second
 	maxTransactionRetries        = 8
 	minAnnouncePort              = 49152
+	udpSessionCapacity           = 2 * limits.Trackers
 )
 
 // Event is the BEP 15 announce event.
@@ -168,6 +169,7 @@ type UDPClient struct {
 	mu       sync.Mutex
 	randomMu sync.Mutex
 	sessions map[string]*udpSession
+	changed  chan struct{}
 	closed   bool
 }
 
@@ -178,6 +180,8 @@ type udpSession struct {
 	conn     net.Conn
 	connID   uint64
 	expires  time.Time
+	users    int  // guarded by UDPClient.mu; includes transaction-lock waiters
+	retiring bool // guarded by UDPClient.mu; retained until its socket is closed
 }
 
 // NewUDPClient constructs a UDP tracker client.
@@ -204,6 +208,7 @@ func NewUDPClient(cfg Config) *UDPClient {
 		clock:    clock,
 		random:   random,
 		sessions: make(map[string]*udpSession),
+		changed:  make(chan struct{}),
 	}
 }
 
@@ -216,6 +221,7 @@ func (c *UDPClient) Close() error {
 		return nil
 	}
 	c.closed = true
+	c.notifyLocked()
 	sessions := make([]*udpSession, 0, len(c.sessions))
 	for _, s := range c.sessions {
 		sessions = append(sessions, s)
@@ -228,19 +234,9 @@ func (c *UDPClient) Close() error {
 		// Closing a net.Conn is safe concurrently with Read and Write. Do not
 		// wait for s.mu here: an in-flight exchange owns that lock and must be
 		// interrupted so its reader and cancellation watcher can join.
-		s.connMu.RLock()
-		conn := s.conn
-		s.connMu.RUnlock()
-		if conn != nil {
-			if err := conn.Close(); err != nil && first == nil {
-				first = err
-			}
+		if err := closeSessionConn(s); err != nil && first == nil {
+			first = err
 		}
-		s.connMu.Lock()
-		if s.conn == conn {
-			s.conn = nil
-		}
-		s.connMu.Unlock()
 	}
 	return first
 }
@@ -420,17 +416,11 @@ func (c *UDPClient) announceFamily(ctx context.Context, endpoint netip.AddrPort,
 		network = "udp4"
 	}
 	key := network + "|" + endpoint.Addr().String() + "|" + strconv.Itoa(int(endpoint.Port()))
-	c.mu.Lock()
-	if c.closed {
-		c.mu.Unlock()
-		return udpAnnounceResponse{}, false, &Error{Code: ErrorClosed, Operation: "announce", Err: ErrClientClosed}
+	s, err := c.acquireSession(ctx, key, endpoint)
+	if err != nil {
+		return udpAnnounceResponse{}, false, err
 	}
-	s := c.sessions[key]
-	if s == nil {
-		s = &udpSession{endpoint: endpoint}
-		c.sessions[key] = s
-	}
-	c.mu.Unlock()
+	defer c.releaseSession(s)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -482,6 +472,91 @@ func (c *UDPClient) announceFamily(ctx context.Context, endpoint netip.AddrPort,
 		return udpAnnounceResponse{}, transmitted, err
 	}
 	return parsed, transmitted, nil
+}
+
+func (c *UDPClient) acquireSession(ctx context.Context, key string, endpoint netip.AddrPort) (*udpSession, error) {
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, &Error{Code: ErrorCanceled, Operation: "announce", Err: err}
+		}
+		c.mu.Lock()
+		if c.closed {
+			c.mu.Unlock()
+			return nil, &Error{Code: ErrorClosed, Operation: "announce", Err: ErrClientClosed}
+		}
+		if s := c.sessions[key]; s != nil && !s.retiring {
+			s.users++
+			c.mu.Unlock()
+			return s, nil
+		}
+		if len(c.sessions) < udpSessionCapacity {
+			s := &udpSession{endpoint: endpoint, users: 1}
+			c.sessions[key] = s
+			c.mu.Unlock()
+			return s, nil
+		}
+		retired := false
+		for _, s := range c.sessions {
+			if s.users == 0 && !s.retiring {
+				s.retiring = true
+				c.mu.Unlock()
+				// Keep the entry in the map until Close returns, so it continues
+				// to consume capacity while its socket is being retired.
+				_ = closeSessionConn(s)
+				c.mu.Lock()
+				if c.sessions[sessionKey(s)] == s {
+					delete(c.sessions, sessionKey(s))
+				}
+				c.notifyLocked()
+				c.mu.Unlock()
+				retired = true
+				break
+			}
+		}
+		if retired {
+			continue
+		}
+		changed := c.changed
+		c.mu.Unlock()
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			return nil, &Error{Code: ErrorCanceled, Operation: "announce", Err: ctx.Err()}
+		}
+	}
+}
+
+func sessionKey(s *udpSession) string {
+	network := "udp6"
+	if s.endpoint.Addr().Is4() {
+		network = "udp4"
+	}
+	return network + "|" + s.endpoint.Addr().String() + "|" + strconv.Itoa(int(s.endpoint.Port()))
+}
+
+func (c *UDPClient) releaseSession(s *udpSession) {
+	c.mu.Lock()
+	s.users--
+	if s.users == 0 {
+		c.notifyLocked()
+	}
+	c.mu.Unlock()
+}
+
+func (c *UDPClient) notifyLocked() {
+	close(c.changed)
+	c.changed = make(chan struct{})
+}
+
+func closeSessionConn(s *udpSession) error {
+	s.connMu.Lock()
+	conn := s.conn
+	s.conn = nil
+	s.connMu.Unlock()
+	if conn != nil {
+		return conn.Close()
+	}
+	return nil
 }
 
 func (c *UDPClient) ensureConnection(ctx context.Context, s *udpSession, network string) error {

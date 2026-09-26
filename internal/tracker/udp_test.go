@@ -19,6 +19,37 @@ func (r fixtureResolver) LookupIPAddr(context.Context, string) ([]net.IPAddr, er
 	return append([]net.IPAddr(nil), r.ips...), nil
 }
 
+type fixtureResolverFunc func(context.Context, string) ([]net.IPAddr, error)
+
+func (f fixtureResolverFunc) LookupIPAddr(ctx context.Context, host string) ([]net.IPAddr, error) {
+	return f(ctx, host)
+}
+
+type signaledContext struct {
+	done    chan struct{}
+	entered chan struct{}
+	once    sync.Once
+}
+
+func newSignaledContext() *signaledContext {
+	return &signaledContext{done: make(chan struct{}), entered: make(chan struct{})}
+}
+func (c *signaledContext) Deadline() (time.Time, bool) { return time.Time{}, false }
+func (c *signaledContext) Done() <-chan struct{} {
+	c.once.Do(func() { close(c.entered) })
+	return c.done
+}
+func (c *signaledContext) Err() error {
+	select {
+	case <-c.done:
+		return context.Canceled
+	default:
+		return nil
+	}
+}
+func (c *signaledContext) Value(any) any { return nil }
+func (c *signaledContext) cancel()       { close(c.done) }
+
 type fixtureDialer struct {
 	conn    *fixtureConn
 	factory func() net.Conn
@@ -57,6 +88,7 @@ type fixtureConn struct {
 	onWrite     func([]byte)
 	writes      [][]byte
 	activeReads atomic.Int32
+	onClose     func()
 }
 
 func newFixtureConn(onWrite func([]byte)) *fixtureConn {
@@ -86,7 +118,12 @@ func (c *fixtureConn) Read(p []byte) (int, error) {
 }
 
 func (c *fixtureConn) Close() error {
-	c.closeOne.Do(func() { close(c.closed) })
+	c.closeOne.Do(func() {
+		close(c.closed)
+		if c.onClose != nil {
+			c.onClose()
+		}
+	})
 	return nil
 }
 
@@ -142,7 +179,10 @@ func (c *fixtureClock) NewTimer(delay time.Duration) Timer {
 	c.mu.Lock()
 	c.timers = append(c.timers, t)
 	c.mu.Unlock()
-	c.changed <- struct{}{}
+	select {
+	case c.changed <- struct{}{}:
+	default:
+	}
 	return t
 }
 func (c *fixtureClock) nextActive(t *testing.T) *fixtureTimer {
@@ -600,6 +640,196 @@ func TestUDPConnectionIDReuseAndExpiry(t *testing.T) {
 	}
 	if connects != 2 || announces != 3 {
 		t.Fatalf("after expiry: connects=%d announces=%d", connects, announces)
+	}
+}
+
+func TestUDPRotatingEndpointsRetainBoundedSessions(t *testing.T) {
+	const endpointCount = udpSessionCapacity + 2
+	var selected net.IPAddr
+	resolver := fixtureResolverFunc(func(context.Context, string) ([]net.IPAddr, error) {
+		return []net.IPAddr{selected}, nil
+	})
+	var created []*fixtureConn
+	var open atomic.Int32
+	dialer := fixtureDialFunc(func(_ context.Context, _ string, address string) (net.Conn, error) {
+		seq := len(created) + 1
+		var conn *fixtureConn
+		conn = newFixtureConn(func(packet []byte) {
+			switch binary.BigEndian.Uint32(packet[8:12]) {
+			case 0:
+				conn.push(connectResponse(packet, uint64(seq)))
+			case 1:
+				conn.push(announceResponse(packet))
+			}
+		})
+		conn.onClose = func() { open.Add(-1) }
+		created = append(created, conn)
+		open.Add(1)
+		return conn, nil
+	})
+	client := NewUDPClient(Config{Resolver: resolver, Dialer: dialer, Clock: newFixtureClock()})
+	defer client.Close()
+
+	addresses := make([]net.IPAddr, endpointCount)
+	for i := range addresses {
+		addresses[i] = net.IPAddr{IP: net.IPv4(10, byte(i>>8), byte(i), 1)}
+		selected = addresses[i]
+		result, err := client.Announce(context.Background(), "udp://tracker.test:1", testRequest())
+		if err != nil || !result.Transmitted {
+			t.Fatalf("announce endpoint %d: result=%+v err=%v", i, result, err)
+		}
+		if got := len(client.sessions); got > udpSessionCapacity {
+			t.Fatalf("retained %d sessions, capacity %d", got, udpSessionCapacity)
+		}
+		if got := open.Load(); got > udpSessionCapacity {
+			t.Fatalf("owned %d open sockets, capacity %d", got, udpSessionCapacity)
+		}
+	}
+	if len(created) != endpointCount || open.Load() != udpSessionCapacity {
+		t.Fatalf("created=%d open=%d, want %d and %d", len(created), open.Load(), endpointCount, udpSessionCapacity)
+	}
+	evicted := -1
+	for i, conn := range created {
+		select {
+		case <-conn.closed:
+			if evicted < 0 {
+				evicted = i
+			}
+		default:
+		}
+	}
+	if evicted < 0 {
+		t.Fatal("no endpoint socket was retired")
+	}
+
+	// The most recently retained endpoint keeps its connection ID and socket.
+	selected = addresses[endpointCount-1]
+	if _, err := client.Announce(context.Background(), "udp://tracker.test:1", testRequest()); err != nil {
+		t.Fatal(err)
+	}
+	if len(created) != endpointCount || binary.BigEndian.Uint64(created[endpointCount-1].writeAt(1)[:8]) != uint64(endpointCount) {
+		t.Fatal("retained endpoint did not reuse its connection ID")
+	}
+
+	// An evicted endpoint reconnects and receives a fresh ID.
+	selected = addresses[evicted]
+	if _, err := client.Announce(context.Background(), "udp://tracker.test:1", testRequest()); err != nil {
+		t.Fatal(err)
+	}
+	if len(created) != endpointCount+1 || binary.BigEndian.Uint64(created[endpointCount].writeAt(1)[:8]) != endpointCount+1 {
+		t.Fatal("evicted endpoint did not reconnect with a fresh connection ID")
+	}
+	if got := open.Load(); got != udpSessionCapacity {
+		t.Fatalf("open sockets after replacement = %d, want %d", got, udpSessionCapacity)
+	}
+}
+
+func TestUDPTransactionLockWaiterKeepsSessionFromEviction(t *testing.T) {
+	client := NewUDPClient(Config{})
+	endpoint := netip.MustParseAddrPort("192.0.2.1:1")
+	key := sessionKey(&udpSession{endpoint: endpoint})
+	active, err := client.acquireSession(context.Background(), key, endpoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waiter, err := client.acquireSession(context.Background(), key, endpoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var retained []*udpSession
+	for i := 0; i < udpSessionCapacity-2; i++ {
+		addr := netip.AddrPortFrom(netip.AddrFrom4([4]byte{10, byte(i), 0, 1}), 1)
+		s, err := client.acquireSession(context.Background(), sessionKey(&udpSession{endpoint: addr}), addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		retained = append(retained, s)
+	}
+	spareEndpoint := netip.MustParseAddrPort("192.0.2.254:1")
+	spare, err := client.acquireSession(context.Background(), sessionKey(&udpSession{endpoint: spareEndpoint}), spareEndpoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.releaseSession(active)
+	client.releaseSession(spare)
+
+	target := netip.MustParseAddrPort("198.51.100.1:1")
+	got, err := client.acquireSession(context.Background(), sessionKey(&udpSession{endpoint: target}), target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if client.sessions[key] != waiter || waiter.users != 1 {
+		t.Fatal("session with a transaction-lock waiter was evicted")
+	}
+	client.releaseSession(waiter)
+	client.releaseSession(got)
+	for _, s := range retained {
+		client.releaseSession(s)
+	}
+	_ = client.Close()
+}
+
+func TestUDPBusySessionCapacityWaitIsCancelableAndCloseWakes(t *testing.T) {
+	client := NewUDPClient(Config{})
+	held := make([]*udpSession, 0, udpSessionCapacity)
+	for i := 0; i < udpSessionCapacity; i++ {
+		endpoint := netip.AddrPortFrom(netip.AddrFrom4([4]byte{10, byte(i), 0, 1}), 1)
+		s, err := client.acquireSession(context.Background(), sessionKey(&udpSession{endpoint: endpoint}), endpoint)
+		if err != nil {
+			t.Fatal(err)
+		}
+		held = append(held, s)
+	}
+	ctx := newSignaledContext()
+	wait := make(chan error, 1)
+	go func() {
+		endpoint := netip.MustParseAddrPort("192.0.2.1:1")
+		_, err := client.acquireSession(ctx, sessionKey(&udpSession{endpoint: endpoint}), endpoint)
+		wait <- err
+	}()
+	select {
+	case <-ctx.entered:
+	case <-time.After(time.Second):
+		t.Fatal("capacity waiter did not reach its cancellable wait")
+	}
+	ctx.cancel()
+	select {
+	case err := <-wait:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("capacity wait error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("canceled capacity waiter did not return")
+	}
+	if len(client.sessions) != udpSessionCapacity {
+		t.Fatalf("capacity wait grew cache to %d", len(client.sessions))
+	}
+
+	closeCtx := newSignaledContext()
+	closeWait := make(chan error, 1)
+	go func() {
+		endpoint := netip.MustParseAddrPort("192.0.2.2:1")
+		_, err := client.acquireSession(closeCtx, sessionKey(&udpSession{endpoint: endpoint}), endpoint)
+		closeWait <- err
+	}()
+	select {
+	case <-closeCtx.entered:
+	case <-time.After(time.Second):
+		t.Fatal("close waiter did not reach its cancellable wait")
+	}
+	if err := client.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-closeWait:
+		if !errors.Is(err, ErrClientClosed) {
+			t.Fatalf("close-woken waiter error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("client close did not wake capacity waiter")
+	}
+	for _, s := range held {
+		client.releaseSession(s)
 	}
 }
 
