@@ -12,32 +12,115 @@ import (
 	"github.com/gus-ceraso/Leech/internal/limits"
 )
 
-func TestConnectionWorkerClosesWhenEventQueueIsBlocked(t *testing.T) {
+func TestConnectionWorkerPreservesViolationWithFullEventQueue(t *testing.T) {
 	local, remote := net.Pipe()
+	defer remote.Close()
+	worker := NewConnectionWorker(local, ReadOptions{})
+	worker.Start(context.Background())
+	for i := 0; i < maxPeerEventQueue; i++ {
+		if err := WriteKeepAlive(remote); err != nil {
+			t.Fatalf("keepalive %d: %v", i, err)
+		}
+	}
+	var oversized [4]byte
+	binary.BigEndian.PutUint32(oversized[:], MaxPeerFrameBytes+1)
+	if _, err := remote.Write(oversized[:]); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-worker.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("worker did not stop after a protocol violation")
+	}
+	if !errors.Is(worker.Err(), ErrProtocolViolation) {
+		t.Fatalf("worker error = %v", worker.Err())
+	}
+	var queued int
+	for event := range worker.Events() {
+		if event.Err != nil || !event.Message.KeepAlive {
+			t.Fatalf("queued event %d = %#v", queued, event)
+		}
+		queued++
+	}
+	if queued != maxPeerEventQueue {
+		t.Fatalf("queued events = %d, want %d", queued, maxPeerEventQueue)
+	}
+	if err := worker.Err(); !errors.Is(err, ErrProtocolViolation) {
+		t.Fatalf("closed Events lost protocol violation: %v", err)
+	}
+}
+
+func TestConnectionWorkerBackpressuresValidBurst(t *testing.T) {
+	local, remote := net.Pipe()
+	defer remote.Close()
+	worker := NewConnectionWorker(local, ReadOptions{PieceCount: 5, ValidateIndices: true})
+	worker.Start(context.Background())
+	defer worker.Close()
+
+	for i := uint32(0); i < 5; i++ {
+		var have [9]byte
+		binary.BigEndian.PutUint32(have[:4], 5)
+		have[4] = HaveID
+		binary.BigEndian.PutUint32(have[5:], i)
+		if n, err := remote.Write(have[:]); err != nil || n != len(have) {
+			t.Fatalf("Have %d wrote %d/%d bytes: %v", i, n, len(have), err)
+		}
+	}
+	select {
+	case <-worker.done:
+		t.Fatalf("valid burst closed worker: %v", worker.Err())
+	case <-time.After(30 * time.Millisecond):
+	}
+	for i := uint32(0); i < 5; i++ {
+		select {
+		case event, ok := <-worker.Events():
+			if !ok || event.Err != nil || event.Message.ID != HaveID || len(event.Message.Payload) != 4 || binary.BigEndian.Uint32(event.Message.Payload) != i {
+				t.Fatalf("event %d = %#v, channel open = %t", i, event, ok)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timed out waiting for Have %d", i)
+		}
+	}
+	if err := worker.Err(); err != nil {
+		t.Fatalf("valid burst ended worker: %v", err)
+	}
+}
+
+func TestConnectionWorkerCloseUnblocksBackpressuredReader(t *testing.T) {
+	local, remote := net.Pipe()
+	defer remote.Close()
 	worker, err := NewConnectionWorkerWithCaps(local, ReadOptions{}, 1, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
 	worker.Start(context.Background())
-	go func() {
-		_ = WriteChoke(remote)
-		_ = WriteChoke(remote)
-		_ = remote.Close()
-	}()
+	for i := 0; i < 2; i++ {
+		if err := WriteChoke(remote); err != nil {
+			t.Fatalf("Choke %d: %v", i, err)
+		}
+	}
 	select {
 	case <-worker.done:
+		t.Fatalf("full queue closed worker: %v", worker.Err())
+	case <-time.After(30 * time.Millisecond):
+	}
+	closed := make(chan error, 1)
+	go func() { closed <- worker.Close() }()
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatalf("Close = %v", err)
+		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("worker did not stop after its event queue filled")
+		t.Fatal("Close did not join the backpressured reader")
 	}
-	if !errors.Is(worker.Err(), ErrEventQueueFull) {
-		t.Fatalf("worker error = %v", worker.Err())
-	}
+	var queued int
 	for range worker.Events() {
+		queued++
 	}
-	if err := worker.Err(); !errors.Is(err, ErrEventQueueFull) {
-		t.Fatalf("closed Events lost queue overflow error: %v", err)
+	if queued != 1 {
+		t.Fatalf("queued events = %d, want 1", queued)
 	}
-	_ = remote.Close()
 }
 
 func TestConnectionWorkerCloseBeforeStartSealsWorker(t *testing.T) {

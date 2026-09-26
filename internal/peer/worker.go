@@ -12,13 +12,12 @@ import (
 var (
 	ErrWorkerClosed    = errors.New("peer connection worker is closed")
 	ErrWorkerQueueFull = errors.New("peer connection command queue is full")
-	ErrEventQueueFull  = errors.New("peer connection event queue is full")
 	ErrWorkerConfig    = errors.New("invalid peer connection worker configuration")
 )
 
 // A queued event owns its decoded payload until the coordinator receives it.
-// Four queued messages leave room for ordinary peer bursts while placing a
-// fixed bound on payload retention across the 64 supported connections.
+// Four queued messages plus one held by a backpressured reader bound payload
+// retention across the 64 supported connections.
 const maxPeerEventQueue = 4
 
 // PeerEvent is the only output produced by a connection worker. The worker
@@ -210,7 +209,7 @@ func (w *ConnectionWorker) readLoop(ctx context.Context) {
 			}
 			return
 		}
-		if !w.emit(PeerEvent{Message: message}) {
+		if !w.emit(ctx, PeerEvent{Message: message}) {
 			return
 		}
 	}
@@ -233,12 +232,11 @@ func (w *ConnectionWorker) writeLoop(ctx context.Context) {
 	}
 }
 
-func (w *ConnectionWorker) emit(event PeerEvent) bool {
+func (w *ConnectionWorker) emit(ctx context.Context, event PeerEvent) bool {
 	select {
 	case w.events <- event:
 		return true
-	default:
-		w.fail(ErrEventQueueFull, false)
+	case <-ctx.Done():
 		return false
 	}
 }
@@ -260,11 +258,6 @@ func (w *ConnectionWorker) fail(err error, notify bool) {
 		select {
 		case w.events <- PeerEvent{Err: err}:
 		default:
-			w.mu.Lock()
-			if w.terminal == err {
-				w.terminal = ErrEventQueueFull
-			}
-			w.mu.Unlock()
 		}
 	}
 }
