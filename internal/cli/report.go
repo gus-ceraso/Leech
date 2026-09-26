@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -351,7 +352,13 @@ func sanitizeError(err error, maxBytes int) string {
 	if err == nil {
 		return "<nil>"
 	}
-	return SanitizeDiagnostic(err.Error(), maxBytes)
+	message := err.Error()
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		redacted := urlErr.Op + " " + strconv.Quote(RedactTrackerURL(urlErr.URL)) + ": " + urlErr.Err.Error()
+		message = strings.ReplaceAll(message, urlErr.Error(), redacted)
+	}
+	return SanitizeDiagnostic(message, maxBytes)
 }
 
 func redactSensitive(value string) string {
@@ -406,7 +413,7 @@ func sensitiveSchemeAt(value string, offset int) (string, bool) {
 func tokenEnd(value string, start int) int {
 	for i := start; i < len(value); i++ {
 		switch value[i] {
-		case ' ', '\t', '\r', '\n', '\'', '"', '<', '>', '(', ')', '[', ']', '{', '}', ',', ';':
+		case ' ', '\t', '\r', '\n', '\'', '"', '<', '>':
 			return i
 		}
 	}

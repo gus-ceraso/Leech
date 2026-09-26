@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
@@ -162,6 +163,56 @@ func TestRedactTrackerURL(t *testing.T) {
 		if got := RedactTrackerURL(test.input); got != test.want {
 			t.Errorf("RedactTrackerURL(%q) = %q, want %q", test.input, got, test.want)
 		}
+	}
+}
+
+func TestSanitizeDiagnosticRedactsCompleteTrackerURLs(t *testing.T) {
+	for _, test := range []struct {
+		name, raw, want string
+	}{
+		{
+			name: "IPv6 authority",
+			raw:  "announce http://[::1]:8080/private/disposable-ipv6-passkey?token=disposable-ipv6-token failed",
+			want: "announce http://[::1]:8080 failed",
+		},
+		{
+			name: "semicolon in path",
+			raw:  "announce https://tracker.example/private;disposable-semicolon-passkey?token=disposable-semicolon-token failed",
+			want: "announce https://tracker.example failed",
+		},
+		{
+			name: "comma in query",
+			raw:  "announce https://tracker.example/announce?token=disposable-comma,passkey failed",
+			want: "announce https://tracker.example failed",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := SanitizeDiagnostic(test.raw); got != test.want {
+				t.Fatalf("sanitized = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestReporterRedactsNestedURLErrorAndKeepsOrdinaryDetails(t *testing.T) {
+	var output bytes.Buffer
+	reporter := NewReporter(LogError, &output)
+	trackerErr := fmt.Errorf("announce failed: %w", &url.Error{
+		Op:  "Get",
+		URL: "http://[::1]:8080/private/disposable-url-error-passkey?token=disposable-url-error-token",
+		Err: errors.New("dial tcp: connection refused"),
+	})
+	if err := reporter.PrimaryFailure(trackerErr, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := reporter.SecondaryFailure(trackerErr); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := output.String(), "error: failure: announce failed: Get \"http://[::1]:8080\": dial tcp: connection refused\nerror: shutdown: announce failed: Get \"http://[::1]:8080\": dial tcp: connection refused\n"; got != want {
+		t.Fatalf("output = %q, want %q", got, want)
+	}
+	if got, want := SanitizeDiagnostic("ordinary validation error: missing file; retry later"), "ordinary validation error: missing file; retry later"; got != want {
+		t.Fatalf("ordinary diagnostic = %q, want %q", got, want)
 	}
 }
 
