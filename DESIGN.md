@@ -506,7 +506,7 @@ Peer endpoints from trackers or magnets may be public, private, or loopback. Rej
 
 ## 11. Candidate peers and dialing
 
-Candidate endpoints enter one bounded set keyed by resolved IP and port. DNS results are bounded. TCP and uTP are two attempts for one endpoint, not separate candidates.
+Candidate endpoints enter one bounded set keyed by resolved IP and port. DNS results are bounded. TCP and uTP are two attempts for one endpoint, not separate candidates. At capacity, repeated announcements from one tracker cannot evict every candidate supplied by another. Across metadata and transfer, one run may attempt at most 100,000 distinct resolved IP/port endpoints. Retrying an endpoint already attempted does not spend this budget. Exhaustion fails the download with a resource error after normal shutdown; it never forgets a blacklist to admit more endpoints.
 
 For each admitted endpoint:
 
@@ -658,6 +658,7 @@ These are fixed supported-domain limits, not tuning promises:
 | DNS answers retained per hostname | 64 |
 | Magnet-embedded peers | 1,024 |
 | Candidate endpoints retained | 20,000 |
+| Distinct peer endpoints attempted per run | 100,000 |
 | Active peer connections | 64 |
 | Concurrent endpoint races | 32 |
 | Concurrent staged pieces | 64 |
@@ -716,6 +717,7 @@ Accepted residual risks are:
 - Peer failures return unfinished blocks to scheduling unless the endpoint is blacklisted.
 - Corrupt pieces never reach output.
 - Cache and output failures are fatal.
+- Exhausting the per-run distinct endpoint budget is fatal after graceful cleanup.
 - A no-progress timeout is fatal after graceful cleanup.
 - Partial verified output remains in final paths for later resume.
 - Final tracker-event failure never replaces the primary result.

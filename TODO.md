@@ -1016,7 +1016,7 @@ intended failure. Avoid duplicate cases and tests that mirror implementation.
 ## Security review follow-up
 
 Fix all nine findings in [SECURITY.md](SECURITY.md). The earlier checked gates
-record the original implementation; the tasks below are open. Keep the design's
+record the original implementation; the tasks below track later fixes. Keep the design's
 protocol and resource contracts, and use local deterministic peers and trackers.
 SEC1, SEC2, SEC4, and SEC6 can start independently; SEC3 follows SEC1 and SEC2,
 SEC5 follows SEC4, and R7 follows all six fixes.
@@ -1052,6 +1052,14 @@ peer tests. **References:** DESIGN §§11, 16–17; SECURITY F-02, F-07.
   candidates. One tracker must not permanently occupy every slot.
 - [x] Cover false tracker IDs, mixed TCP/uTP race outcomes, a full pool from one
   tracker, and later usable peers from another tracker with deterministic inputs.
+- [x] Bound ordinary endpoint-backoff state as evicted candidates are replaced;
+  keep run-long blacklists and cover sustained candidate churn.
+- [x] Preserve admission capacity across tracker sources when one tracker
+  repeatedly reannounces a full candidate set.
+- [x] Use a bounded numeric tracker-source key in per-peer admission so a long
+  tracker URL is not hashed for every announced endpoint.
+- [x] Enforce the approved 100,000 distinct attempted-endpoint limit across the
+  run, including both phases, and fail with normal cleanup at exhaustion.
 
 **Acceptance:** a tracker cannot blacklist an honest endpoint or exclude all
 later candidates; peer-origin severe handshake violations still blacklist it.
@@ -1068,6 +1076,8 @@ and focused session tests. **References:** DESIGN §§10–11, 15–17; SECURITY
   batch cannot block already available peers or phase shutdown.
 - [x] Use a local tracker and controlled resolver to cover slow names, later
   usable IP peers, queue pressure, cancellation, and both discovery phases.
+- [x] Preserve later tracker sources inside a full pending-peer queue so an
+  earlier source cannot evict them before candidate-pool admission.
 
 **Acceptance:** malicious hostname lists cannot stall discovery or cause large
 queued-memory growth; valid private and loopback endpoints remain supported.
@@ -1085,6 +1095,10 @@ queued-memory growth; valid private and loopback endpoints remain supported.
   validation rule. Preserve Fast `Have None` and Allowed Fast semantics.
 - [x] Cover large piece counts, repeated small availability messages, and each
   spare-bit position with deterministic peer-state and transfer checks.
+- [x] Keep sparse availability changes proportional to occupied words when a
+  peer alternates one wanted `Have` with `Have None` or `Choke`/`Unchoke`.
+- [x] Keep sparse-word order so repeated choke transitions do not sort a
+  full-torrent availability delta on every small frame.
 
 **Acceptance:** peer startup is not quadratic in piece count, small repeated
 messages cannot force full scans, and malformed bitfields trigger the required
@@ -1127,6 +1141,91 @@ and SACK behavior remains correct under loss and reordering.
 F-01–F-09 and the original design contracts. Return concrete defects to the
 responsible worker, then recheck affected paths.
 
-- [ ] Confirm each malicious peer and tracker path has a focused regression.
+- [x] Confirm each malicious peer and tracker path has a focused regression.
   Run the affected tests under `-race`, then `go test ./...`, `go vet ./...`,
   and a pure-Go build. Use local deterministic fixtures only.
+
+## Additional review follow-up
+
+Resolve the confirmed R-01–R-10 findings in the separate full-application
+review. Keep owners on disjoint production files and use local deterministic
+fixtures. R-03 and R-05 are liveness gaps even though their exact remedies are
+not specified by the design; choose bounded fixes that preserve its contracts.
+
+### REV1. Redact tracker diagnostics (R-01)
+
+**Owns:** `internal/cli/report.go` and focused CLI tests.
+
+- [x] Redact complete tracker URLs, including bracketed IPv6 authorities and
+  punctuation in paths or queries, when nested transport errors reach the CLI.
+- [x] Prove disposable passkeys never appear in error-level output.
+
+### REV2. Preserve peer violations and handle bursts (R-02, R-03)
+
+**Owns:** `internal/peer/worker.go` and focused peer tests.
+
+- [x] Preserve the first terminal protocol error when the bounded event queue
+  is full, so transfer can blacklist a severe violation.
+- [x] Apply cancellation-safe backpressure to valid frame bursts within the
+  existing queue and payload bounds; cover a burst and close while blocked.
+
+### REV3. Keep uTP sending live (R-04, R-05)
+
+**Owns:** `internal/utp/congestion.go`, `send.go`, any necessary adapter file,
+and focused uTP tests.
+
+- [x] Recover from a zero congestion window by BEP 29's bounded timeout and
+  one-packet restart, including when no packet remains unacknowledged.
+- [x] Probe a persistently closed remote receive window at a bounded rate so a
+  lost reopen update cannot leave queued writes stalled indefinitely.
+
+### REV4. Preserve tracker final events (R-06)
+
+**Owns:** `internal/tracker/loop.go` and focused tracker tests.
+
+- [x] Give `stopped` its own bounded transmission opportunity after a stalled
+  `completed` response, while retaining a bounded total shutdown time.
+
+### REV5. Keep UDP address families independent (R-07)
+
+**Owns:** `internal/tracker/udp.go` and focused tracker tests.
+
+- [x] Run the supported IPv4 and IPv6 tracker transactions independently so
+  one silent announce cannot delay the other family; join both on cancellation.
+
+### REV6. Bound HTTP work and classify failures (R-08, R-09)
+
+**Owns:** `internal/tracker/http.go` and focused tracker tests.
+
+- [x] Preserve permanent 4xx classification when reading an oversized or
+  failing response body, subject only to a parsed applicable retry hint.
+- [x] Sanitize a delimiter-heavy tracker query with bounded memory proportional
+  to its bytes, retaining the supported 64 MiB URL input contract.
+
+### REV7. Negotiate transfer extensions (R-10)
+
+**Depends on:** SEC2 endpoint-budget integration and REV2. **Owns:**
+`internal/session/run.go`, `transfer.go`, `scheduler.go`,
+`internal/peer/extensions.go`, and focused tests.
+
+- [x] Send and parse BEP 10 handshakes in transfer; keep extension IDs
+  directional and allow later handshakes to update negotiated state.
+- [x] Parse `reqq` and keep the active scheduler request limit within the
+  peer's latest advertised capacity, including zero and repeated updates.
+- [x] Apply already queued extension handshakes before assigning more blocks,
+  and bound peer-command enqueue time so a nonreading peer cannot stall the
+  coordinator while Leech sends metadata or Fast rejects.
+
+### REV8. Integrated review and validation
+
+**Depends on:** REV1–REV7 and R7.
+
+- [x] Stabilize `TestTransferRunContinuesAfterDriveSeesClosedWorker`: its
+  scripted first peer can be closed after useful work finishes, before the
+  fixture writes its second frame. Keep the closed-worker behavior covered.
+- [x] Recheck all ten findings on the integrated tree, run full tests with and
+  without `-race`, `go vet ./...`, and a pure-Go build. Keep local deterministic
+  tests only and record any remaining interoperability limit.
+
+Live trackers and existing BitTorrent clients were not used for interoperability
+tests, as required by the project validation boundary.
