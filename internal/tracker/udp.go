@@ -484,10 +484,20 @@ func (c *UDPClient) acquireSession(ctx context.Context, key string, endpoint net
 			c.mu.Unlock()
 			return nil, &Error{Code: ErrorClosed, Operation: "announce", Err: ErrClientClosed}
 		}
-		if s := c.sessions[key]; s != nil && !s.retiring {
-			s.users++
+		if s := c.sessions[key]; s != nil {
+			if !s.retiring {
+				s.users++
+				c.mu.Unlock()
+				return s, nil
+			}
+			changed := c.changed
 			c.mu.Unlock()
-			return s, nil
+			select {
+			case <-changed:
+			case <-ctx.Done():
+				return nil, &Error{Code: ErrorCanceled, Operation: "announce", Err: ctx.Err()}
+			}
+			continue
 		}
 		if len(c.sessions) < udpSessionCapacity {
 			s := &udpSession{endpoint: endpoint, users: 1}
