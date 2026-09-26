@@ -273,33 +273,43 @@ func (c *UDPClient) Announce(ctx context.Context, trackerURL string, req Announc
 		return result, &Error{Code: ErrorInvalidURL, Operation: "announce", Err: errors.New("UDP tracker URL data exceeds datagram limit")}
 	}
 
+	if err := ctx.Err(); err != nil {
+		return result, &Error{Code: ErrorCanceled, Operation: "announce", Err: err}
+	}
+	result.Families = make([]FamilyResult, len(addresses))
+	var workers sync.WaitGroup
+	for i, endpoint := range addresses {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			response, transmitted, familyErr := c.announceFamily(ctx, endpoint, req, urlData)
+			result.Families[i] = FamilyResult{
+				Endpoint: endpoint, Interval: response.Interval,
+				Leechers: response.Leechers, Seeders: response.Seeders,
+				Peers: response.Peers, Transmitted: transmitted, Err: familyErr,
+			}
+		}()
+	}
+	workers.Wait()
+
 	var firstErr error
-	for _, endpoint := range addresses {
-		if err := ctx.Err(); err != nil {
-			return result, &Error{Code: ErrorCanceled, Operation: "announce", Transmitted: result.Transmitted, Err: err}
-		}
-		family := FamilyResult{Endpoint: endpoint}
-		response, transmitted, familyErr := c.announceFamily(ctx, endpoint, req, urlData)
-		family.Transmitted = transmitted
-		family.Err = familyErr
-		family.Interval = response.Interval
-		family.Leechers = response.Leechers
-		family.Seeders = response.Seeders
-		family.Peers = response.Peers
-		result.Families = append(result.Families, family)
-		result.Transmitted = result.Transmitted || transmitted
-		if familyErr != nil {
+	for _, family := range result.Families {
+		result.Transmitted = result.Transmitted || family.Transmitted
+		if family.Err != nil {
 			if firstErr == nil {
-				firstErr = familyErr
+				firstErr = family.Err
 			}
 			continue
 		}
-		if response.Interval > result.Interval {
-			result.Interval = response.Interval
+		if family.Interval > result.Interval {
+			result.Interval = family.Interval
 		}
-		result.Leechers += response.Leechers
-		result.Seeders += response.Seeders
-		result.Peers = appendUniquePeers(result.Peers, response.Peers)
+		result.Leechers += family.Leechers
+		result.Seeders += family.Seeders
+		result.Peers = appendUniquePeers(result.Peers, family.Peers)
+	}
+	if err := ctx.Err(); err != nil {
+		return result, &Error{Code: ErrorCanceled, Operation: "announce", Transmitted: result.Transmitted, Err: err}
 	}
 	if result.Interval > 0 {
 		return result, nil

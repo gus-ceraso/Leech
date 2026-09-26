@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -21,6 +22,12 @@ func (r fixtureResolver) LookupIPAddr(context.Context, string) ([]net.IPAddr, er
 type fixtureDialer struct {
 	conn    *fixtureConn
 	factory func() net.Conn
+}
+
+type fixtureDialFunc func(context.Context, string, string) (net.Conn, error)
+
+func (f fixtureDialFunc) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	return f(ctx, network, address)
 }
 
 func (d fixtureDialer) DialContext(context.Context, string, string) (net.Conn, error) {
@@ -43,12 +50,13 @@ func (d *blockingDialer) DialContext(context.Context, string, string) (net.Conn,
 }
 
 type fixtureConn struct {
-	mu       sync.Mutex
-	reads    chan []byte
-	closed   chan struct{}
-	closeOne sync.Once
-	onWrite  func([]byte)
-	writes   [][]byte
+	mu          sync.Mutex
+	reads       chan []byte
+	closed      chan struct{}
+	closeOne    sync.Once
+	onWrite     func([]byte)
+	writes      [][]byte
+	activeReads atomic.Int32
 }
 
 func newFixtureConn(onWrite func([]byte)) *fixtureConn {
@@ -66,6 +74,8 @@ func (c *fixtureConn) Write(p []byte) (int, error) {
 }
 
 func (c *fixtureConn) Read(p []byte) (int, error) {
+	c.activeReads.Add(1)
+	defer c.activeReads.Add(-1)
 	select {
 	case data := <-c.reads:
 		copy(p, data)
@@ -260,6 +270,184 @@ func TestUDPAnnounceWireAndURLData(t *testing.T) {
 	wantURL := append([]byte{2, 12}, []byte("/dir?a=b&c=d")...)
 	if got := announce[98:]; string(got) != string(wantURL) {
 		t.Fatalf("URLData = %x, want %x", got, wantURL)
+	}
+}
+
+func TestUDPAnnounceFamiliesTransmitIndependently(t *testing.T) {
+	v4Started := make(chan struct{})
+	v4Announced := make(chan []byte, 1)
+	v6Announced := make(chan []byte, 1)
+	var v4, v6 *fixtureConn
+	v4 = newFixtureConn(func(packet []byte) {
+		switch binary.BigEndian.Uint32(packet[8:12]) {
+		case 0:
+			v4.push(connectResponse(packet, 1))
+		case 1:
+			v4Announced <- packet
+			close(v4Started)
+		}
+	})
+	v6 = newFixtureConn(func(packet []byte) {
+		switch binary.BigEndian.Uint32(packet[8:12]) {
+		case 0:
+			v6.push(connectResponse(packet, 2))
+		case 1:
+			v6Announced <- packet
+			response := append(announceResponse(packet), make([]byte, 18)...)
+			peer := netip.MustParseAddr("2001:db8::2").As16()
+			copy(response[20:36], peer[:])
+			binary.BigEndian.PutUint16(response[36:38], 6881)
+			v6.push(response)
+		}
+	})
+	client := NewUDPClient(Config{
+		Resolver: fixtureResolver{ips: []net.IPAddr{{IP: net.ParseIP("127.0.0.1")}, {IP: net.ParseIP("::1")}}},
+		Dialer: fixtureDialFunc(func(ctx context.Context, network, _ string) (net.Conn, error) {
+			switch network {
+			case "udp4":
+				return v4, nil
+			case "udp6":
+				select {
+				case <-v4Started:
+					return v6, nil
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
+			}
+			return nil, errors.New("unexpected address family")
+		}),
+		Clock:  newFixtureClock(),
+		Random: bytesReader{0, 0, 0, 1},
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	type announceOutcome struct {
+		result AnnounceResult
+		err    error
+	}
+	done := make(chan announceOutcome, 1)
+	go func() {
+		result, err := client.Announce(ctx, "udp://tracker.test:6969/dir?a=b", testRequest())
+		done <- announceOutcome{result, err}
+	}()
+	var first, second []byte
+	select {
+	case first = <-v4Announced:
+	case <-time.After(time.Second):
+		t.Fatal("IPv4 announce did not start")
+	}
+	select {
+	case second = <-v6Announced:
+	case <-time.After(time.Second):
+		t.Fatal("IPv6 announce was blocked by the silent IPv4 transaction")
+	}
+	select {
+	case <-done:
+		t.Fatal("announce returned before the IPv4 transaction finished")
+	default:
+	}
+	if want := string(append([]byte{2, 8}, []byte("/dir?a=b")...)); string(first[98:]) != want || string(second[98:]) != want {
+		t.Fatalf("family URL data differs: IPv4=%x IPv6=%x", first[98:], second[98:])
+	}
+	bad := announceResponse(first)
+	binary.BigEndian.PutUint32(bad[4:8], binary.BigEndian.Uint32(first[12:16])+1)
+	v4.push(bad)
+	select {
+	case got := <-done:
+		if got.err != nil {
+			t.Fatalf("announce: %v", got.err)
+		}
+		if !got.result.Transmitted || got.result.Interval != time.Minute || got.result.Leechers != 4 || got.result.Seeders != 5 || len(got.result.Peers) != 1 || got.result.Peers[0].String() != "[2001:db8::2]:6881" {
+			t.Fatalf("aggregate result: %+v", got.result)
+		}
+		if len(got.result.Families) != 2 || !got.result.Families[0].Endpoint.Addr().Is4() || !got.result.Families[1].Endpoint.Addr().Is6() || !got.result.Families[0].Transmitted || !got.result.Families[1].Transmitted || got.result.Families[1].Err != nil {
+			t.Fatalf("family order or accounting: %+v", got.result.Families)
+		}
+		var trackerErr *Error
+		if !errors.As(got.result.Families[0].Err, &trackerErr) || trackerErr.Code != ErrorTransaction {
+			t.Fatalf("IPv4 failure = %v, want transaction mismatch", got.result.Families[0].Err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("announce did not join both families")
+	}
+}
+
+func TestUDPAnnounceCancellationJoinsBothFamilies(t *testing.T) {
+	announced := make(chan string, 2)
+	newFamily := func(network string) *fixtureConn {
+		var conn *fixtureConn
+		conn = newFixtureConn(func(packet []byte) {
+			switch binary.BigEndian.Uint32(packet[8:12]) {
+			case 0:
+				conn.push(connectResponse(packet, 1))
+			case 1:
+				announced <- network
+			}
+		})
+		return conn
+	}
+	v4, v6 := newFamily("udp4"), newFamily("udp6")
+	client := NewUDPClient(Config{
+		Resolver: fixtureResolver{ips: []net.IPAddr{{IP: net.ParseIP("::1")}, {IP: net.ParseIP("127.0.0.1")}}},
+		Dialer: fixtureDialFunc(func(_ context.Context, network, _ string) (net.Conn, error) {
+			switch network {
+			case "udp4":
+				return v4, nil
+			case "udp6":
+				return v6, nil
+			}
+			return nil, errors.New("unexpected address family")
+		}),
+		Clock:  newFixtureClock(),
+		Random: bytesReader{0, 0, 0, 1},
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	type announceOutcome struct {
+		result AnnounceResult
+		err    error
+	}
+	done := make(chan announceOutcome, 1)
+	go func() {
+		result, err := client.Announce(ctx, "udp://tracker.test:1", testRequest())
+		done <- announceOutcome{result, err}
+	}()
+	for range 2 {
+		select {
+		case <-announced:
+		case <-time.After(time.Second):
+			t.Fatal("both families did not transmit before cancellation")
+		}
+	}
+	cancel()
+	select {
+	case got := <-done:
+		if !errors.Is(got.err, context.Canceled) || !got.result.Transmitted || len(got.result.Families) != 2 {
+			t.Fatalf("canceled result=%+v err=%v", got.result, got.err)
+		}
+		if !got.result.Families[0].Endpoint.Addr().Is6() || !got.result.Families[1].Endpoint.Addr().Is4() {
+			t.Fatalf("family order = %+v", got.result.Families)
+		}
+		for _, family := range got.result.Families {
+			if !family.Transmitted || !errors.Is(family.Err, context.Canceled) {
+				t.Fatalf("family after cancellation = %+v", family)
+			}
+		}
+		if v4.activeReads.Load() != 0 || v6.activeReads.Load() != 0 {
+			t.Fatal("announce returned before both socket readers joined")
+		}
+		select {
+		case <-v4.closed:
+		default:
+			t.Fatal("IPv4 socket remains open after cancellation")
+		}
+		select {
+		case <-v6.closed:
+		default:
+			t.Fatal("IPv6 socket remains open after cancellation")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cancellation did not join both families")
 	}
 }
 
