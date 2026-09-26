@@ -2,8 +2,22 @@
 
 - **Status:** Approved
 - **Design date:** 2026-09-19
-- **Implementation status:** In progress
+- **Implementation status:** Unresolved work is tracked in [TODO.md](TODO.md).
 - **Primary specifications:** [`beps/`](beps/), especially BEP 3
+
+This document defines Leech's required behavior. Present-tense descriptions are
+contracts, not claims that every requirement is implemented. [TODO.md](TODO.md)
+records known gaps and their acceptance checks; task sequencing does not relax
+these contracts. [README.md](README.md) provides build and usage instructions.
+
+| Topic | Sections |
+| --- | --- |
+| Product scope and protocol choices | [Summary](#1-decision-summary), [goals](#2-goals), [non-goals](#3-non-goals), [protocol profile](#5-protocol-profile) |
+| User interface | [CLI](#4-command-line-interface) |
+| Session and files | [Phases](#6-session-phases-and-ownership), [metadata](#7-input-and-metadata), [selection and storage](#8-selection-and-storage-mapping), [resume](#9-resume-behavior) |
+| Networking | [Trackers](#10-tracker-subsystem), [candidates and dialing](#11-candidate-peers-and-dialing), [peer wire](#12-peer-wire-behavior), [uTP](#14-utp) |
+| Transfer and shutdown | [Scheduling and verification](#13-piece-scheduling-and-verification), [lifecycle](#15-concurrency-and-lifecycle) |
+| Limits and acceptance | [Bounds](#16-supported-bounds), [trust boundaries](#17-security-and-trust-boundaries), [failures](#18-failure-semantics), [validation](#19-validation), [tradeoffs](#20-key-tradeoffs) |
 
 ## 1. Decision summary
 
@@ -33,7 +47,8 @@ Fast is the principal recovery path for a client that advertises no availability
 4. Bound memory, disk staging, network concurrency, and parser work.
 5. Recover from interruption by validating output files rather than loading application state.
 6. Keep all concurrent work owned, cancellable, and joined.
-7. Remain portable Go, with Linux as the first supported environment.
+7. Remain portable Go, with Linux as the first supported environment. Target only
+   the current stable Go release; backward toolchain compatibility is not a goal.
 
 ## 3. Non-goals
 
@@ -48,7 +63,7 @@ Leech does not support:
 - web seeds;
 - proxies, anonymity mode, or peer-wire encryption;
 - bandwidth limiting;
-- persistent configuration, session state, resume databases, or cache indexes;
+- persistent configuration, session state, resume databases, cache indexes, or reusable cached data;
 - tracker scrape, torrent creation, feeds, signing, or mutable torrents;
 - multiple torrents in one process;
 - automated or manual interoperability tests against existing clients or live trackers.
@@ -126,8 +141,9 @@ It does not offer output renaming.
 
 Each `--file` adds a pattern to one union. Matching is case-sensitive and uses
 `/` regardless of the host operating system. `*`, `?`, and `[]` are supported;
-`*` does not cross `/`, and `**` is rejected. A directory match includes all of
-its descendants. Shell metacharacters should be quoted.
+matching follows Go's `path.Match`: `*` and `?` do not cross `/`, but a bracket
+class can consume `/`. `**` is rejected. A directory match includes all of its
+descendants. Shell metacharacters should be quoted.
 
 For a multi-file torrent, patterns are relative to the torrent root and omit the
 root name. For a single-file torrent, the selectable path is its torrent name.
@@ -431,7 +447,8 @@ Treating `private=1` as public is deliberate. A private torrent may be disclosed
 
 The normalized metadata becomes an immutable file table. Every original file-list position is retained for BEP 53 indexing, while each entry separately records whether it has an output path. Entries also carry length, attributes, and their half-open range in the v1 concatenated byte space.
 
-Selections are case-sensitive and relative to the torrent root. They support exact paths and `*`, `?`, and `[]` with `/` separators, but not `**`. Matching a directory selects its descendants. No match is an error. Explicit user selection replaces magnet `so`.
+Selections follow the exact-path and glob rules in [§4.3](#43-file-selection).
+No match is an error. Explicit user selection replaces magnet `so`.
 
 When `so` applies, indices refer to original file-list positions before padding or symlink filtering. Padding indices contribute no output selection. Selecting a symlink is an error. A selection containing only padding or otherwise producing no output files is an error. A single-file torrent has index zero.
 
@@ -439,7 +456,10 @@ A piece is wanted if it intersects a selected non-padding regular file. Leech do
 
 The destination directory is resolved once if it is a symlink. No descendant traversed or created by Leech may be a symlink. Unsafe or colliding paths are rejected rather than renamed. Races from a hostile concurrent local process are outside scope.
 
-Selected zero-length files are created. Other selected files grow as verified ranges arrive and may be sparse while incomplete.
+Selected zero-length files are created. Other selected files grow as verified
+ranges arrive and may be sparse while incomplete. No output file is created for
+unselected content. Final paths remain partial until their selected content has
+passed piece verification and the download completes.
 
 ## 9. Resume behavior
 
@@ -455,6 +475,9 @@ With `.torrent` input, the scan occurs before any network activity. Magnet and b
 
 If selected output is already complete, Leech exits without starting transfer discovery. Without resume, it truncates existing selected files and treats every wanted piece as missing. Unselected and unrelated files remain untouched.
 
+If resume finds missing data, transfer preparation stays in resume mode and
+preserves verified output. It must not switch to overwrite mode after the scan.
+
 The optional no-progress timeout starts only when transfer begins. It resets only after a newly completed file piece verifies.
 
 ## 10. Tracker subsystem
@@ -467,7 +490,8 @@ Every run generates one cryptographically random:
 - 32-bit tracker key;
 - announced port in `49152–65535`.
 
-The same values are used across trackers, phases, and address families. The announced port is neither probed nor bound. `uploaded` is always zero.
+The same values are used across trackers, phases, and address families. The
+announced port is not probed, bound, or reserved. `uploaded` is always zero.
 
 ### 10.1 Accounting
 
@@ -483,9 +507,18 @@ Leech owns the authoritative announce parameters: `info_hash`, `peer_id`, `port`
 
 HTTP(S) uses bounded bodies, normal redirect limits, standard TLS verification, and compact mode. Responses may contain dictionary peers, compact IPv4 `peers`, and compact IPv6 `peers6`.
 
+Peer-list deduplication uses linear work and preserves the first occurrence's
+order. Tracker-specific decoded-node and container bounds admit the supported
+20,000-peer dictionary response while limiting allocation from ignored fields.
+Query sanitization uses memory proportional to URL bytes and retains the
+supported 64 MiB tracker-URL input limit.
+
 ### 10.3 UDP
 
 UDP trackers implement BEP 15 connection IDs and lifetimes, transaction matching, the specified `15 × 2^n` transaction retransmission schedule, IPv4 and IPv6 response strides, and BEP 41 URL data. This transaction schedule is separate from tracker-loop backoff after a transaction fails. For a dual-stack hostname, one resolved endpoint per available family receives announces with the same session identity.
+
+The two address-family transactions run independently, so a silent family does
+not delay the working one. Both are canceled and joined on shutdown.
 
 ### 10.4 Tracker state machine
 
@@ -500,13 +533,38 @@ For each phase and tracker:
 7. Transient failures retry indefinitely with capped exponential backoff and jitter.
 8. BEP 31 `retry in` is a not-before duration in minutes; Leech accepts the specified integer form and the deployed decimal-string form, with checked conversion. `never` and definitive HTTP client errors disable only that tracker for the run.
 
+Definitive HTTP client-error classification survives a body-read or body-size
+failure unless a parsed applicable retry hint changes it.
+
 On a phase transition or final shutdown, the session first cancels and joins every regular announce loop. It then uses a separate bounded context to send at most one announce for each applicable final event per tracker: full completion sends `completed` and then `stopped`; every other exit sends only `stopped`. `stopped` is attempted for every nonpermanently-disabled tracker to which a `started` request was transmitted, whether or not a response arrived. No regular announce may begin after the final-event sequence starts. Final announce failure is secondary and never changes an existing primary result.
+
+`stopped` has its own bounded transmission opportunity if `completed` stalls;
+the total final-event sequence remains bounded.
 
 Peer endpoints from trackers or magnets may be public, private, or loopback. Reject peer endpoints with invalid ports, unspecified addresses, or multicast addresses. Tracker-server destinations retain unrestricted address resolution, including loopback and private addresses. This intentionally permits untrusted inputs to induce connections to local services.
 
 ## 11. Candidate peers and dialing
 
-Candidate endpoints enter one bounded set keyed by resolved IP and port. DNS results are bounded. TCP and uTP are two attempts for one endpoint, not separate candidates. At capacity, repeated announcements from one tracker cannot evict every candidate supplied by another. Across metadata and transfer, one run may attempt at most 100,000 distinct resolved IP/port endpoints. Retrying an endpoint already attempted does not spend this budget. Exhaustion fails the download with a resource error after normal shutdown; it never forgets a blacklist to admit more endpoints.
+### 11.1 Admission and bounds
+
+Candidate endpoints enter one bounded set keyed by resolved IP and port. TCP and
+uTP are two attempts for one endpoint, not separate candidates. At capacity,
+repeated announcements from one tracker cannot evict every candidate supplied by
+another. Stale or repeatedly failed candidates can be replaced; ordinary
+endpoint-backoff state remains bounded as candidates churn.
+
+Pending tracker updates are bounded by their total retained peer data, not just
+their event count, and preserve later tracker sources under queue pressure.
+Hostname resolution uses bounded results, a small worker limit, and a deadline
+per lookup. Admission interleaves with dialing so a large hostname batch cannot
+block already available peers or phase shutdown.
+
+Across metadata and transfer, one run may attempt at most 100,000 distinct
+resolved IP/port endpoints. Retrying an endpoint already attempted does not spend
+this budget. Exhaustion fails the download with a resource error after normal
+shutdown; it never forgets a blacklist to admit more endpoints.
+
+### 11.2 Transport race
 
 For each admitted endpoint:
 
@@ -518,7 +576,16 @@ For each admitted endpoint:
 
 uTP uses one connected UDP socket per attempt. TCP uses `net.Dialer.DialContext` with the literal resolved address, so DNS cannot silently change endpoint identity.
 
-Tracker-supplied peer IDs are not used for candidate deduplication. If supplied, they are only expected handshake values under BEP 3. If two live connections claim the same peer ID, the older established connection remains and the newcomer closes. The ID is not blacklisted, and another endpoint may be tried after the retained connection closes.
+### 11.3 Identity and penalties
+
+Tracker-supplied peer IDs are not used for candidate deduplication. If supplied,
+they are only expected handshake values under BEP 3. A mismatch with that
+unauthenticated expectation is not a peer-origin protocol violation and cannot
+blacklist the endpoint. A later unpoisoned announcement can retry it.
+
+If two live connections claim the same peer ID, the older established connection
+remains and the newcomer closes. The ID is not blacklisted, and another endpoint
+may be tried after the retained connection closes.
 
 Blacklisted endpoints are not retried in the run. Ordinary failures and timeouts use per-endpoint backoff rather than strikes.
 
@@ -534,7 +601,7 @@ Leech always keeps the remote choked and advertises no availability:
 - otherwise omit the initial bitfield;
 - never send `Have`, `Bitfield`, `Have All`, or `Unchoke`.
 
-Leech sends `interested` only while the remote advertises a wanted piece and `not interested` otherwise. Incoming file requests cannot reach payload data. With Fast they receive `Reject Request`; without Fast they are ignored. Repeated abusive requests are a protocol violation.
+Leech sends `interested` only while the remote advertises a wanted piece and `not interested` otherwise. Incoming file requests cannot read payload, cache, or output storage. With Fast they receive `Reject Request`; without Fast they are ignored. Repeated abusive requests are a protocol violation.
 
 The outbound peer-message API contains no file `piece` encoder and no metadata `data` encoder. Transport ACKs, tracker requests, peer control messages, metadata requests/rejects, and block requests are permitted; torrent payload responses are impossible through the API.
 
@@ -558,18 +625,33 @@ Extension IDs are directional and per connection:
 ### 12.4 Requests and framing
 
 - Request blocks are at most 16 KiB and never cross a piece boundary.
-- A peer pipeline is bounded and clamps any `reqq` hint to the local cap.
+- A peer pipeline is bounded by the local cap and the peer's latest advertised
+  `reqq`, including zero and repeated updates. Already queued extension
+  handshakes apply before more blocks are assigned.
 - Piece messages must match an outstanding or tombstoned request exactly.
 - Duplicate endgame responses after one winner are consumed and discarded safely.
 - Keepalives preserve otherwise useful idle connections.
 - Bounded, well-framed unknown core IDs are ignored.
 - Invalid handshakes, impossible indices, malformed bitfields, invalid reserved-bit-dependent messages, and oversized frames immediately blacklist the endpoint.
 
-Persistently choked peers that neither deliver data nor offer useful Allowed Fast pieces are rotated out.
+Active block requests have bounded lifetimes; expired blocks are released or
+reassigned while preserving Fast terminal-response obligations. Peer replacement
+uses recent useful activity, not a lifetime productivity flag. Persistently
+choked peers that neither deliver data nor offer useful Allowed Fast pieces are
+rotated out. Ordinary stalls do not cause corruption strikes.
+
+Peer-command enqueue time is bounded so sending Fast or metadata rejects to a
+nonreading peer cannot stall the coordinator.
 
 ## 13. Piece scheduling and verification
 
 The coordinator tracks remote availability, wanted pieces, block state, outstanding requests, and endpoint provenance.
+
+Wanted-piece initialization takes one pass. Interest and scheduler availability
+updates follow changed bits; duplicate `Have`, already-empty `Have None`, and
+other unchanged small events must not cause repeated whole-torrent scans.
+Sparse availability and choke changes remain proportional to occupied words
+without repeatedly sorting a full-torrent delta.
 
 Bulk mode chooses the rarest wanted piece among connected peers, with randomized ties. Streaming mode ranks earlier wanted pieces first but may fetch later available pieces rather than idle a useful connection.
 
@@ -581,7 +663,9 @@ Leech creates no cache workspace until validated metadata, selection, and resume
 
 Each active piece has a random-access cache file and an in-memory block bitmap plus endpoint provenance. Network reads use bounded block buffers; no whole piece is held in memory. Multiple endpoints may contribute. Cache failure is fatal, with no memory fallback.
 
-The finalizer reads a completed staged piece sequentially and verifies SHA-1:
+Every completed piece must pass SHA-1 verification before it is marked complete
+or written to output, whether its bytes came from peers, staging, or existing
+files. The finalizer reads a completed staged piece sequentially and verifies it:
 
 - On mismatch, each contributing endpoint receives one strike; the staged piece is removed and rescheduled.
 - Strikes are keyed by resolved IP and port across transports and reconnects for this run.
@@ -591,6 +675,9 @@ The finalizer reads a completed staged piece sequentially and verifies SHA-1:
 On success, one output committer opens each affected selected file without following descendant symlinks, writes selected intersections, closes every handle, and only then removes the staged piece. Successful `Write` and `Close` are sufficient; no `fsync` is required.
 
 A cache or output error fails the session. Verified output remains available for future resume. On orderly exit, the finalizer and all cache handles are joined and closed before workspace removal. If the primary operation succeeded, final close or removal failure becomes the returned error; if a primary failure already exists, cleanup failures are secondary diagnostics. Crashes and immediate second signals may leave ignored workspaces.
+
+Later runs do not scan, recover, reuse, or clean abandoned workspaces. Any
+power-loss inconsistency in final output is found by rehashing during resume.
 
 ## 14. uTP
 
@@ -611,6 +698,12 @@ It covers:
 - IPv4 and IPv6 connected UDP sockets.
 
 It does not accept unsolicited SYN packets, share a listener, perform hole punching, or expose server APIs. The peer layer depends only on `net.Conn` and does not branch by transport after dialing.
+
+Duplicate packets reuse unchanged selective-ACK state rather than repeatedly
+scanning the reorder window. A zero congestion window has bounded timeout
+recovery with a one-packet restart, including when no packet remains
+unacknowledged. A persistently closed remote receive window is probed at a bounded
+rate so a lost reopen update cannot stall queued writes indefinitely.
 
 ## 15. Concurrency and lifecycle
 
@@ -645,6 +738,7 @@ These are fixed supported-domain limits, not tuning promises:
 | Resource | Limit |
 | --- | ---: |
 | Total `.torrent` or info-dictionary bytes | 64 MiB |
+| Tracker URL bytes | 64 MiB |
 | Decoded bencode values and dictionary entries | 1,000,000 |
 | Entries in one bencode list or dictionary | 200,000 |
 | Bencode nesting depth | 64 |
@@ -726,7 +820,10 @@ Accepted residual risks are:
 
 Validation is local and deterministic; it never uses existing clients or live trackers.
 
-Required evidence includes:
+The checks below are required evidence, not a record of completed validation.
+Outstanding work belongs in [TODO.md](TODO.md).
+
+### 19.1 Command-line boundary
 
 - CLI parser tests covering every option form, `--`, hash-shaped paths, repeated
   file selection, list-mode conflicts, log levels, bad arity, malformed durations,
@@ -743,19 +840,30 @@ Required evidence includes:
   acquisition without touching output or piece-cache paths;
 - CLI integration tests covering output mapping, default overwrite, optional
   resume, bulk and streaming scheduling, no-progress timeout behavior, exit
-  statuses, partial-output messages, and first-signal cleanup;
+  statuses, partial-output messages, and first-signal cleanup.
+
+### 19.2 Parsers and protocol state
+
 - golden vectors for bencoding, exact info hashes, compact endpoints, peer frames, Fast messages, BEP 10 directionality, metadata messages, UDP trackers, and uTP packets;
 - fuzzing of parsers and state-machine transitions for bencoding, metainfo, magnets, trackers, peer wire, BEP 6, BEP 10, metadata transfer, uTP, transport racing, peer-ID deduplication, strike accounting, and session shutdown;
 - properties for checked ranges, file normalization, BEP 53 indexing, selection, block coverage, rarity, tracker accounting, and sequence wraparound;
+- differential checks of accelerated selection against Go's `path.Match`,
+  including bracket classes that consume `/` while `*` and `?` cannot;
 - deterministic tracker models covering premetadata `left=1`, actual `left`, started/regular/completed/stopped sequences, HTTP early rerequests, UDP interval enforcement, BEP 31, phase quiescence, stopped ordering, first-value-wins and last-value-wins duplicate query parsing, HTTP success responses with failure bodies, malformed compact IPv4 and IPv6 lists, a transmitted `started` with no response followed by `stopped`, and unequal IPv4/IPv6 support;
 - deterministic peer models covering a Fast seed using `Have None`, a reciprocal leecher, an Allowed Fast peer, a peer without Fast, a peer that requires ordinary availability before honoring Allowed Fast, and a peer that would retain stale availability unless `Have None` clears it;
 - peer-state tests covering Fast choke/reject/cancel, repeated extension handshakes, local/remote extension IDs, request tombstones, metadata rejection, and independent bounded availability and Allowed Fast sets;
 - deterministic dial tests proving exact-endpoint use, first-handshake wins, loser cancellation/close/join, duplicate peer-ID handling, and reconnect eligibility;
-- strike tests across transports and reconnects, including mixed-source corrupt pieces and sole-source invalid metadata;
+- strike tests across transports and reconnects, including mixed-source corrupt pieces and sole-source invalid metadata.
+
+### 19.3 Transport, storage, and lifecycle
+
 - uTP simulation with loss, delay, duplication, reordering, selective ACKs, window pressure, timeout, wraparound, teardown, and cancellation;
 - race-detector tests for tracker transitions, peer replacement, event queues, cache finalization, and both signal paths;
 - filesystem tests for traversal, collisions, omitted padding paths, omitted symlink lengths, descendant symlinks, padding, selected boundaries, sparse growth, overlong files, interruption, and resume;
-- local fake HTTP/UDP trackers and TCP/uTP peers for complete `.torrent`, magnet, and bare-hash sessions;
+- local fake HTTP/UDP trackers and TCP/uTP peers for complete `.torrent`, magnet, and bare-hash sessions.
+
+### 19.4 No-upload and terminal-response invariants
+
 - wire and storage assertions that an incoming payload or metadata request causes no payload, cache, or output disk read and never emits file `piece` or metadata `data`;
 - terminal-response assertions that each admissible Fast payload request and each rejectable metadata request produces exactly one rejection, while ignored cases produce none;
 - tombstone assertions that an exact late `Piece` or `Reject Request` consumes its tombstone once, or the connection closes before the bounded tombstone is forgotten;

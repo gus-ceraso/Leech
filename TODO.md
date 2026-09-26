@@ -1,1231 +1,588 @@
-# Leech implementation plan
+# Leech unresolved work
 
-Implement the behavior in [DESIGN.md](DESIGN.md). That document and the local
-[BEPs](beps/) remain the specifications; this file organizes the work. Development
-milestones deliberately cover subsets of the design. They do not narrow the
-finished CLI's promised behavior.
+[DESIGN.md](DESIGN.md) is the behavioral specification; this file is the execution
+backlog. Read the applicable `AGENTS.md` before changing a package. Preserve the
+supported input domain and resource limits while fixing the defects below.
 
-## Working arrangement
+The baseline is commit `0914fee9750d60a828a828493a6bc1af1d826e6b`, reconciled on
+2026-09-26. Finding IDs and severities are retained from that review. R-24 is
+partially fixed; its remaining scope is explicit below. Fixture recipes here are
+self-contained and do not depend on temporary review directories.
 
-- **KISS:** Choose the simplest implementation that satisfies the accepted design.
-  Favor short, working iterations; add abstractions, machinery, or polish only
-  for a concrete need. Preserve correctness and the required robustness.
-- **Adapt the plan:** Update `TODO.md` as implementation and review reveal new
-  facts. Add, split, combine, or reorder tasks and revise dependencies when useful.
-  If a breaking change to user-visible behavior or an approved design contract
-  is required, explain why, its impact, and the smallest proposed change, then
-  prompt the user for explicit approval before implementing it. Continue
-  unaffected work. Routine planning and internal implementation changes do not
-  require approval.
-- **Orchestrator:** GPT-6 Sol, `max`. Dispatch ready tasks, settle interface
-  questions, integrate changes, keep this checklist current, and run integration
-  checks. Keep implementation work with the workers when practical.
-- **Workers:** GPT-6 Luna, `max`, one worker per task ID. A task includes its
-  implementation, focused tests, and fixes. Its checkboxes are subtasks for that
-  worker, not separate agent assignments.
-- **Reviewers:** GPT-6 Luna, `max`, one separate reviewer per group, R1–R5
-  for the original implementation, R6 for robustness, and R7 for security.
-  Review the integrated group once; return fixes to the responsible workers and
-  recheck affected areas. No reviewer for every small task or additional review
-  hierarchy. The orchestrator accepts the small A0 bootstrap directly.
-- Give each worker its task, dependencies, owned files, relevant design sections,
-  and acceptance checks. Workers should report consequential findings and
-  interface changes as they discover them, then finish with changed files,
-  checks run, and remaining issues.
-- Use isolated worktrees when workers share a repository. Keep one active owner
-  per production file, including shared types. The paths below are initial
-  ownership boundaries; A0 may simplify them before dispatch. The orchestrator
-  owns shared-file integration and updates to this plan and root guidance.
-- Integrate small, compiling changes as soon as their focused checks pass.
-  Dependents need their named prerequisites, not every task in an earlier group.
-  Review checkpoints mark group completion; they are not global scheduling
-  barriers. A known contract or safety defect blocks affected dependent work.
-- Keep handoffs in task messages and this checklist. Do not create a parallel
-  reporting system, a generic framework, or a new design document per task.
+## Execution order and ownership
 
-### Keep iteration short
+Each task owns its implementation and focused regressions. Dependencies below
+include ordering needed for shared production files. Tasks with disjoint files
+can proceed independently; a dependency is not a reason to block unrelated work.
+Use separate task-specific test files when concurrent tasks share a package.
+Expand a task's file scope only after resolving ownership with any affected task.
 
-Establish real bounds, hash verification, output confinement, no-upload behavior,
-and cancellation ownership when each boundary first appears. These are cheaper
-to preserve than to retrofit. Defer streaming, endgame, complete terminal output,
-and the full integration matrix until the basic download path works.
-
-Start uTP early and develop it alongside the TCP path. Do not make the first
-local download wait for uTP. Early transfer tests may inject connected TCP peers;
-the finished CLI must use the designed uTP/TCP race. Use private test seams, not
-temporary user-facing switches, environment settings, or fallback contracts.
-
-Use concrete types, ordinary functions, and small interfaces only where two
-components or deterministic tests actually need them. Add fixtures beside the
-component that needs them. Extract shared test helpers only after actual reuse.
-Avoid speculative optimizations, generalized simulators, plugin architectures,
-and arbitrary coverage targets. Required design behavior and regression tests
-remain required even when implemented in a later iteration.
-
-## Dispatch and milestones
-
-Dependencies below are prerequisites for dispatch. Tasks without a dependency on
-one another can run concurrently if their files do not overlap. Fill available
-worker slots from this table; do not launch workers merely to wait. Prioritize
-the next runnable milestone and the uTP path when slots are limited.
-
-| Task | Deliverable | Depends on |
+| Task | Findings or remaining scope | Depends on |
 | --- | --- | --- |
-| A0 | Buildable skeleton, shared contracts, limits | — |
-| I1 | Strict bencoding | A0 |
-| I2 | CLI arguments and source parsing | A0 |
-| I3 | Validated, normalized v1 metadata | I1 |
-| I4 | Selection and offline file listing | I2, I3 |
-| S1 | Confined output operations | A0 |
-| S2 | Disk staging, verification, and commit | I4, S1 |
-| S3 | Stateless resume | I4, S1 |
-| P1 | Peer framing, handshake, safe outbound API | A0 |
-| P2 | Peer request and Fast state | P1 |
-| P3 | Candidate admission and transport racing | P1 |
-| D1 | Basic rarest-first scheduler | I4, P2 |
-| D2 | First local TCP download | D1, S2 |
-| D3 | Streaming, endgame, and peer replacement | D2 |
-| T1 | HTTP(S) tracker transactions | I1 |
-| T2 | UDP tracker transactions | A0 |
-| T3 | Tracker lifecycle and accounting | T1, T2 |
-| M1 | BEP 10 and metadata messages | I1, P1 |
-| M2 | Metadata-only discovery | I2, I3, P2, P3, T3, M1 |
-| U1 | uTP packets, sequence arithmetic, test link | A0 |
-| U2 | uTP receive state | U1 |
-| U3 | uTP send state and congestion control | U1 |
-| U4 | Outgoing uTP `net.Conn` | U2, U3 |
-| L1 | Logs, terminal status, and signal adapter | I2, D2 |
-| L2 | Complete session and CLI wiring | D2, S3, P3, T3, M2, U4, L1 |
-| V1 | Complete local integration coverage | L2, D3 |
-
-The first parallel set after A0 is **I1, I2, S1, P1, T2, and U1**, subject to
-available slots. Then start T1 and I3 after I1; P2, P3, and M1 after their
-prerequisites; and U2/U3 together after U1. Storage, discovery, and uTP continue
-while the first TCP transfer is assembled.
-
-| Milestone | Demonstrable result | Required tasks |
-| --- | --- | --- |
-| 0: Command | Buildable command with help and argument errors | A0, I2 |
-| 1: Offline listing | Real `.torrent --list-files`, entirely offline | I1–I4 |
-| 2: TCP transfer | Verified selected bytes from a local TCP fixture reach final files | S1, S2, P1, P2, D1, D2, plus their dependencies |
-| 3: Metadata | Local tracker-driven metadata acquisition stops cleanly before returning metadata | T1–T3, P2, P3, M1, M2, plus their dependencies |
-| 4: uTP | Outgoing uTP stream survives deterministic loss and reordering | U1–U4 |
-| 5: Complete CLI | Complete CLI passes the local acceptance suite | A0–V1 and R1–R5 |
-
-Milestone 2 is an integration test of the transfer path, not a claim that the
-public CLI already supports discovery. Milestone 3 uses injected dialers until
-U4 is ready. L2 binds the real transports. Keep these limitations explicit in
-development documentation until milestone 5 passes.
-
-## A0. Bootstrap and shared contracts
-
-**Owner:** one worker. **Owns:** `go.mod`, `cmd/leech/main.go`, initial shared
-types in their owning packages, and `internal/limits/`.
-**References:** DESIGN §§6, 15–16, 19.
-
-- [x] Verify the installed stable Go toolchain and create a standard-library-only
-  module and buildable command. Keep production pure Go. Use the existing
-  `bash -ic 'go ...'` environment when needed.
-- [x] Establish only the shared types needed to unblock the table: immutable
-  info hash/file/piece metadata, original file indices and byte ranges, selection
-  ranges, resolved endpoint identity, and the small worker event/command shapes.
-  Keep types with their owning component; avoid a catch-all model package.
-- [x] Keep buffer, block, connection, and completion-signal ownership with the
-  first component that uses each resource. The session coordinator owns mutable
-  torrent state; I/O workers report bounded events. P2, D2, and T3 must specify
-  how a canceled producer or full queue unblocks when they add those queues.
-- [x] Put every fixed supported-domain limit from DESIGN §16 in one place.
-  Validate arithmetic before conversion, allocation, seeking, or duration use.
-  Add unspecified operational timings as named constants in the component that
-  introduces them; use reasonable initial values without creating tuning flags.
-- [x] Establish private dependency injection for clocks, dialers/resolvers, and
-  failing I/O only where the first consumers need it. Ensure test construction
-  can route the mandatory default tracker locally without changing its inclusion
-  in production. Do not build all fake peers and trackers up front.
-
-**Acceptance:** the command builds with `CGO_ENABLED=0`; the initial tests pass;
-each ready worker knows its files and the concrete contracts it consumes. The
-bootstrap should unblock implementation, not attempt to design every method.
-
-## Group 1: Offline input and storage
-
-### I1. Strict bencoding
-
-**Depends on:** A0. **Owns:** `internal/bencode/`.
-**References:** DESIGN §§7.2, 16; BEP 3.
-
-- [x] Implement bounded decoding with exact byte spans, including the raw `info`
-  span. Support decoding a bounded prefix where an extension header precedes
-  binary payload; full-value callers must reject trailing bytes.
-- [x] Reject unsorted or duplicate dictionary keys, invalid lengths/integers,
-  negative zero, leading zeros, signed-64-bit overflow, truncation, and excessive
-  bytes, depth, values, or container entries before excessive work or allocation.
-- [x] Add only the encoding needed for Leech's permitted protocol messages.
-  Keep exact received bytes available; never derive an info hash by re-encoding.
-- [x] Add independently specified golden bytes and a decoder fuzz target covering
-  malformed, truncated, canonical, and near-limit inputs.
-
-**Acceptance:** canonical values decode predictably, invalid inputs fail within
-bounds, and exact-span tests distinguish hashing the original bytes from encoding
-the decoded structure again.
-
-### I2. CLI arguments and source parsing
-
-**Depends on:** A0. **Owns:** `internal/cli/args.go`, help text and parser tests,
-and `internal/torrent/source.go`.
-**References:** DESIGN §§4.1, 4.4–4.8, 7.1; BEPs 9, 53.
-
-- [x] Implement every documented option, long-option value form, `--`, one-source
-  arity, uncombined short options, and options-before-source rule. Preserve the
-  exact defaults and reject list-mode conflicts even when an explicitly supplied
-  option equals its default. Validate log levels and positive Go durations.
-- [x] Classify case-insensitive `magnet:` first, exact-length hex/Base32 hashes
-  second, and paths otherwise. Reject literal `-`; allow `./` to disambiguate a
-  hash-shaped filename. Parse and validate without output/cache mutations.
-- [x] Parse one effective v1 `btih`, reject conflicts and any `btmh`, and preserve
-  `tr`, `x.pe`, display-only `dn`, and bounded `so` indices/ranges. Reject malformed
-  endpoints, selections, and unsupported schemes without unbounded expansion.
-- [x] Provide tracker URL deduplication and mandatory default-tracker inclusion.
-  Keep hostname resolution separate from parsing. Use the same normalization
-  when I3 extracts metainfo trackers.
-- [x] Add parser tables and fuzz cases for option errors, escaped names, malformed
-  magnets, numeric overflow, source precedence, and all accepted hash forms.
-
-**Acceptance:** help exits 0, usage errors exit 2, parsing causes no network or
-storage side effects, and the documented CLI examples parse as specified.
-
-### I3. Metainfo validation and normalization
-
-**Depends on:** I1. **Owns:** `internal/torrent/metainfo.go` and normalization
-tests. **References:** DESIGN §§7.2–7.3, 8, 16; BEPs 3, 12, 47, 52.
-
-- [x] Bound file reads and metadata bytes, hash the exact `info` span, and accept
-  both a full metainfo file and a fetched info dictionary at the appropriate
-  boundary. Preserve unknown keys in the hash while ignoring their semantics.
-- [x] Validate single-file versus multi-file exclusivity, piece length/count,
-  SHA-1 string length, UTF-8 where required, checked total length, and all metadata
-  limits. Reject v2 and hybrid structures.
-- [x] Build immutable file and piece tables with half-open ranges and every
-  original file-list position. Normalize padding without a path, symlinks without
-  a length, and ignored attributes correctly. Validate names, path structure,
-  duplicates, and file/directory collisions; S1 adds filesystem-specific checks.
-- [x] Retain the conventional `info.name` output root. Recognize but ignore
-  `private=1` and expose it for the required warning. Extract flattened
-  `announce-list` trackers, or `announce` when the list is absent; I2's helper is
-  connected during I4 integration, so I3 need not wait for I2.
-- [x] Add normalization/range properties, golden info hashes, and metainfo fuzzing,
-  including zero-length content, omitted fields, overflow, and malformed tables.
-
-**Acceptance:** invalid metadata fails before output/cache creation; valid
-metadata exposes consistent ranges and original indices without storing payload.
-
-### I4. Selection and offline file listing
-
-**Depends on:** I2, I3. **Owns:** `internal/torrent/selection.go` and the initial
-local listing path in `internal/cli/run.go`.
-**References:** DESIGN §§4.2–4.4, 8; BEPs 47, 53.
-
-- [x] Implement case-sensitive exact and glob selection with `/`, `*`, `?`, and
-  `[]`; reject `**` and malformed patterns. A matching directory selects its
-  descendants. Union repeated matches without duplicate work.
-- [x] Apply explicit selectors instead of magnet `so`. Interpret `so` against
-  original file positions, including padding and symlinks; reject selected
-  symlinks and selections without regular files. Handle single-file index zero.
-- [x] Map selected ranges to wanted pieces, selected output intersections, and
-  synthetic zero padding. Preserve unwanted non-padding ranges that a full piece
-  still needs for verification. Include selected zero-length files.
-- [x] Wire local `.torrent --list-files`: validate metadata, emit JSON-quoted
-  selectable paths in torrent order, and omit padding/symlinks. Do not validate
-  the destination or touch output/cache paths. Merge tracker sources for later
-  download use through I2's helper.
-- [x] Cover directory/glob semantics, overlap, no matches, index bounds, padding,
-  symlinks, and exact listing output. Prove local listing makes no network calls.
-
-**Acceptance:** offline listing works, and the same immutable selection plan can
-drive storage and scheduling without each component interpreting paths again.
-
-### S1. Confined output operations
-
-**Depends on:** A0. **Owns:** `internal/storage/output.go` and path checks.
-**References:** DESIGN §§4.2, 4.7, 8, 17–18.
-
-- [x] Resolve the existing destination once, allowing its root to be a symlink.
-  Refuse descendant symlinks, unsafe/unrepresentable names, path collisions, and
-  incompatible existing entries. Check the complete selected output plan before
-  destructive preparation. Keep hostile concurrent filesystem races out of scope.
-- [x] Expose separate validation and preparation operations so listing and early
-  validation never mutate output. Default preparation truncates only selected
-  regular files; resume preserves their contents. Never open unselected paths
-  for writing or create torrent-provided symlinks/padding files.
-- [x] Create selected zero-length files; otherwise allow verified writes to grow
-  files naturally. Confine all writes below the resolved root and close every
-  handle. Do not add preallocation or `fsync` requirements.
-- [x] Test traversal, separators, root/descendant symlinks, file/directory
-  conflicts, target-filesystem representability, sparse growth, and protection
-  of existing unselected/unrelated files. Provide narrowly scoped I/O failure
-  injection for subsequent storage tasks.
-
-**Acceptance:** unsafe plans fail before truncation; valid selected writes stay
-confined; output preparation can be tested independently with A0's file ranges.
-
-### S2. Disk staging, verification, and commit
-
-**Depends on:** I4, S1. **Owns:** `internal/storage/staging.go`,
-`internal/storage/finalize.go`, and their tests.
-**References:** DESIGN §§13.1, 15–18.
-
-- [x] Create a random private workspace under `os.UserCacheDir()/leech` only on
-  an explicit transfer-needed call. Use directory `0700` and file `0600` where
-  supported. Enforce staged-piece count and total declared-length budgets before
-  admission; never use whole-piece memory or a memory fallback.
-- [x] Stage block-sized writes in per-piece random-access files and synthesize
-  padding. Keep block coverage and endpoint provenance coordinator-owned; pass
-  immutable snapshots to the finalizer when needed. Define block-buffer ownership
-  through the write completion event.
-- [x] Serialize finalization: hash the whole staged piece using bounded buffers,
-  then write only selected intersections. Report mismatch and contributors to
-  the coordinator. Remove the piece after mismatch, or after every successful
-  selected write and close; never commit corrupt data.
-- [x] Make open/read/write/short-write/close/removal errors fatal. Preserve the
-  primary error and report secondary cleanup failures. Close/join staging work
-  before removing only this run's workspace; ignore abandoned workspaces.
-- [x] Test cross-file and skipped-file boundaries, padding, mixed contributors,
-  hash failures, budget exhaustion, unavailable/full cache, output failures,
-  cleanup failures, and cancellation during finalization.
-
-**Acceptance:** verification precedes output writes; no whole piece is retained
-in memory; resource credits and handles return on every tested success/failure
-path; deleting staged data never precedes successful output close.
-
-### S3. Stateless resume
-
-**Depends on:** I4, S1. **Owns:** `internal/storage/resume.go` and tests. It may
-run alongside S2. **References:** DESIGN §§4.7, 9, 16.
-
-- [x] Reconstruct and hash complete pieces from selected existing regular files
-  and synthetic padding, using bounded buffers and no cache workspace/index.
-  Mark missing, short, or mismatching content as needing download.
-- [x] Require redownload of an entire piece when skipped non-padding ranges
-  prevent reconstruction. Do not infer validity from file length, previous
-  progress, or only the selected part of a piece.
-- [x] Hash only the expected prefix of an overlong selected file; truncate its
-  excess only after that file's selected content validates successfully. Return
-  any necessary pending truncation to the transfer path for later completion.
-- [x] Return verified selected ranges and whole-torrent retained-byte accounting,
-  plus an explicit no-transfer-needed result. Preserve unselected output and
-  support selected zero-length files and canceled scans.
-- [x] Test missing/short/overlong files, piece boundaries across files, padding,
-  partial selection, mismatches, read/truncate failures, and a fully valid resume.
-
-**Acceptance:** scan results derive only from SHA-1 verification. L2 can run the
-scan with no network workers and can exit without creating a workspace or
-starting transfer discovery when selection is already complete.
-
-- [x] **R1 — Offline/storage review:** one reviewer checks I1–I4 and S1–S3
-  together. Focus on validation before mutation, original indices, exact hashes,
-  selected-range confinement, bounded memory, and error/cleanup behavior. Verify
-  offline listing and the storage regression tests; do not wait for networking
-  to review this group.
-
-  R1 fixes to recheck:
-
-  - [x] I1: reject duplicate empty dictionary keys (`6061e62`).
-  - [x] I3: reject an explicitly empty padding `path` list and invalid UTF-8
-    metainfo announce URLs (`8fdb1d0`).
-  - [x] I4: bound selection work for up to 100,000 files and patterns without
-    narrowing the supported selection domain (`6eaef77`, corrected class
-    handling in `e08df8f`).
-  - [x] S3: scan resume mappings one at a time to avoid cloning millions of
-    piece descriptors and range slices (`c272bb2`).
-
-## Group 2: Peer protocol and the first download
-
-### P1. Peer framing and the no-upload API
-
-**Depends on:** A0. **Owns:** `internal/peer/wire.go`, `handshake.go`, and golden
-fixtures. **References:** DESIGN §§11–12, 16–17; BEPs 3, 4, 6.
-
-- [x] Parse and validate the BEP 3 handshake, info hash, optional expected peer ID,
-  and reserved bits. Read bounded frames and keepalives from any `net.Conn`;
-  reject oversized/truncated/invalid frames before payload-sized allocation.
-- [x] Encode only permitted local control, request, cancel, and reject messages.
-  Provide no outbound file `piece` or metadata `data` encoder and no storage
-  access from incoming-request handling.
-- [x] With Fast, emit immediate `Have None` as the sole local availability
-  message; otherwise omit the bitfield. Never emit `Have`, `Bitfield`, `Have All`,
-  or `Unchoke`. Keep extension-specific encoding with M1.
-- [x] Distinguish severe protocol violations from ordinary disconnects and
-  unsupported cooperation. Ignore bounded unknown core IDs; validate known
-  messages against negotiated bits and valid indices.
-- [x] Add independent wire vectors, fragmented-I/O tests, handshake/framing fuzz
-  targets, and an outbound-message allowlist assertion.
-
-**Acceptance:** captured outbound traffic preserves no-upload/no-availability
-behavior, and malformed handshakes/frames return actionable classifications to
-the coordinator without allocating beyond the supported bounds.
-
-### P2. Requests, Fast, and per-peer state
-
-**Depends on:** P1. **Owns:** `internal/peer/state.go`, `requests.go`, and bounded
-connection I/O workers. **References:** DESIGN §12; BEPs 3, 6.
-
-- [x] Represent ordinary availability and Allowed Fast separately. Incoming
-  `Have None` clears only availability; choked requests require both availability
-  and Allowed Fast. Parse Suggest Piece without needing a scheduling policy.
-- [x] Bound requests and clamp `reqq`; require exact piece/begin/length response
-  matching. Fast choke retains outstanding terminal obligations. Cancel and
-  local timeout create bounded tombstones, not forgotten requests.
-- [x] Consume one exact late piece/reject per tombstone. Close without a strike
-  before the cap would require forgetting one. Release non-Fast requests on
-  choke while retaining bounded protection for allowed late piece races.
-- [x] Reject each admissible incoming Fast payload request exactly once; ignore
-  non-Fast requests. Handle abusive repetition as specified. Incoming requests
-  must have no path to storage reads. Update interested/not-interested from
-  useful advertised availability and keep otherwise useful idle peers alive.
-- [x] Keep protocol state under coordinator ownership and connection I/O in
-  bounded workers. Test choke/cancel/reject/timeout permutations, unknown frames,
-  stale availability, terminal-response duplication, and blocked-queue shutdown;
-  fuzz transitions and run race tests for the I/O boundary.
-
-**Acceptance:** local peer fixtures cover Fast seeds, ordinary peers, Allowed
-Fast-only cooperation, and uncooperative peers. No unavailable Allowed Fast piece
-is requested, and compatibility failure never becomes a corruption strike.
-
-### P3. Candidate admission and handshake racing
-
-**Depends on:** P1. **Owns:** `internal/peer/candidates.go`, `dial.go`, and race
-tests. **References:** DESIGN §§11, 15–16.
-
-- [x] Resolve and normalize bounded endpoint candidates keyed by IP and port.
-  Permit loopback/private unicast addresses; reject invalid ports, unspecified,
-  and multicast addresses. Bound DNS results, candidates, races, and live peers
-  before spawning work; deduplicate across sources and transports.
-- [x] Race injected uTP and TCP dial functions against the exact same resolved
-  endpoint, with uTP's short head start. Win only after a valid BEP 3 handshake;
-  then cancel, close, and join the loser. Inspect phase capabilities afterward
-  without reviving the loser. Bind the actual uTP dialer in L2.
-- [x] Do not deduplicate on tracker-supplied peer IDs. Apply optional expected-ID
-  validation and retain the older established connection on a live peer-ID
-  collision. Release the ID when it closes, permitting later connections.
-- [x] Keep ordinary failure backoff and endpoint blacklist state independent of
-  transport and peer-ID spoofing. Expose bounded outcomes to the coordinator,
-  which owns admission/penalty decisions.
-- [x] Use controlled dialers/clocks to test handshake races, a connected socket
-  with a stalled handshake, both failures, cancellation, duplicate IDs,
-  reconnects, DNS changes, and IPv4/IPv6. Fuzz event ordering and run race tests.
-
-**Acceptance:** one endpoint consumes one race slot; no loser or canceled dial
-survives completion; ordinary failure does not poison a peer ID or incur a
-corruption strike. These tests need no working uTP implementation.
-
-### D1. Basic piece and block scheduling
-
-**Depends on:** I4, P2. **Owns:** `internal/session/scheduler.go` and pure-state
-tests. **References:** DESIGN §§8, 12–13, 16.
-
-- [x] Track wanted pieces, connected-peer rarity, block state, selected-byte
-  progress, and contributor endpoints under one coordinator. Choose rarest-first
-  with cryptographically randomized ties; accept controlled randomness in tests.
-- [x] Split requests into at most 16 KiB without crossing piece boundaries or
-  requesting padding. Stage whole wanted pieces while committing only selected
-  intersections. Initially keep at most one active request per block.
-- [x] Enforce per-peer/global request caps, queue capacity, staged-piece count,
-  and staged-byte admission together. Return work after disconnect or rejection;
-  avoid spinning when no useful work is available.
-- [x] Turn successful verification/commit results into completion/progress. On a
-  hash mismatch, reschedule and add one strike per distinct contributing endpoint.
-  Blacklist at three strikes across reconnects/transports; severe violations blacklist
-  immediately. Keep compatibility and ordinary timeouts out of strike accounting.
-- [x] Add properties for coverage, rarity changes, padding, request budgets,
-  progress, mixed contributors, and strike deduplication; fuzz scheduler events.
-
-**Acceptance:** a deterministic sequence of peer events produces bounded valid
-requests and correct completion/penalties. Streaming and endgame remain D3 work.
-
-### D2. First local TCP transfer
-
-**Depends on:** D1, S2. **Owns:** `internal/session/transfer.go` and its local TCP
-integration fixtures. **References:** DESIGN §§6, 13, 15, 18–19.
-
-- [x] Connect the coordinator, peer I/O, scheduler, staged writes, and serialized
-  finalizer. Accept test-supplied handshaken TCP connections so this milestone
-  does not depend on trackers, metadata acquisition, or uTP.
-- [x] Define explicit transfer completion, cancellation, and storage-failure
-  paths. Stop scheduling, unblock and join workers, settle the current bounded
-  output operation, close handles, and remove the current workspace.
-- [x] Download a spec-derived single-file fixture, then selected multi-file
-  ranges with padding and a skipped-file boundary. Verify final bytes and prove
-  unselected files are absent. Exercise incoming payload requests throughout.
-- [x] Add corruption/retry, disconnect/reassignment, cancellation, and fatal
-  storage-failure scenarios. Capture bounded read-only observations needed for
-  assertions; do not build a metrics subsystem.
-
-**Acceptance:** the TCP milestone passes with wire and storage no-upload assertions,
-verified output, no leaked workers, and race-detector coverage. The test peer
-uses independent expected wire bytes rather than trusting Leech's own encoder.
-
-### D3. Streaming, endgame, and replacement
-
-**Depends on:** D2. **Owns:** subsequent changes to `internal/session/scheduler.go`
-and peer-replacement policy. **References:** DESIGN §§4.6, 12–13.
-
-- [x] Add sequential priority for streaming while using later available pieces
-  when earlier ones would leave a useful connection idle.
-- [x] Enter endgame only after every remaining block has an assignment. Duplicate
-  within existing budgets, accept the first response once, cancel the others,
-  and preserve P2's terminal/tombstone obligations for late responses.
-- [x] Rotate persistently choked/unproductive peers while retaining useful data
-  suppliers and useful Allowed Fast peers. Use fixed initial timings and ordinary
-  endpoint backoff, not corruption penalties or extra upload behavior.
-- [x] Let transfer wait for and admit later handshaken peers after current peers
-  disconnect, without spinning or ending the default indefinite retry. Seed
-  resume-verified pieces and metadata-phase endpoint strikes before transfer;
-  report each newly verified piece after output commit for timeout/accounting.
-- [x] Test changing availability, scarce pieces, winner/late-response races,
-  duplicate payload accounting, tombstone pressure, replacement, and reconnects.
-  Add event-sequence fuzz coverage for the new transitions.
-
-**Acceptance:** bulk behavior still passes, streaming progresses without needless
-idle connections, and endgame cannot double-commit a block or leak request slots.
-
-- [x] **R2 — Peer/transfer review:** one reviewer checks P1–P3 and D1–D3. Inspect
-  outbound API reachability, independent availability/Allowed Fast, terminal
-  obligations, exact-endpoint races, coordinator ownership, and corruption
-  attribution. Run the first-download and concurrent-state regressions.
-
-  R2 findings to return to original owners:
-
-  - [x] P1: report worker event-queue overflow to the coordinator, and make
-    concurrent `Start`/`Close` join-safe (`134d851`, `249ce31`).
-  - [x] P2: enforce initial availability message ordering, so late bitfields
-    cannot restore availability after `Have None` (`b0583b1`).
-  - [x] D3: treat closed worker channels and Fast tombstone-cap choke as
-    peer-local disconnects; release every initial peer on startup failure;
-    preserve explicit `reqq=0`; expose received-payload accounting and a
-    pre-peer-shutdown callback for ordered tracker quiescence (`f43f7c6`);
-    recover when a worker closes during scheduling (`909a369`).
-  - [x] P3: start TCP after the head start even if uTP fails early, and blacklist
-    endpoints after severe handshake violations (`bb0e235`).
-  - [x] D3: propagate transfer-phase severe and corruption blacklists to the
-    candidate dialer (`0ce6e28`).
-  - [x] P1: bound retained peer event payload across 64 connections; unknown
-    well-framed core messages must remain ignorable without large queue memory
-    (`1fc7fa0`).
-
-## Group 3: Trackers and metadata discovery
-
-### T1. HTTP(S) tracker transactions
-
-**Depends on:** I1. **Owns:** `internal/tracker/http.go` and HTTP fixtures.
-**References:** DESIGN §§10.2, 10.4, 16; BEPs 3, 7, 23, 31.
-
-- [x] Build announces with exact binary info-hash/peer-ID encoding. Remove every
-  existing Leech-owned parameter plus `ip`, `ipv4`, and `ipv6`, then add one
-  authoritative value for each applicable parameter. Preserve unrelated tracker
-  data and apply the same sanitization to every redirect target.
-- [x] Use standard TLS verification, bounded bodies, cancellation/deadlines, and
-  normal redirect limits. Report whether the complete announce was transmitted
-  independently of whether any response was received or parsed successfully.
-- [x] Parse dictionary peers, compact IPv4, and compact IPv6. Validate a complete
-  compact string's stride before dropping excess whole records. A successful
-  HTTP status with a bencoded failure is still a tracker failure.
-- [x] Parse intervals and BEP 31 integer/decimal-string retry minutes with checked
-  conversions. Distinguish transient failure, definitive HTTP client failure,
-  `never`, and invalid delays so T3 can apply the correct policy.
-- [x] Test local HTTP/TLS servers, redirects, duplicate-query first-value/last-value
-  parsers, malformed bodies, response loss after transmission, family variants,
-  credentials in URLs, and response-size limits; fuzz response parsing.
-
-**Acceptance:** each emitted request has authoritative counters/identity,
-redirects cannot restore supplied announce values, and failures cannot become
-successful tracker activations. Diagnostic data is safe for L1 to render.
-
-### T2. UDP tracker transactions
-
-**Depends on:** A0. **Owns:** `internal/tracker/udp.go` and UDP fixtures.
-**References:** DESIGN §§10.3–10.4, 16; BEPs 7, 15, 41.
-
-- [x] Implement connect/announce messages, connection-ID validity, transaction
-  and action checks, tracker errors, and bounded datagrams. A mismatched
-  transaction ID is a tracker-local failure, never an accepted response.
-- [x] Follow BEP 15's `15 × 2^n` transaction retransmission schedule and reconnect
-  when the connection ID expires. Keep transaction retries distinct from T3's
-  tracker-loop backoff and interruptible by the final-event deadline.
-- [x] Encode BEP 41 URL data and parse complete IPv4/IPv6 peer strides. For a
-  dual-stack hostname, announce to one resolved endpoint per available family
-  with the same session identity; handle unequal family support.
-- [x] Report transmission before awaiting a response. Test exact packet bytes,
-  loss/retry schedules using controlled time, ID expiry, malformed/mismatched
-  replies, URL data, family handling, and cancellation; fuzz packet decoding.
-
-**Acceptance:** the local model observes BEP 15 transactions and cancellation
-without real-time retry sleeps; no malformed datagram activates a tracker.
-
-### T3. Independent tracker lifecycle and accounting
-
-**Depends on:** T1, T2. **Owns:** `internal/tracker/loop.go`, session identity and
-announce snapshot helpers, and lifecycle tests.
-**References:** DESIGN §§6, 10, 15–16; BEP 31.
-
-- [x] Generate one opaque cryptographically random 20-byte peer ID, tracker key,
-  and dynamic-range announced port per run. Reuse them across phases, trackers,
-  and families; never probe, reserve, bind, or listen on the announced port.
-- [x] Run each unique tracker independently, including the mandatory default.
-  Start every phase with `started`; track transmitted-started separately from
-  activation. Isolate tracker failures, honor capped exponential backoff/jitter,
-  and disable permanent failures or invalid intervals/retry delays for the run.
-- [x] Never shorten a not-before time. Allow HTTP peer-depletion rerequests;
-  enforce UDP intervals except for defined events. Retry indefinitely by default
-  and remain interruptible during every wait/transaction.
-- [x] Consume coordinator snapshots: `uploaded=0`, received file payload for
-  `downloaded` including duplicates/corruption, metadata-phase `left=1`, then
-  whole-torrent retained-byte `left` excluding synthetic padding. Do not mistake
-  selected-byte completion for full-torrent completion.
-- [x] Stop and join regular loops before separate bounded final-event operations.
-  Full completion sends `completed` then `stopped`; other exits send `stopped`
-  only. Attempt stopped for every eligible transmitted-started tracker even
-  without a response. Final failures are secondary; no regular announce follows.
-- [x] Test/fuzz phase/event ordering, empty candidate pools, failed activation,
-  no-response started, interval/delay limits, cancellation, disabled trackers,
-  partial/full completion, and no normal announce after finalization. Run race
-  tests around loop termination and final operations.
-
-**Acceptance:** recorded request traces satisfy ordering and counters for each
-tracker independently, and final announcements cannot keep the process alive
-beyond their bounded shutdown budget.
-
-### M1. Extension protocol and metadata messages
-
-**Depends on:** I1, P1. **Owns:** `internal/peer/extensions.go`, `metadata.go`,
-and codec/state tests. **References:** DESIGN §§7.4, 12.3; BEPs 9, 10.
-
-- [x] Maintain per-connection extension maps: local IDs dispatch received
-  messages; remote IDs encode outgoing messages. Apply repeated handshakes as
-  additive enable/disable updates and ignore bounded unknown extensions.
-- [x] Encode metadata requests/rejects only. Parse received metadata data with
-  a bounded bencoded header and exact block bytes; validate message fields,
-  indices, block lengths, advertised size, and repeated `total_size`.
-- [x] Reject an incoming metadata request exactly once when the peer currently
-  provides a usable remote `ut_metadata` ID; otherwise ignore it. Expose no
-  metadata-data encoder and perform no storage read for a request.
-- [x] Test differing local/remote IDs, ID changes and disablement, repeated
-  handshakes, unknown extensions, malformed blocks, and rejection counts.
-  Fuzz extension and metadata transitions, not just decoding.
-
-**Acceptance:** a peer can use a different ID in each direction and change its
-mapping without misdispatch or upload. Invalid messages remain bounded and
-produce the intended peer-local error classification.
-
-### M2. Metadata-only acquisition
-
-**Depends on:** I2, I3, P2, P3, T3, M1. **Owns:** `internal/session/metadata.go` and
-local metadata-discovery tests. **References:** DESIGN §§6, 7.4, 15.
-
-- [x] Start independent metadata trackers with `left=1`, accept embedded/tracker
-  candidates, and keep only handshake winners that support metadata. Use P3's
-  dialer seams; real uTP wiring is L2's responsibility.
-- [x] Try the first bounded advertised size without a consensus wait. Have one
-  endpoint supply the complete candidate with the metadata request cap; do not
-  combine suppliers. Keep candidate data only in bounded run memory.
-- [x] Validate blocks, complete canonical bencoding, and exact info hash. Give
-  the sole supplier one strike for a complete invalid candidate, retaining
-  endpoint penalties across retries and later phases. Rotate peers or advertised
-  sizes after failure; treat ordinary rejection/timeouts as ordinary failures.
-- [x] Once the candidate passes hash/bencoding validation, cancel and join
-  tracker loops, dials, and metadata peers, then attempt bounded stopped events
-  before full normalization. Return immutable metadata and bounded retained
-  endpoint values, never a live network worker or cache workspace.
-- [x] Test magnet/bare hashes, wrong sizes/hashes, refusing peers, ID changes,
-  corruption strikes, repeated retry/cancellation, tracker loss, and the absence
-  of file-payload requests. Assert the phase boundary under the race detector.
-  Initial local fixtures cover multi-block metadata, refusal, repeated extension
-  IDs, one invalid complete candidate, cancellation, and request rejection.
-  R3 requires five more deterministic fixtures before sign-off: wrong advertised
-  size rotates to a second peer without a strike or mixed blocks; refusal or
-  timeout rotates with ordinary backoff; a transmitted but unanswered tracker
-  `started` still gets `stopped` with no later regular announce; an incoming
-  core payload request reads and serves no file data; and discovery returns
-  only after metadata peers and tracker loops join. L2/V1 cover full magnet
-  and bare-hash command flows.
-
-**Acceptance:** the metadata milestone obtains valid metainfo from local fixtures
-and returns only after workers stop. It creates no piece workspace/output,
-serves no metadata, and is not subject to the file-transfer no-progress timeout.
-
-- [x] **R3 — Discovery review:** one reviewer checks T1–T3 and M1–M2 together.
-  Focus on HTTP sanitization, UDP timing, transmitted-versus-successful started,
-  final events, whole-torrent accounting, directional extension IDs, single-source
-  metadata, and phase quiescence. Use captured local request traces as evidence.
-
-  R3 fixes to recheck:
-
-  - [x] T1: retain the standard ten-redirect HTTP limit while sanitizing every
-    redirect (`f609204`).
-  - [x] T2: reconnect before retransmitting an announce whose BEP 15 connection
-    ID has expired; preserve the transaction retry schedule and final deadline
-    (`67b2a4b`).
-
-## Group 4: uTP, developed alongside TCP
-
-### U1. Packets, sequence arithmetic, and a deterministic test link
-
-**Depends on:** A0. **Owns:** `internal/utp/packet.go`, `sequence.go`, and the
-small test-only datagram link. **References:** DESIGN §§14, 16; BEP 29.
-
-- [x] Implement v1 headers, packet types, extension chains, selective-ACK bits,
-  connection-ID representation, and checked timestamp/sequence wraparound.
-  Reject malformed packets/extensions and enforce datagram bounds.
-- [x] Define the narrow packet/action contracts shared by U2 and U3 so their
-  state logic can develop independently. Keep socket ownership for U4.
-- [x] Build a deterministic test link supporting clock advancement and scripted
-  packet loss, delay, reordering, and duplication. Keep it specific to uTP tests;
-  do not build a generic network simulation service.
-- [x] Add independent BEP-derived packet vectors, sequence/SACK properties, and
-  packet fuzzing. Supply reusable wraparound and adversarial packet cases.
-
-**Acceptance:** U2/U3 can test state changes without sockets or wall-clock sleeps,
-and malformed packet input cannot drive unbounded parsing or allocation.
-
-### U2. Receive windows and ordered reassembly
-
-**Depends on:** U1. **Owns:** `internal/utp/receive.go` and receive-state tests.
-**References:** DESIGN §§14, 16; BEP 29.
-
-- [x] Reassemble an ordered byte stream, handling duplicates, missing packets,
-  out-of-order data, sequence wraparound, and consumption by partial reads.
-- [x] Generate ACK/selective-ACK state and advertise receive capacity from bounded
-  storage. Enforce both packet-count and byte limits without treating a valid
-  peer's window pressure as permission to allocate more.
-- [x] Track receive-side FIN/RESET state for U4; preserve bytes preceding FIN and
-  define when reads return EOF or an error. Reject invalid connection/state input
-  according to the transport contract.
-- [x] Test/fuzz loss/reordering/duplication, gaps across wraparound, receive-window
-  exhaustion/reopening, FIN before missing data, reset, and cancellation actions.
-
-**Acceptance:** the received stream has neither gaps nor duplicate bytes; ACKs
-describe actual retained packets; receive memory remains within the fixed caps.
-
-### U3. Sending, recovery, and congestion control
-
-**Depends on:** U1. **Owns:** `internal/utp/send.go`, `congestion.go`, and send-state
-tests. May run alongside U2. **References:** DESIGN §§14, 16; BEP 29.
-
-- [x] Bound queued bytes and unacknowledged packets, segment writes, and respect
-  the remote receive window. Process cumulative and selective ACKs without
-  releasing bytes twice or advancing from invalid acknowledgments.
-- [x] Implement RTT/RTO estimation, retransmission, duplicate-ACK loss detection,
-  timeout backoff, and recovery from window pressure per BEP 29. Use controlled
-  time for tests; no independent unowned retry goroutines.
-- [x] Implement BEP 29's delay-based congestion control and packet sizing. Start
-  with the specified algorithm and constants; defer performance tuning rather
-  than substituting an unrestricted sender or omitting congestion control.
-- [x] Account for timestamp/sequence wraparound and define send-side SYN/FIN
-  retransmission actions for U4. Keep queued transport bytes distinct from
-  torrent-payload upload, which the peer API already forbids.
-- [x] Test/fuzz ACK/SACK combinations, reordering, retransmission ambiguity,
-  timeout/backoff, changing windows, delay samples, send limits, and wraparound.
-
-**Acceptance:** deterministic traces demonstrate recovery without duplicate
-delivery or exceeding local/remote windows, and congestion response follows the
-local BEP rather than an invented approximation.
-
-### U4. Outgoing `net.Conn` and transport integration
-
-**Depends on:** U2, U3. **Owns:** `internal/utp/conn.go`, `dial.go`, and full
-transport tests. **References:** DESIGN §§11, 14–16; BEP 29.
-
-- [x] Combine the state logic behind one outgoing connection using a connected
-  UDP socket per attempt. Implement SYN setup, connection-ID rules, IPv4/IPv6,
-  FIN/RESET, and protocol teardown. Expose no listener or inbound-SYN/server API.
-- [x] Implement `Read`, `Write`, addresses, deadlines, context-aware dialing, and
-  idempotent `Close` with `net.Conn` concurrency semantics. Unblock all pending
-  I/O on deadline, cancellation, reset, or close and join owned workers.
-- [x] Exercise complete streams over the deterministic link with loss, delay,
-  reordering, duplication, SACKs, window pressure, timeout, and wraparound. Add
-  real loopback UDP tests for socket/address/deadline behavior.
-- [x] Test P3-style cancellation while dialing/handshaking and a peer handshake
-  over the stream. Verify concurrent read/write/deadline/close behavior under
-  the race detector and fuzz transport transitions.
-
-**Acceptance:** the transport milestone passes with bounded packets/bytes and
-joined workers. The peer layer sees an ordinary `net.Conn`; it needs no uTP
-branches. Correctness is demonstrated by independent fixtures, not just two
-copies of this implementation successfully talking to each other.
-
-- [x] **R4 — uTP review:** one reviewer checks U1–U4 as a major task group.
-  Compare packet/state behavior directly with local BEP 29, especially sequence
-  arithmetic, SACKs, retransmission, congestion control, window bounds, and
-  cancellation. Keep tuning suggestions separate from correctness fixes.
-
-  Initial R4 review fixes are integrated: outgoing ACK/window/delay fields and
-  STATE ACK headers, handshake RESET rejection, post-FIN delivery, and bounded
-  congestion gain arithmetic. R4 recheck found a blocked large `Conn.Write`,
-  extreme RTT/RTO overflow, and missing full `Conn` stream simulation. U4 fixed
-  the wakeup and added independent stream/race fixtures in `ee2fef7`. U3 fixed
-  RTO saturation in `497c2ce`. R4's production recheck passed; its final
-  sign-off followed `7214254`, which asserts the exact timed-out packet's
-  retransmission before acknowledging it. Focused race checks passed.
-
-## Group 5: Complete CLI and lifecycle
-
-### L1. Logs, status, and signal adapter
-
-**Depends on:** I2, D2. **Owns:** `internal/cli/report.go`, `signals*.go`, and
-presentation/signal tests. This can run while uTP and metadata work continue.
-**References:** DESIGN §§4.5, 4.9–4.10, 15.
-
-- [x] Implement the exact log levels/default, permanent phase/result lines, and
-  stdout/stderr separation. Quote/escape untrusted names; redact tracker URL
-  userinfo/path/query and never echo a full magnet, including through wrapped
-  errors. Keep diagnostics bounded.
-- [x] At info/debug on an interactive stderr, show one replaceable line updated
-  at most once per second, with the defined phase/progress fields. Noninteractive
-  stderr gets enabled permanent lines only. Use no color or terminal dependency;
-  isolate the minimal platform-specific terminal detection if needed.
-- [x] Report no-transfer-needed resume, selection-versus-torrent completion,
-  resumable verified partial output, and ignored `private=1` accurately. Keep a
-  primary error distinct from secondary shutdown diagnostics.
-- [x] Implement the signal adapter: first SIGINT/SIGTERM requests graceful
-  cancellation with the right exit reason; a second may terminate immediately.
-  Keep process exit out of the reusable session code.
-- [x] Add golden log/status tests using injected terminal/time state and helper
-  process tests for signal behavior. Include escaped control characters and
-  credential-bearing URLs in error cases.
-
-**Acceptance:** user-visible output matches the CLI contract without leaking
-untrusted terminal controls or tracker credentials; signal tests cannot terminate
-the test runner. L2 receives a small reporter/cancellation adapter.
-
-### L2. Complete session orchestration and executable wiring
-
-**Depends on:** D2, S3, P3, T3, M2, U4, L1.
-**Owns:** `internal/session/run.go`, lifecycle integration, and final changes to
-`internal/cli/run.go` and `cmd/leech/main.go`.
-**References:** DESIGN §§4, 6, 9–11, 15, 18.
-
-- [x] Wire `.torrent`, magnet, and bare-hash flows through one explicit lifecycle.
-  Keep run identity/strikes across phases. Bind real TCP/uTP dialers, independent
-  trackers, the scheduler, storage, and reporter without production test switches.
-- [x] For known metadata, validate/select and finish resume before tracker/peer
-  activity. For fetched metadata, join metadata discovery and finish its stopped
-  sequence before normalization/selection/resume. Start transfer with fresh
-  started events and real `left` only if selected content is missing.
-- [x] Finish listing immediately after validated metadata, including remote
-  metadata-phase cleanup, without selection/resume/destination access. Finish a
-  complete resume without transfer discovery or piece-cache creation. Prepare
-  default overwrite only after metadata, selection, and path validation.
-- [x] Start the optional no-progress timer only at file transfer; reset it only
-  for a newly verified file piece. Metadata, resume, duplicates, mere received
-  bytes, and tracker responses must not extend it. With no option, keep retrying.
-- [x] Implement the complete ordered shutdown from DESIGN §15: stop admission,
-  join regular trackers, join dials/peers, settle/join finalization, attempt
-  applicable completed/stopped, close resources, and remove this workspace.
-  Preserve the primary result; cleanup failure changes an otherwise successful
-  result, while final tracker-event failures remain secondary.
-- [x] Map help/list/download outcomes, usage failures, runtime failures, and
-  supported signals to 0/2/1/130/143 as specified. Apply pending overlong-file
-  truncation only when that file has validated. Cover empty/zero-length selected
-  content and final output-close failures.
-
-**Acceptance:** the actual command runs complete local-fixture sessions in both
-transports, with correct listing/resume/overwrite/timeout/signal behavior. No
-worker crosses a phase boundary or outlives orderly return.
-
-### V1. Remaining integration and failure coverage
-
-**Depends on:** L2, D3. **Owns:** cross-component integration tests, missing
-regressions, and final usage/build documentation. Reuse the earlier local fixtures.
-**References:** DESIGN §19 and the coverage map below.
-
-- [x] Close gaps across `.torrent`/magnet/bare-hash input; HTTP/UDP discovery;
-  IPv4/IPv6; TCP/uTP winners; full/selective output; bulk/streaming; overwrite/
-  resume; and local/remote listings. Use representative combinations, not a
-  mechanically exhaustive Cartesian product.
-- [x] Assert mandatory default-tracker inclusion while routing every resolver,
-  tracker transport, and peer dial to controlled local fixtures. Test helpers may
-  provide dependencies to the same CLI/session entry points. Do not contact live
-  trackers/clients, add test-only user flags, or silently skip protocol families.
-- [x] Cover cancellation and first-signal cleanup during discovery, dialing,
-  resume, transfer, and finalization; second-signal immediate termination;
-  blocked queues; no-progress expiry; mixed-source corruption; and injected
-  cache/output/close/removal failures. Assert bounded final-event deadlines.
-- [x] Capture outbound peer traffic and instrument storage boundaries throughout
-  complete sessions. Prove payload/metadata requests cause no payload/cache/
-  output reads, no payload responses, no availability/unchoke messages, and the
-  specified rejection counts. Assert `uploaded=0` on every announce.
-- [x] Verify fuzz targets and seed cases exist for each parser/state boundary
-  required by DESIGN §19, including racing, deduplication, strikes, and shutdown.
-  Run bounded fuzz sessions and the relevant race tests; retain discovered
-  regressions. Reuse earlier evidence when the implementation has not changed.
-- [x] Update README with build/run examples, supported behavior, and the actual
-  implementation status. Update durable AGENTS guidance only where implementation
-  reveals a useful command, boundary, or pitfall. Keep temporary task history out
-  of guidance and do not claim external interoperability evidence.
-
-**Acceptance:** every promised design behavior has implementation and local
-evidence. Remaining follow-ups concern measured tuning or out-of-scope ideas,
-not silently omitted requirements.
-
-- [x] U4/P3 integration fix: a uTP connection returned by `DialContext` must
-  remain live when P3 cancels the winning dial attempt's context; V1's local
-  complete-session uTP fixture currently exposes premature connection closure.
-
-- [x] **R5 — Final integration review:** one reviewer checks L1, L2, and V1,
-  plus the interfaces between already reviewed groups. Verify phase ordering,
-  CLI side effects, shutdown/error precedence, default tracker routing in tests,
-  and the coverage map. Revisit earlier internals only when integration changes
-  or new evidence warrant it.
-
-  R5 fixes are integrated: verified-output diagnostics, metadata final-event
-  diagnostics, second-signal exit during cleanup, partial-resume preparation,
-  and committed-output reporting after staged-file removal failure. The reviewer
-  signed off on `4424ed9`.
-
-## Coverage and completion
-
-This map assigns the cross-cutting requirements to concrete tasks. Workers add
-tests with the behavior; V1 fills integration gaps instead of becoming a deferred
-testing phase.
-
-| Design area | Implementation owners | Main evidence |
-| --- | --- | --- |
-| CLI parsing, selection, listing (§4) | I2, I4, L1, L2 | Parser/golden cases, offline and remote-listing side effects |
-| Protocol profile and overrides (§5) | I2, I3, P1, T3, M2, L2 | Default tracker, public private-marker behavior, no availability/listener |
-| Source, hashes, metainfo (§7) | I1–I3, M1, M2 | Exact-byte vectors, normalization properties, fuzzing |
-| Output mapping and resume (§§8–9) | I4, S1–S3, L2 | Filesystem boundaries, skipped bytes, overlong/zero-length files |
-| Tracker transactions/lifecycle (§10) | T1–T3 | Independent request traces, retries, sanitization, event ordering |
-| Candidate identity/racing (§11) | P3, L2 | Controlled races, ID collisions, reconnect and loser join |
-| No upload and peer state (§12) | P1, P2, M1, D2, V1 | Wire allowlist, rejection counts, storage-read assertions, fuzzing |
-| Scheduling, corruption, staging (§13) | S2, D1–D3 | Coverage/provenance properties, endgame, hash and disk failures |
-| Outgoing uTP (§14) | U1–U4 | Independent packets, simulated loss/windows/wraparound, race tests |
-| Phases, timeout, shutdown (§§6, 15, 18) | T3, M2, D2, L1, L2, V1 | No overlapping phases, joined workers, signal/failure traces |
-| Limits and trust boundaries (§§16–17) | A0 and each boundary owner | Limit/overflow cases, bounded queues/buffers, confinement |
-
-For each group, the reviewer blocks completion on contract violations, incorrect
-data, unbounded resource use, ownership/shutdown bugs, and missing evidence for a
-required invariant. Style preferences and speculative performance improvements
-are advisory. The orchestrator resolves findings; do not add another reviewer
-merely because there is a disagreement.
-
-Before marking the original implementation complete:
-
-- [x] All task checkboxes and R1–R5 are complete; any breaking change has explicit
-  user approval and a matching design update. Development subsets are not
-  described as the complete supported client.
-- [x] Formatting, `go vet ./...`, and `go test ./...` pass on the integrated tree.
-- [x] `go test -race ./...` passes with the toolchain support the race detector
-  needs. This does not relax the pure-Go production rule.
-- [x] `CGO_ENABLED=0 go build ./cmd/leech` succeeds with no third-party modules.
-- [x] Required bounded fuzz runs and deterministic network/filesystem regressions
-  have passed. Run focused tests during work and these integrated checks once on
-  the final tree; repeat only after relevant changes or failures.
-- [x] Validation has used no existing BitTorrent clients or live trackers. State
-  that limit in the completion report rather than implying tested compatibility.
-
-## Post-completion robustness testing
-
-The checked gates above record completion of the original implementation. These
-new tasks strengthen independent evidence and interactions without changing the
-supported behavior. Reuse the current local fixtures and test seams. Do not add
-a Cartesian product, a second generic simulator, a coverage-percentage target,
-or tests against live trackers or existing clients. Keep expected bytes and
-outcomes independent of Leech's encoders and implementation where practical.
-
-### H1. Independent vectors and useful fuzz seeds
-
-**Depends on:** V1. **Owns:** parser, peer-wire, and uTP send tests in their
-existing packages. **References:** DESIGN §§7, 11–14, 19; libtorrent's
-[semantic fuzz corpus](https://github.com/arvidn/libtorrent/blob/6da363d2994f17c0b3c0450d124cf73a31a73847/fuzzers/tools/generate_initial_corpus.py#L47-L213)
-and Transmission's
-[fixed-hash metainfo tests](https://github.com/transmission/transmission/blob/48835c6660a7a3730b5a122bb7b88909997addbe/tests/libtransmission/torrent-metainfo-test.cc#L214-L294).
-
-- [x] Add a literal canonical v1 `info` golden, independent of Leech's bencoder:
-  one-byte payload `A`, piece hash
-  `6dcd4ce23d88e2ee9568ba546c007c63d9131c1b`, and exact info hash
-  `1db2e0a5d96e3ef52f804b928b28a19f90e3f92e`. Derive small mutations
-  for duplicate or unordered keys, wrong piece count, and an unsafe path;
-  assert parser rejection, then use one representative invalid fixture to
-  check that the CLI creates no output or cache and starts no network work.
-- [x] Add `so=2-4&so=1` as a repeated-parameter magnet vector; assert the
-  union selects original file indices 1–4 after metadata acquisition. Seed
-  valid Fast and BEP 10 wire frames, including Bitfield, Allowed Fast, and
-  Have None, and assert their state transitions and bounded parsing.
-- [x] Make `FuzzSendStateBounded` use its `initial` sequence argument; its
-  previous `65535` seed never exercised send-side wrap. Seed `FuzzReadHandshake`
-  with a valid handshake and `FuzzReadMessage` with valid Fast and BEP 10
-  frames. Add useful compact and dictionary peer responses to tracker fuzz
-  seeds. Keep minimized failures as named regression inputs.
-
-**Acceptance:** literal vectors have independently known results, valid seeds
-reach the intended parser or state path, and fuzz assertions check safety and
-protocol invariants rather than merely avoiding a panic. Preserve Leech's strict
-rejection rules where the upstream clients accept or repair malformed input.
-
-### H2. Cross-boundary local sessions
-
-**Depends on:** V1. **Owns:** complete-session tests in `internal/cli/` and
-`internal/session/`. **References:** DESIGN §§8–13, 15, 19; Transmission's
-[file-to-piece cases](https://github.com/transmission/transmission/blob/48835c6660a7a3730b5a122bb7b88909997addbe/tests/libtransmission/file-piece-map-test.cc#L21-L131).
-
-- [x] Test a four-byte piece spanning selected `A="AB"` and unselected
-  `B="CD"`, with existing `A="AB"` under `--resume`. Request the full piece,
-  verify it, write only `A`, create no `B`, and finish with whole-torrent
-  `left=2` and `stopped` but no `completed`.
-- [x] In separate scripted sessions, reassign an outstanding block after a
-  peer disconnects, and recover from a piece whose blocks came from two bad
-  endpoints. Assert strikes by resolved endpoint, a later clean piece, final
-  bytes, no upload, and joined connections.
-- [x] Inject an output-close or staged-read error after tracker `started` was
-  transmitted. Assert the error remains primary, `stopped` is attempted under
-  its deadline, `completed` is absent, the current workspace is removed, and
-  network workers join. Include one mixed-tracker shutdown trace only if it
-  reveals ordering not already proved by the tracker and metadata tests.
-
-**Acceptance:** each new session proves an interaction that component tests
-cannot; assertions include outbound wire and tracker traces, filesystem state,
-and worker lifetime. Reuse the existing fixture seams.
-
-### H3. Address-family smoke test and fixture reliability
-
-**Depends on:** H2, to avoid simultaneous ownership of CLI fixtures.
-**Owns:** `internal/cli/v1_utp_test.go`, the existing UDP wire fixture in
-`internal/cli/v1_test.go`, and focused uTP tests as needed.
-
-- [x] Complete one real IPv6 uTP loopback transfer through a BEP 3 handshake,
-  with a scripted TCP loser and outbound no-upload assertions. Keep the
-  existing deterministic uTP loss, reordering, SACK, and wrap tests; this
-  test covers the `utp6` socket and address-family path only.
-- [x] Remove the timing dependence behind the observed intermittent
-  `TestV1UDPTrackerWirePathCompletesCLITransfer` fixture-join failure. Use a
-  deterministic barrier or explicit event trace so the test knows whether
-  `started` was transmitted before requiring `stopped`. Do not mask the race
-  by increasing sleeps or deadlines. Repeat the focused test under `-race`.
-
-### R6. Robustness-test review and validation
-
-**Depends on:** H1–H3. One reviewer checks that each new test has an
-independent expected result, exercises its claimed path, and would detect the
-intended failure. Avoid duplicate cases and tests that mirror implementation.
-
-- [x] Resolve R6 findings, then run `go test ./...`, `go test -race ./...`,
-  `go vet ./...`, and a pure-Go build on the integrated tree. Replay all fuzz
-  seeds and run bounded fuzz campaigns for changed parsers and state machines.
-  Keep every minimized regression. Use local deterministic peers and trackers
-  throughout; report the absence of external interoperability testing.
-
-## Security review follow-up
-
-Fix all nine findings in [SECURITY.md](SECURITY.md). The earlier checked gates
-record the original implementation; the tasks below track later fixes. Keep the design's
-protocol and resource contracts, and use local deterministic peers and trackers.
-SEC1, SEC2, SEC4, and SEC6 can start independently; SEC3 follows SEC1 and SEC2,
-SEC5 follows SEC4, and R7 follows all six fixes.
-
-### SEC1. Bound HTTP tracker parsing (F-05, F-09)
-
-**Depends on:** I1, T1. **Owns:** `internal/tracker/http.go` and focused tracker
-tests. **References:** DESIGN §§10.2, 16–17; SECURITY F-05, F-09.
-
-- [x] Deduplicate compact IPv4, compact IPv6, and dictionary peers with one map
-  per response instead of rebuilding it for each entry. Preserve first-endpoint
-  ordering and the existing optional peer-ID behavior.
-- [x] Apply tracker-specific decoded-node and container limits that still admit
-  valid responses with 20,000 dictionary peers. Reject tracker responses with
-  large unused trees before they cause disproportionate allocation.
-- [x] Add bounded local fixtures for unique and duplicate peers, and for small
-  wire bodies containing many decoded nodes. Check work and memory bounds
-  without relying on live trackers.
-
-**Acceptance:** a maximum supported peer list parses with linear deduplication
-work, and ignored tracker fields cannot expand into excessive decoded memory.
-
-### SEC2. Keep candidate identity and capacity trustworthy (F-02, F-07)
-
-**Depends on:** P3. **Owns:** `internal/peer/candidates.go`, `dial.go`, and focused
-peer tests. **References:** DESIGN §§11, 16–17; SECURITY F-02, F-07.
-
-- [x] Keep a supplied tracker peer ID as an expected handshake value, but do
-  not classify its mismatch as a peer-origin protocol violation or blacklist
-  the endpoint. Let a later unpoisoned announcement retry that endpoint.
-- [x] Keep the 20,000-endpoint cap and resolved IP/port deduplication while
-  allowing later tracker responses to replace stale or repeatedly failed
-  candidates. One tracker must not permanently occupy every slot.
-- [x] Cover false tracker IDs, mixed TCP/uTP race outcomes, a full pool from one
-  tracker, and later usable peers from another tracker with deterministic inputs.
-- [x] Bound ordinary endpoint-backoff state as evicted candidates are replaced;
-  keep run-long blacklists and cover sustained candidate churn.
-- [x] Preserve admission capacity across tracker sources when one tracker
-  repeatedly reannounces a full candidate set.
-- [x] Use a bounded numeric tracker-source key in per-peer admission so a long
-  tracker URL is not hashed for every announced endpoint.
-- [x] Enforce the approved 100,000 distinct attempted-endpoint limit across the
-  run, including both phases, and fail with normal cleanup at exhaustion.
-
-**Acceptance:** a tracker cannot blacklist an honest endpoint or exclude all
-later candidates; peer-origin severe handshake violations still blacklist it.
-
-### SEC3. Bound tracker-update admission (F-03)
-
-**Depends on:** SEC1, SEC2. **Owns:** `internal/session/metadata.go`, `run.go`,
-and focused session tests. **References:** DESIGN §§10–11, 15–17; SECURITY F-03.
-
-- [x] Bound the total peer data retained in pending tracker updates, not just
-  the update count. Keep each tracker loop independent and cancellation safe.
-- [x] Resolve tracker-supplied hostnames under a small concurrency limit and
-  per-lookup deadline. Interleave admission with dialing so a large hostname
-  batch cannot block already available peers or phase shutdown.
-- [x] Use a local tracker and controlled resolver to cover slow names, later
-  usable IP peers, queue pressure, cancellation, and both discovery phases.
-- [x] Preserve later tracker sources inside a full pending-peer queue so an
-  earlier source cannot evict them before candidate-pool admission.
-
-**Acceptance:** malicious hostname lists cannot stall discovery or cause large
-queued-memory growth; valid private and loopback endpoints remain supported.
-
-### SEC4. Make peer availability updates proportional (F-01, F-06)
-
-**Depends on:** P1, P2, D2. **Owns:** `internal/peer/wire.go`, `state.go`,
-`internal/session/transfer.go`, and focused tests. **References:** DESIGN
-§§12–13, 16–17; SECURITY F-01, F-06.
-
-- [x] Initialize the wanted set in one pass and update interest and scheduler
-  availability from changed bits. Repeated `Have` and empty `Have None`
-  messages must not trigger whole-torrent scans.
-- [x] Reject every nonzero spare bit in an initial Bitfield through one shared
-  validation rule. Preserve Fast `Have None` and Allowed Fast semantics.
-- [x] Cover large piece counts, repeated small availability messages, and each
-  spare-bit position with deterministic peer-state and transfer checks.
-- [x] Keep sparse availability changes proportional to occupied words when a
-  peer alternates one wanted `Have` with `Have None` or `Choke`/`Unchoke`.
-- [x] Keep sparse-word order so repeated choke transitions do not sort a
-  full-torrent availability delta on every small frame.
-
-**Acceptance:** peer startup is not quadratic in piece count, small repeated
-messages cannot force full scans, and malformed bitfields trigger the required
-protocol rejection.
-
-### SEC5. Expire stalled block requests (F-04)
-
-**Depends on:** SEC4, D3. **Owns:** `internal/session/transfer.go`,
-`scheduler.go`, `internal/peer/requests.go` if needed, and focused tests.
-**References:** DESIGN §§12–13, 15; SECURITY F-04.
-
-- [x] Give active block requests a bounded timeout, release or reassign expired
-  blocks, and rotate peers based on recent useful activity rather than one
-  lifetime `productive` flag. Free connection slots for later candidates.
-- [x] Preserve exact Fast terminal obligations and bounded tombstones for late
-  responses. Ordinary stalls must not create corruption strikes.
-- [x] Script a peer that sends one valid block and then idles while later peers
-  can finish, including the active-peer cap and default indefinite retry.
-
-**Acceptance:** a stalled peer cannot hold requests or a slot indefinitely,
-and late Fast responses remain correctly attributed.
-
-### SEC6. Reuse uTP selective ACK state (F-08)
-
-**Depends on:** U2, U4. **Owns:** `internal/utp/receive.go`, `conn.go`, and
-focused uTP tests. **References:** DESIGN §§14, 16–17; SECURITY F-08.
-
-- [x] Send the ACK returned by the receive state instead of rebuilding it in
-  the socket adapter. Reuse the selective-ACK mask for duplicate packets when
-  the receive window has not changed.
-- [x] Cover a nearly full reorder window followed by repeated duplicates,
-  checking ACK fields, bounded work, and recovery when the gap closes.
-
-**Acceptance:** duplicate packets cannot force repeated full reorder-map scans,
-and SACK behavior remains correct under loss and reordering.
-
-### R7. Security-fix review and validation
-
-**Depends on:** SEC1–SEC6. One reviewer checks the integrated fixes against
-F-01–F-09 and the original design contracts. Return concrete defects to the
-responsible worker, then recheck affected paths.
-
-- [x] Confirm each malicious peer and tracker path has a focused regression.
-  Run the affected tests under `-race`, then `go test ./...`, `go vet ./...`,
-  and a pure-Go build. Use local deterministic fixtures only.
-
-## Additional review follow-up
-
-Resolve the confirmed R-01–R-10 findings in the separate full-application
-review. Keep owners on disjoint production files and use local deterministic
-fixtures. R-03 and R-05 are liveness gaps even though their exact remedies are
-not specified by the design; choose bounded fixes that preserve its contracts.
-
-### REV1. Redact tracker diagnostics (R-01)
-
-**Owns:** `internal/cli/report.go` and focused CLI tests.
-
-- [x] Redact complete tracker URLs, including bracketed IPv6 authorities and
-  punctuation in paths or queries, when nested transport errors reach the CLI.
-- [x] Prove disposable passkeys never appear in error-level output.
-
-### REV2. Preserve peer violations and handle bursts (R-02, R-03)
-
-**Owns:** `internal/peer/worker.go` and focused peer tests.
-
-- [x] Preserve the first terminal protocol error when the bounded event queue
-  is full, so transfer can blacklist a severe violation.
-- [x] Apply cancellation-safe backpressure to valid frame bursts within the
-  existing queue and payload bounds; cover a burst and close while blocked.
-
-### REV3. Keep uTP sending live (R-04, R-05)
-
-**Owns:** `internal/utp/congestion.go`, `send.go`, any necessary adapter file,
-and focused uTP tests.
-
-- [x] Recover from a zero congestion window by BEP 29's bounded timeout and
-  one-packet restart, including when no packet remains unacknowledged.
-- [x] Probe a persistently closed remote receive window at a bounded rate so a
-  lost reopen update cannot leave queued writes stalled indefinitely.
-
-### REV4. Preserve tracker final events (R-06)
-
-**Owns:** `internal/tracker/loop.go` and focused tracker tests.
-
-- [x] Give `stopped` its own bounded transmission opportunity after a stalled
-  `completed` response, while retaining a bounded total shutdown time.
-
-### REV5. Keep UDP address families independent (R-07)
-
-**Owns:** `internal/tracker/udp.go` and focused tracker tests.
-
-- [x] Run the supported IPv4 and IPv6 tracker transactions independently so
-  one silent announce cannot delay the other family; join both on cancellation.
-
-### REV6. Bound HTTP work and classify failures (R-08, R-09)
-
-**Owns:** `internal/tracker/http.go` and focused tracker tests.
-
-- [x] Preserve permanent 4xx classification when reading an oversized or
-  failing response body, subject only to a parsed applicable retry hint.
-- [x] Sanitize a delimiter-heavy tracker query with bounded memory proportional
-  to its bytes, retaining the supported 64 MiB URL input contract.
-
-### REV7. Negotiate transfer extensions (R-10)
-
-**Depends on:** SEC2 endpoint-budget integration and REV2. **Owns:**
-`internal/session/run.go`, `transfer.go`, `scheduler.go`,
-`internal/peer/extensions.go`, and focused tests.
-
-- [x] Send and parse BEP 10 handshakes in transfer; keep extension IDs
-  directional and allow later handshakes to update negotiated state.
-- [x] Parse `reqq` and keep the active scheduler request limit within the
-  peer's latest advertised capacity, including zero and repeated updates.
-- [x] Apply already queued extension handshakes before assigning more blocks,
-  and bound peer-command enqueue time so a nonreading peer cannot stall the
-  coordinator while Leech sends metadata or Fast rejects.
-
-### REV8. Integrated review and validation
-
-**Depends on:** REV1–REV7 and R7.
-
-- [x] Stabilize `TestTransferRunContinuesAfterDriveSeesClosedWorker`: its
-  scripted first peer can be closed after useful work finishes, before the
-  fixture writes its second frame. Keep the closed-worker behavior covered.
-- [x] Recheck all ten findings on the integrated tree, run full tests with and
-  without `-race`, `go vet ./...`, and a pure-Go build. Keep local deterministic
-  tests only and record any remaining interoperability limit.
-
-Live trackers and existing BitTorrent clients were not used for interoperability
-tests, as required by the project validation boundary.
+| UTP | R-11, R-12 | — |
+| SELECT | R-13 | — |
+| STORAGE | R-14, R-15, R-16 | — |
+| ENDPOINT | R-17 | — |
+| ADMISSION | R-18, unresolved part of R-24 | — |
+| METADATA | R-19, R-20, R-21 | — |
+| CLI | R-27, R-28 | — |
+| PEERS | R-23 | ADMISSION |
+| SHUTDOWN | R-22 | ADMISSION, METADATA |
+| SCHEDULER | R-25, R-26, F-01/SEC4 | PEERS |
+| STATUS | R-29 | CLI, SHUTDOWN |
+| INPUT-REVIEW | Unfinished offline-input review coverage | SELECT |
+| VALIDATE | Integrated acceptance of this backlog | All tasks above |
+
+`ADMISSION → PEERS → SCHEDULER` serializes edits to `transfer.go`.
+`ADMISSION + METADATA → SHUTDOWN → STATUS` serializes edits to `run.go` and
+`metadata.go`. SHUTDOWN and PEERS can proceed together, as can STATUS and
+SCHEDULER. STORAGE owns output operations; SCHEDULER uses the existing staging
+abort API and does not own storage production files.
+
+Validation is local and deterministic, using the current stable Go toolchain.
+Commands below can run through `bash -ic 'go ...'` in this environment. Run focused
+checks with each change, and run the full gates once on the final integrated
+tree. Use existing private test seams; route the mandatory tracker locally.
+Never test against live trackers or existing BitTorrent clients. Regression tests
+must assert corrected behavior, including when an earlier proof asserted the bug.
+
+## UTP — Bound packet work and honor write deadlines
+
+**Findings:** R-11 (P2), R-12 (P2). **Depends on:** none.
+**Owns:** `internal/utp/packet.go`, `conn.go`, and focused uTP tests.
+**Guidance:** [uTP](internal/utp/AGENTS.md).
+**References:** DESIGN §§14, 16, 19; BEP 29.
+
+R-11: `ParsePacket` retains every unknown extension, and `Packet.Validate`
+visits them again. A 65,534-byte datagram containing 32,757 empty unknown
+extensions allocates megabytes; `Conn.handleDatagram` parses it before checking
+the connection ID. Repeated packets amplify CPU and memory without stream
+progress. R-12: `Conn.Write` queues data whenever buffer space is available even
+when its write deadline has already expired, violating its `net.Conn` contract.
+
+- [ ] Walk and validate unknown extension framing without materializing one
+  object per ignored header. Preserve supported datagrams, payload ownership,
+  selective-ACK validation, and malformed-chain rejection. Do not introduce a
+  smaller extension-count or datagram limit to hide the amplification.
+- [ ] Check the connection identity early enough to avoid extension/state work
+  for unrelated packets, without weakening validation for the active connection.
+- [ ] Check the effective write deadline before each newly accepted prefix.
+  Expired writes return a timeout without enqueueing more bytes; writes that
+  accepted an earlier prefix retain correct partial-write results. Preserve
+  deadline updates, close/reset wakeups, and concurrent `net.Conn` behavior.
+
+**Fixtures and validation:** Construct a valid STATE header whose first extension
+type is 2, followed by 32,757 two-byte headers with zero-length bodies; each
+header names type 2 next except the last, which names 0. Compare allocations for
+short and maximum chains and assert that ignored headers create no retained
+per-header state. Include truncated chains, mixed unknown/SACK extensions, and
+an unrelated connection ID. On a local connected uTP fixture with free send
+capacity, set a past deadline and write 12 bytes: require zero accepted bytes
+and a timeout. Also cover expiry after a partial write and extension/clearing of
+the deadline while blocked. Run `go test ./internal/utp` and
+`go test -race ./internal/utp`; seed and run bounded
+`FuzzParsePacketBounded` and `FuzzConnectedTransportTransitions` campaigns.
+
+**Acceptance:** valid ignored extensions require only bounded framing work and
+no per-header retained allocation; active connection state ignores unrelated
+IDs; write results reflect the deadline in force when bytes are accepted.
+
+## SELECT — Preserve negated descending glob classes
+
+**Finding:** R-13 (P2). **Depends on:** none.
+**Owns:** `internal/torrent/selection.go` and selection tests/fuzz seeds.
+**Guidance:** [torrent](internal/torrent/AGENTS.md).
+**References:** DESIGN §§4.3, 8, 19.
+
+`globClassToRegexp` turns an empty descending range into a NUL-only match even
+when negated. `path.Match("[^z-a]", "a")` is true, but the accelerated selector
+excludes the file, causing missing selections or a false no-match error.
+
+- [ ] Preserve negation for classes whose ranges contribute no characters, or
+  use the existing `path.Match` semantics for that case. Keep supported patterns
+  and the existing accelerated selection bound.
+- [ ] Add the exact pattern/path pair to the differential corpus. Cover positive
+  and negated descending-only classes, descending ranges mixed with ordinary
+  members, escaped class characters, and directory selection. Retain the rule
+  that a bracket class can consume `/`, while `*` and `?` cannot.
+
+**Validation:** Run `go test ./internal/torrent` and a bounded
+`FuzzGlobRegexMatchesPathMatch` campaign, with the named edge cases replayed
+deterministically. Check selected paths, not just compiled regular expressions.
+
+**Acceptance:** accelerated selection agrees with `path.Match` over the supported
+domain, including `[^z-a]`, without losing existing large-selection behavior.
+
+## STORAGE — Preserve valid paths, isolate output inodes, and bound handles
+
+**Findings:** R-14 (P2), R-15 (P1), R-16 (P2). **Depends on:** none.
+**Owns:** `internal/storage/output.go`, `finalize.go`, `resume.go`, any necessary
+storage platform helper, and focused storage tests. Metainfo parsing is a
+read-only reference for this task.
+**Guidance:** [storage](internal/storage/AGENTS.md).
+**References:** DESIGN §§4.7, 8–9, 13.1, 16–19.
+
+R-14: `Validate` prepends `info.name` before checking the relative file's
+64-component/4,096-byte limits, rejecting valid metadata. R-15: `Prepare`,
+`writeSelected`, and `TruncateSelected` mutate existing hardlinked inodes. An
+outside file can be truncated, and two selected paths can both finish with the
+second path's bytes despite successful piece verification. No concurrent
+filesystem race is needed. R-16: preparation and finalization open every affected
+file at once; valid many-file torrents fail with `EMFILE` under ordinary limits.
+
+- [ ] Apply metainfo path limits to the relative file path, excluding the
+  torrent root name. Check the combined path for actual filesystem
+  representability separately; keep unsafe-path and collision rejection.
+- [ ] Ensure selected output paths have distinct writable inodes before
+  destructive preparation, verified writes, or resume truncation. Detach
+  existing hardlinks as needed without modifying their other names. Preserve
+  existing regular-file support and verified resume bytes; choose the smallest
+  implementation that meets these conditions rather than rejecting every
+  hardlinked regular file. Bound any copying and propagate its failures.
+- [ ] Keep simultaneous output handles bounded independently of file count in
+  both `Prepare` and `writeSelected`. Complete plan validation before destructive
+  preparation, and preserve fatal open/write/short-write/close error handling.
+- [ ] Preserve verification-before-output and staged-piece lifetime: do not
+  delete a stage until all selected writes and closes succeed. Keep unselected
+  paths untouched and zero-length selected files supported.
+
+**Fixtures and validation:** Parse and select canonical metainfo with 64
+one-character relative components, then validate and prepare its output. Check
+the relative-byte boundary separately from genuine platform path failures.
+Create a selected hardlink to an outside sentinel and verify overwrite leaves
+the sentinel intact. Link two selected paths to one inode, finalize independently
+hashed `A` and `B` pieces, and require final contents `A` and `B`. Repeat the
+alias cases for resume-preserving writes and truncation of a verified overlong
+file, including an unselected alias. In isolated child processes with a soft
+descriptor limit of 64, exercise 96-file preparation and one piece spanning 96
+selected files; both must succeed without leaking handles. Keep failure
+injection for writes, closes, detachment/copying, and cancellation. Run
+`go test ./internal/storage` and `go test -race ./internal/storage` plus affected
+session resume/finalization regressions.
+
+**Acceptance:** supported relative paths are not rejected merely because the
+root was prepended; selected mutations cannot corrupt another pathname; file
+count does not dictate simultaneous open handles; I/O failure remains fatal.
+
+## ENDPOINT — Give routed IPv6 aliases one identity
+
+**Finding:** R-17 (P2). **Depends on:** none.
+**Owns:** `internal/peer/candidates.go` and focused endpoint/dial tests in
+`internal/peer/`. Inspect tracker dictionary parsing and session admission as
+callers without changing their files in this task.
+**Guidance:** [peer](internal/peer/AGENTS.md).
+**References:** DESIGN §§11, 16–17, 19; BEP 7.
+
+`ResolveCandidate`, `NormalizeEndpoint`, and `normalizedEndpoint` retain
+irrelevant IPv6 zones. An HTTP dictionary peer can announce `::1%anything` and
+`::1` as separate identities even though Linux connects both to the same
+listener. Changing the zone bypasses deduplication, backoff, strikes, and the
+run-long blacklist; it also undermines distinct-endpoint accounting.
+
+- [ ] Canonicalize at endpoint admission: remove zones with no routing meaning
+  and normalize meaningful interface aliases consistently. Preserve distinct
+  link-local routes and accepted IPv4/IPv6, private, and loopback endpoints.
+- [ ] Use the same canonical identity for pool membership, dial attempts,
+  backoff, corruption penalties, and blacklists across reconnects/transports.
+  Keep tracker-supplied peer IDs out of identity.
+- [ ] Cover direct parsed addresses and resolver-returned addresses, including
+  name/numeric aliases for a meaningful scope. Keep ordinary invalid-interface
+  failures distinct from a peer-origin protocol violation.
+
+**Fixtures and validation:** Recreate
+`TestAuditZonedLoopbackAliasesBypassEndpointBlacklist` with a loopback endpoint
+and variants `::1`, `::1%anything`, and another arbitrary zone: require one
+candidate identity and one shared blacklist/backoff state. A local IPv6 listener
+can confirm routing equivalence on Linux. Controlled interface/resolver fixtures
+must also prove that meaningful different scopes stay distinct and equivalent
+interface aliases share strikes and attempted-endpoint accounting. Run
+`go test ./internal/peer` and `go test -race ./internal/peer`, retaining existing
+candidate-source fairness and endpoint-budget tests.
+
+**Acceptance:** addresses that route to the same scoped endpoint cannot create
+fresh penalty identities; genuinely distinct scoped endpoints remain usable.
+
+## ADMISSION — Advance candidates fairly and propagate fatal failures
+
+**Findings:** R-18 (P1), unresolved part of R-24 (P2).
+**Depends on:** none. **Owns:** `internal/session/run.go`, `transfer.go`, and
+dedicated admission regressions. Leave `metadata.go` to METADATA/SHUTDOWN.
+**Guidance:** [session](internal/session/AGENTS.md).
+**References:** DESIGN §§11, 15, 18–19.
+
+R-18: the acquisition closure in `coordinator.startTransferPhase` advances
+`candidateCursor` by the full 64-entry batch before examining candidates, then
+returns on success or breaks on an ordinary dial error. A two-entry pool can
+retry its first live peer forever while never trying a useful second peer.
+R-24: `Transfer.acquireLoop` now propagates `peer.EndpointBudgetError`, but still
+retries other permanent errors, including the coordinator's latched tracker-event
+queue overflow. The real failure is eventually hidden by cancellation/timeout.
+
+- [ ] Advance the cursor for candidates actually examined, including the one
+  ending an acquisition. Continue within the bounded batch after an ordinary
+  dial failure or live-peer-ID collision, observing endpoint backoff and
+  cancellation without busy retrying.
+- [ ] Define the acquisition boundary's retryable outcomes explicitly. Retry
+  `ErrNoPeer` and explicitly temporary failures; deliver permanent errors to
+  `Transfer.Run` and preserve them through normal shutdown. Keep existing fatal
+  endpoint-budget propagation and ordinary indefinite discovery retries.
+- [ ] Make both direct and latched queue-overflow paths reach the same fatal
+  outcome without building a generic error-classification framework.
+
+**Fixtures and validation:** Recreate
+`TestAuditTwoCandidatesStarveSecondAfterFirstConnects`: use two controlled peers,
+one that handshakes and idles, and another that supplies the piece. Assert the
+second is attempted and makes progress with capacity available. Include first
+candidate dial failure, live-ID collision, and backoff; assert attempt order with
+barriers rather than the original 900 ms sleep. Recreate
+`TestReviewFatalAcquireErrorMustStopTransfer` by injecting a permanent acquisition
+error: require that error before a safety deadline, joined workers, normal
+`stopped`/cache cleanup, and no endless retries. Cover the actual queue-overflow
+callback and temporary/no-peer recovery. Run `go test ./internal/session` and
+`go test -race ./internal/session` with the focused acquisition tests.
+
+**Acceptance:** an eligible candidate is not starved by batch-cursor arithmetic
+or a live collision; permanent acquisition errors terminate with their original
+cause, while ordinary lack of peers remains retryable.
+
+## METADATA — Permit progress and classify replies correctly
+
+**Findings:** R-19 (P2), R-20 (P2), R-21 (P2). **Depends on:** none.
+**Owns:** `internal/session/metadata.go`, `internal/peer/metadata.go`, and focused
+metadata tests. Keep phase-shutdown edits in SHUTDOWN after this task.
+**Guidance:** [session](internal/session/AGENTS.md), [peer](internal/peer/AGENTS.md).
+**References:** DESIGN §§7.4, 12.3, 16, 19; BEPs 9 and 10.
+
+R-19: `fetchMetadata` sends one 16 KiB request at a time under one fixed
+30-second candidate deadline. A healthy supplier whose cumulative round trips
+exceed that cutoff is discarded despite progress, repeatedly restarting large
+supported metadata. R-20: the pre-size and response loops accept unsolicited or
+wrong-piece rejects as ordinary `ErrMetadataRejected`. R-21:
+`peer.ParseMetadataMessage` rejects canonical unknown integer `msg_type=256`
+before unknown-type handling, and `tryCandidate` blacklists the endpoint.
+
+- [ ] Implement bounded metadata request scheduling and a timeout policy that
+  allows steady progress through supported metadata sizes while rotating stalled
+  or unproductive suppliers. Keep at most the design's 32 metadata requests in
+  flight, bounded response work, one supplier per candidate, and fixed geometry
+  from the first accepted advertised size. Choose pipeline width and timeout
+  details as internal implementation decisions, not new user-facing limits.
+- [ ] Track outstanding pieces and accept each terminal response only for an
+  outstanding request. Treat unsolicited/mismatched data or rejects as protocol
+  violations; a matching reject remains ordinary refusal/backoff. Handle out-of-
+  order valid responses if the chosen pipeline permits them.
+- [ ] Compare the full decoded `msg_type` integer with known types before any
+  narrowing. Ignore other well-formed integer types within existing bencode and
+  frame bounds; keep malformed known messages rejectable.
+- [ ] Preserve per-connection directional extension IDs, repeated mapping
+  updates/disablement, cancellation, exact candidate hash validation, sole-
+  supplier strikes for complete invalid metadata, and the no-metadata-upload API.
+
+**Fixtures and validation:** Recreate
+`TestReviewSerialMetadataRequestsExhaustCandidateDeadline` with at least two
+valid metadata blocks, each returned after 90 ms, and a scaled old total budget
+of 150 ms; the corrected policy must finish while each response is productive.
+Use controlled time/barriers where practical and also check a permanently idle
+supplier and endless irrelevant messages. Recreate
+`TestReviewUnsolicitedMetadataRejectBeforeHandshake` and
+`TestReviewWrongPieceRejectAbortsCandidate` over `net.Pipe`: a reject before any
+request and a reject for piece 1 while only piece 0 is outstanding must be
+protocol violations; a correct reject must not earn a strike. Feed the literal
+canonical body `d8:msg_typei256ee` through parsing and discovery, then a valid
+reply, and require ignored-message behavior with no blacklist. Include other
+well-formed unknown integers and malformed known types. Exercise request-cap,
+duplicate-terminal, extension-update, and cancellation cases. Run
+`go test ./internal/peer ./internal/session` and their `-race` equivalents;
+seed/run bounded `FuzzMetadataMessages` and `FuzzExtensionTransitions` campaigns.
+
+**Acceptance:** productive supported metadata can complete without a fixed
+cumulative-round-trip failure; stalled work stays bounded; request matching and
+unknown-message handling produce the required endpoint classification.
+
+## PEERS — Retire disconnected transfer state
+
+**Finding:** R-23 (P1). **Depends on:** ADMISSION, for `transfer.go` ownership.
+**Owns:** `internal/session/transfer.go` and dedicated transfer-retirement tests.
+**Guidance:** [session](internal/session/AGENTS.md).
+**References:** DESIGN §§11–13, 15–16, 19.
+
+`admitCandidate` appends every `transferPeer`, while `disconnectPeer` marks it
+done without removing it. Default indefinite retry retains closed connections,
+workers, and bitsets and repeatedly scans their history. At two million pieces,
+the three bitsets alone retain about 750,000 bytes per old connection; reconnects
+to one endpoint evade the distinct-endpoint budget as a bound on this growth.
+
+- [ ] Remove a disconnected peer from the active event set after its worker
+  joins, releasing its connection and request ownership exactly once.
+- [ ] Update event indices/selection safely when removing entries. Preserve
+  processing of live peers, endgame cancellation, live peer-ID release, and
+  later reconnection. Keep run-long endpoint strikes/blacklists in their
+  separate state.
+
+**Fixtures and validation:** Recreate
+`TestReviewDisconnectedPeersDoNotAccumulate`: admit and disconnect 200 peers
+during an incomplete transfer, including repeated connections to one endpoint.
+After joins, require retained peer state to track live peers instead of history
+(zero live peers must not leave 200 dead entries). Keep a useful peer active
+while others leave; deliver events around removal, reuse a released peer ID,
+and verify no lost events, double releases, or reset penalties. Run
+`go test ./internal/session` and `go test -race ./internal/session` with these
+regressions and the existing closed-worker/endgame tests.
+
+**Acceptance:** reconnect history does not grow the active peer slice or retain
+per-connection state; active event handling and run-long penalties remain correct.
+
+## SHUTDOWN — Join admission before final tracker events
+
+**Finding:** R-22 (P2). **Depends on:** ADMISSION and METADATA, for shared files.
+**Owns:** `internal/session/metadata.go`, `run.go`, and dedicated shutdown tests.
+**Guidance:** [session](internal/session/AGENTS.md).
+**References:** DESIGN §§6, 7.4, 15, 18–19.
+
+`MetadataDiscovery.Run` finalizes trackers before joining `trackerPeerResolver`;
+`coordinator.startTransferPhase` defers resolver close until after final events.
+An active lookup therefore overlaps `stopped`; metadata also begins full
+normalization before resolver completion. Existing proofs show an ordering
+defect, not a permanent goroutine leak or DNS work entering resume.
+
+- [ ] Cancel and join admission/resolver workers before final tracker events,
+  and before full metadata normalization. Keep pending-queue cleanup within the
+  same ownership boundary and make success, failure, cancellation, and timeout
+  exits follow it.
+- [ ] Preserve the rest of the phase shutdown order, bounded final-event
+  attempts, primary-error precedence, and ordinary worker joining before return.
+
+**Fixtures and validation:** Recreate
+`TestReviewMetadataStoppedWhileResolverStillRunning` and
+`TestReviewTransferFinalEventsPrecedeResolverJoin` with a controlled resolver
+that observes cancellation but completes only after a barrier. Record resolver
+completion, tracker events, and normalization/phase entry. Require resolver join
+before the first final event and before normalization, plus joined workers on
+outer return. Exercise successful metadata acquisition and transfer timeout,
+then representative cancellation/error exits. Run `go test ./internal/session`,
+`go test -race ./internal/session`, and a bounded
+`FuzzRunMetadataCancellationShutdown` campaign.
+
+**Acceptance:** no admission/DNS worker remains active during final tracker
+events or crosses the metadata-normalization boundary; shutdown remains bounded.
+
+## SCHEDULER — Keep requestable work moving within resource bounds
+
+**Findings:** R-25 (P2), R-26 (P2), remaining F-01 (high)/SEC4 work.
+**Depends on:** PEERS, for `transfer.go` ownership.
+**Owns:** `internal/session/scheduler.go`, `transfer.go`, and dedicated scheduler
+and transfer regressions/benchmarks. Use `storage.PieceStage.Abort` for stage
+cleanup; storage production files remain with STORAGE.
+**Guidance:** [session](internal/session/AGENTS.md).
+**References:** DESIGN §§8, 12–13, 16, 19.
+
+R-25: `RemovePeer` releases requests but leaves all stages. Sixty-four unavailable
+stages prevent `ReservePiece` from admitting another peer's available piece.
+The transfer `drive` loop also reserves stages before checking a peer's zero
+request capacity, so an explicit `reqq=0` can fill the stage budget without
+issuing a request. This blocks available progress; it does not prove that the
+whole torrent could finish without the unavailable pieces.
+
+R-26: `makeBlocks` splits every non-padding file span separately; repeated
+`choosePiece`, `firstAssignableBlock`, `findActive`, and `allDone` scans then make
+one piece spanning many tiny files quadratic to schedule. The baseline benchmark
+with one selected file took about 4.22 ms for 1,000 spans and 350.68 ms for 10,000
+on the review host. This is independent of output-handle limits.
+
+F-01/SEC4: `Transfer.Run`/`drive` still reaches `choosePiece` after keepalives or
+duplicate availability messages, scanning the full wanted order even when
+availability is unchanged. Prior state-delta fixes do not remove this scheduler
+scan. Small repeated messages can monopolize coordinator CPU at large piece
+counts. This is a separate dimension from R-26's blocks within one piece.
+
+- [ ] Skip new stage reservation for peers with no request capacity. When full
+  staging prevents requestable work, reclaim stages that current peers cannot
+  advance, together with their cache files and scheduler/cache credits. Preserve
+  useful partial stages when capacity permits. Keep stage removal failures fatal.
+- [ ] Reconcile stage eligibility after disconnect, availability/choke changes,
+  and request-limit updates without losing active requests, Fast tombstones,
+  accepted-block provenance, or verification state. Do not increase staging
+  budgets or discard useful in-flight work merely to evade the defect.
+- [ ] Coalesce contiguous non-padding file spans into requests no larger than
+  the existing block limit. Preserve piece boundaries and synthetic padding.
+  Use direct block lookup and remaining-work state where needed so unavoidable
+  fragmentation does not cause a full block-list scan per request/response.
+- [ ] Schedule from eligible work instead of rescanning every wanted piece after
+  unchanged events or for each pipeline slot. Preserve rarest-first randomized
+  ties, streaming fallback, Allowed Fast eligibility, per-peer/global caps,
+  endgame duplicates, and exact late-terminal handling. Use the smallest state
+  needed to maintain these properties.
+
+**Fixtures and validation:**
+
+- Recreate `TestReviewOrphanedStagesBlockAvailableWork` with 65 wanted 16 KiB
+  pieces. Admit pieces 0–63 for a departing peer, remove it, then offer piece 64
+  from another peer. Require a request for 64, correct stage/file reclamation,
+  and bounded count/bytes. Retain the positive control
+  `TestReviewHealthyReplacementCanUseRetainedStage`: a replacement offering an
+  existing partial piece can resume it. Cover pressure from both stage count
+  and declared bytes, plus injected abort/removal failure.
+- Recreate `TestReviewZeroReqQStagesWithoutRequests` with one stage slot, a peer
+  advertising `reqq=0`, and a useful second peer. Require zero reservation for
+  the zero-capacity peer and progress from the second. Cover repeated extension
+  handshakes changing capacity to and from zero.
+- Recreate `BenchmarkReviewTinyFilesOnePiece` with 1,000 and 10,000 one-byte
+  regular files inside one piece, selecting only the first file. Check full-piece
+  request coverage, bounded request count for contiguous bytes, verified output,
+  and scaling. Add padding-separated spans to exercise unavoidable fragmentation.
+- Recreate `BenchmarkReviewNoAssignableBlock` with 10,000 and 100,000 wanted
+  pieces, a peer offering only piece 0, and its block already assigned. Repeated
+  scheduling must find no work without traversing the full wanted order. Also
+  recreate `BenchmarkReviewPipelineFill` with 64 available staged pieces while
+  varying total wanted pieces. Drive duplicate `Have`, empty `Have None`,
+  keepalive, and sparse choke/unchoke sequences through transfer, including a
+  peer with other requestable work, and check that scheduling honors the same
+  bound. Use deterministic work assertions where practical; report benchmark
+  scaling instead of requiring a host-specific millisecond threshold.
+
+Run `go test ./internal/session`, `go test -race ./internal/session`, the focused
+benchmarks with allocation reporting, and bounded `FuzzSchedulerEvents`,
+`FuzzSchedulerEndgameEvents`, and `FuzzSchedulerStrikeAccounting` campaigns.
+
+**Acceptance:** unusable stages cannot indefinitely block requestable pieces;
+zero capacity does not reserve work; tiny-file fragmentation does not produce
+quadratic block handling; unchanged small messages do not force full-torrent
+scans. Existing scheduling, Fast, verification, and cache bounds still hold.
+
+## CLI — Report listing failures and sanitize usage errors
+
+**Findings:** R-27 (P3), R-28 (P3). **Depends on:** none.
+**Owns:** `internal/cli/run.go`, `args.go`, `report.go`, `cmd/leech/main.go`, and
+focused CLI/command tests. STATUS takes CLI files after this task.
+**Guidance:** [CLI](internal/cli/AGENTS.md).
+**References:** DESIGN §§4.4–4.5, 4.9–4.10, 19.
+
+R-27: `RunWithSession` returns a wrapped `--list-files` stdout write failure
+without calling `Reporter.PrimaryFailure`, leaving stderr empty at error level.
+R-28: `parseLongOption`/`parseShortOption` interpolate raw unknown options, and
+`main` prints the resulting usage error without the reporter's escaping/bound.
+Command-line control bytes can alter the terminal, and long options exceed the
+diagnostic limit; no remote injection path was demonstrated.
+
+- [ ] Report the wrapped listing-write error as the primary error before
+  returning it. Preserve its cause, stdout/stderr separation, and failure exit.
+- [ ] Escape and bound untrusted usage text at the argument/printing boundary,
+  using the existing diagnostic policy. Preserve useful usage context, exit 2,
+  accepted argument forms, and help behavior.
+
+**Fixtures and validation:** Recreate
+`TestReviewListingWriteFailureIsReported` with valid local metainfo and a stdout
+writer that fails; require the original error and an error-level stderr
+diagnostic. Run the executable with an unknown option containing literal ESC
+(`--` followed by byte `0x1b` and `[2J`) and with a 5,000-byte unknown option.
+Require escaped control text, a bounded diagnostic, and exit 2; the baseline
+emitted literal ESC and 5,055 stderr bytes. Include short-option and invalid-value
+paths that reach the same boundary. Run `go test ./internal/cli ./cmd/leech` and
+the focused subprocess checks. These cases require no network.
+
+**Acceptance:** listing failures explain their cause at error level, and every
+usage-error path prints bounded terminal-safe text with the correct exit status.
+
+## STATUS — Show active phases before the first committed piece
+
+**Finding:** R-29 (P3). **Depends on:** CLI and SHUTDOWN, for shared files.
+**Owns:** `internal/cli/run.go`, `report.go`, `internal/session/run.go`, and
+dedicated status tests. `transfer.go` is a read-only progress-callback reference.
+**Guidance:** [CLI](internal/cli/AGENTS.md), [session](internal/session/AGENTS.md).
+**References:** DESIGN §§4.9, 6, 19.
+
+The CLI's `OnPhase` callback only prints permanent messages. `Reporter.Status`
+is called from `OnProgress`, which first fires after a committed piece.
+Metadata discovery, resume checking, and a pre-commit stalled transfer therefore
+lack the promised replaceable interactive status line.
+
+- [ ] Emit an initial status at active metadata, resume, and transfer phase
+  entry, using available progress values accurately. Keep subsequent transfer
+  progress connected to the existing callback.
+- [ ] Preserve terminal detection, info/debug filtering, status throttling,
+  permanent phase/result lines, and stdout's listing-only role. Check quick
+  phase transitions against the existing one-second update bound rather than
+  resetting the throttle to force every rapid transition into a new update.
+
+**Fixtures and validation:** Use injected terminal/time state and complete CLI
+fixtures. For resume, supply a one-byte torrent with matching output and run
+`--resume --loglevel info`; require a resume status before the already-complete
+result even though no transfer occurs. Hold metadata acquisition and transfer
+before any commit behind controlled barriers and require status in both phases.
+Include non-TTY stderr, warning/error levels, and fast consecutive transitions.
+Run `go test ./internal/cli ./internal/session` and their `-race` equivalents;
+use a local pseudo-terminal check where needed to cover the executable boundary.
+
+**Acceptance:** metadata, resume, and transfer status no longer depend on a
+committed piece; existing terminal, logging, and rate rules remain intact.
+
+## INPUT-REVIEW — Finish the bounded offline-input review
+
+**Scope:** unresolved review coverage, not a confirmed new defect.
+**Depends on:** SELECT so the selection fix is included.
+**Owns:** review of `internal/bencode/` and `internal/torrent/{source,metainfo,selection}.go`,
+with dedicated test/fuzz additions in those packages. Read CLI/session validation
+call sites and storage boundaries; do not edit their production files here.
+**Guidance:** [bencode](internal/bencode/AGENTS.md),
+[torrent](internal/torrent/AGENTS.md).
+**References:** DESIGN §§4.1–4.4, 7.1–7.3, 8, 16–19; relevant local BEPs.
+
+The full-application review left bencoding, source parsing, metainfo normalization,
+and file selection marked in progress. Completed fixes and passing general tests
+do not close that specific coverage gap.
+
+- [ ] Complete a focused review of these input paths against their documented
+  domain: canonical decoding and exact `info` bytes; byte/node/container bounds
+  and checked arithmetic; source precedence and magnet fields; normalized file
+  ranges/attributes/paths; selection and original BEP 53 indices.
+- [ ] Check that representative invalid local inputs fail before output/cache
+  mutation and network activity. Reuse existing lifecycle evidence and independent
+  vectors rather than rebuilding the complete integration matrix.
+- [ ] Replay existing fuzz corpora and run bounded campaigns for
+  `FuzzDecodeBounded`, `FuzzParseSource`, `FuzzParseMagnet`,
+  `FuzzParseMetainfoBounded`, `FuzzSelectPattern`, and
+  `FuzzGlobRegexMatchesPathMatch`. Add concrete missing edge cases and minimized
+  regressions with their expected contract.
+- [ ] Record any confirmed new defect as an actionable task in this backlog
+  with file scope, evidence, acceptance, and dependencies. Do not turn hypotheses
+  or unrelated refactoring into mandatory work.
+
+**Validation:** Run `go test ./internal/bencode ./internal/torrent` plus the
+affected existing offline CLI tests. Report reviewed boundaries and checks in
+the completion handoff; keep durable lessons in applicable guidance.
+
+**Acceptance:** the unfinished review scope has been examined on the integrated
+input code, and every confirmed remaining gap has an explicit task. Completion
+of this review does not imply that any newly reported defect is fixed.
+
+## VALIDATE — Verify the integrated corrections
+
+**Depends on:** every task above and any contract defects found by INPUT-REVIEW.
+**Owns:** final review of the integrated changes, necessary cross-component
+regression tests, and backlog reconciliation. It owns no speculative production
+cleanup; return a concrete failure to its implementation task.
+**Guidance:** root [AGENTS.md](AGENTS.md) and the affected package guidance.
+**References:** DESIGN §19 and each task's acceptance criteria.
+
+- [ ] Confirm every original ID in the task table has corrected-behavior
+  evidence, including R-24's non-budget permanent errors, R-25's zero-capacity
+  trigger, and F-01/SEC4's scheduler scans. Check that tests exercise the
+  production path and would detect the original trigger.
+- [ ] Recheck interactions changed by these tasks: endpoint identity through
+  penalties; candidate/peer/stage replacement; metadata replies and shutdown;
+  verified output across linked/many-file paths and resume; CLI primary errors
+  and phase status. Reuse existing no-upload, local-tracker, and cleanup fixtures.
+  Add only missing cross-boundary assertions.
+- [ ] Verify formatting and run `go test ./...`, `go test -race ./...`,
+  `go vet ./...`, and `CGO_ENABLED=0 go build ./cmd/leech` on the integrated tree.
+  Replay all fuzz seeds and run the bounded campaigns required by changed
+  boundaries. Retain minimized failures as regressions.
+- [ ] Reconcile acceptance with the actual results. Remove resolved tasks from
+  this backlog after their checks pass; retain or split unresolved work with its
+  original IDs and update affected dependencies. Update durable guidance only
+  when the implementation establishes a new useful boundary or pitfall.
+
+**Acceptance:** integrated tests, race checks, vet, and the pure-Go build pass;
+each implemented fix meets its specific acceptance criteria; any remaining work
+is visible. Completion reports identify local deterministic validation and do
+not imply interoperability testing against live trackers or existing clients.
