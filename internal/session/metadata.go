@@ -44,6 +44,7 @@ const (
 	trackerAdmissionBatch             = 64
 	trackerEventBatch                 = 8
 	trackerResolverQueue              = trackerResolverWorkers
+	peerSourceSlots                   = limits.Trackers + 2
 )
 
 var (
@@ -54,39 +55,55 @@ var (
 	ErrMetadataEventQueue   = errors.New("metadata tracker event queue is full")
 	ErrMetadataAlreadyPhase = errors.New("metadata tracker phase is already active")
 	ErrTrackerUpdateQueue   = errors.New("session tracker event queue is full")
+	ErrTrackerSourceLimit   = errors.New("session tracker source limit reached")
 )
 
 // trackerPeerUpdateQueue keeps status events and announced peers in separate
-// bounded queues. IP literals have priority over pending peers: when the peer
-// budget is full, a newly announced IP evicts the oldest queued peer. Peers
-// already being resolved are never evicted.
+// bounded queues. IP literals get priority in each admission pump. At the peer
+// or hostname-byte cap, admission evicts the oldest eligible peer from an
+// overrepresented source. Peers already being resolved are never evicted.
 //
 // The event channel retains the original accounting/error fields but never a
 // tracker-owned peer slice. Peer entries are copied into one queue node each,
 // so a large input slice cannot keep an oversized backing array reachable.
 type trackerPeerUpdateQueue struct {
-	mu        sync.Mutex
-	events    chan tracker.Update
-	notify    chan struct{}
-	ipPeers   list.List
-	hosts     list.List
-	total     int // queued and currently resolving peers
-	hostBytes int // queued and currently resolving hostname bytes
-	nextID    uint64
+	mu          sync.Mutex
+	sourceMu    sync.Mutex
+	events      chan tracker.Update
+	notify      chan struct{}
+	ipPeers     list.List
+	hosts       list.List
+	total       int // queued and currently resolving peers
+	hostBytes   int // queued and currently resolving hostname bytes
+	nextID      uint64
+	sourceCount map[peer.CandidateSource]int
+	sourceOrder map[peer.CandidateSource]*queuedPeerSource
+	sources     map[string]peer.CandidateSource
 }
 
 type queuedTrackerPeer struct {
-	peer   tracker.TrackerPeer
-	phase  tracker.Phase
-	source string
-	ip     bool
-	id     uint64
+	peer            tracker.TrackerPeer
+	phase           tracker.Phase
+	source          peer.CandidateSource
+	ip              bool
+	id              uint64
+	queueElement    *list.Element
+	sourceElement   *list.Element
+	hostSourceEntry *list.Element
+}
+
+type queuedPeerSource struct {
+	all   list.List
+	hosts list.List
 }
 
 func newTrackerPeerUpdateQueue() *trackerPeerUpdateQueue {
 	return &trackerPeerUpdateQueue{
-		events: make(chan tracker.Update, metadataEventQueueSize),
-		notify: make(chan struct{}, 1),
+		events:      make(chan tracker.Update, metadataEventQueueSize),
+		notify:      make(chan struct{}, 1),
+		sourceCount: make(map[peer.CandidateSource]int),
+		sourceOrder: make(map[peer.CandidateSource]*queuedPeerSource),
+		sources:     make(map[string]peer.CandidateSource),
 	}
 }
 
@@ -97,6 +114,10 @@ func (q *trackerPeerUpdateQueue) enqueue(update tracker.Update) error {
 	if q == nil {
 		return ErrTrackerUpdateQueue
 	}
+	source, err := q.sourceID(update.Tracker)
+	if err != nil {
+		return err
+	}
 	status := update
 	status.Peers = nil
 	select {
@@ -104,20 +125,51 @@ func (q *trackerPeerUpdateQueue) enqueue(update tracker.Update) error {
 	default:
 		return ErrTrackerUpdateQueue
 	}
-	q.enqueuePeersFrom(update.Tracker, update.Phase, update.Peers)
+	q.enqueuePeersFromID(source, update.Phase, update.Peers)
 	return nil
 }
 
 func (q *trackerPeerUpdateQueue) enqueuePeers(phase tracker.Phase, peers []tracker.TrackerPeer) {
-	q.enqueuePeersFrom(peer.DefaultCandidateSource, phase, peers)
+	q.enqueuePeersFromID(peer.DefaultCandidateSource, phase, peers)
 }
 
-func (q *trackerPeerUpdateQueue) enqueuePeersFrom(source string, phase tracker.Phase, peers []tracker.TrackerPeer) {
+func (q *trackerPeerUpdateQueue) enqueuePeersFrom(source string, phase tracker.Phase, peers []tracker.TrackerPeer) error {
+	if q == nil {
+		return ErrTrackerUpdateQueue
+	}
+	sourceID, err := q.sourceID(source)
+	if err != nil {
+		return err
+	}
+	q.enqueuePeersFromID(sourceID, phase, peers)
+	return nil
+}
+
+// sourceID maps each exact tracker URL once per configured tracker. Peer queue
+// entries and CandidatePool keys carry only this uint16 ID.
+func (q *trackerPeerUpdateQueue) sourceID(source string) (peer.CandidateSource, error) {
+	if source == "" {
+		return peer.DefaultCandidateSource, nil
+	}
+	if source == magnetPeerSource {
+		return peer.MagnetCandidateSource, nil
+	}
+	q.sourceMu.Lock()
+	defer q.sourceMu.Unlock()
+	if existing, ok := q.sources[source]; ok {
+		return existing, nil
+	}
+	if len(q.sources) >= limits.Trackers {
+		return peer.DefaultCandidateSource, ErrTrackerSourceLimit
+	}
+	id := peer.FirstTrackerCandidateSource + peer.CandidateSource(len(q.sources))
+	q.sources[source] = id
+	return id, nil
+}
+
+func (q *trackerPeerUpdateQueue) enqueuePeersFromID(source peer.CandidateSource, phase tracker.Phase, peers []tracker.TrackerPeer) {
 	if q == nil {
 		return
-	}
-	if source == "" {
-		source = peer.DefaultCandidateSource
 	}
 	limit := len(peers)
 	if limit > trackerPeerQueueLimit {
@@ -137,16 +189,22 @@ func (q *trackerPeerUpdateQueue) enqueuePeersFrom(source string, phase tracker.P
 		if !usableQueuedPeer(announced) || !isTrackerPeerIP(announced.Host) {
 			continue
 		}
-		q.makeRoomForIPLocked()
-		if q.total == trackerPeerQueueLimit {
+		if !q.makeRoomForIPLocked(source) {
 			continue
 		}
 		q.pushLocked(source, phase, announced, true)
 	}
 	for i := 0; i < limit; i++ {
 		announced := peers[i]
-		if !usableQueuedPeer(announced) || isTrackerPeerIP(announced.Host) || q.total == trackerPeerQueueLimit || q.hostBytes+len(announced.Host) > trackerPeerHostBytesLimit {
+		if !usableQueuedPeer(announced) || isTrackerPeerIP(announced.Host) {
 			continue
+		}
+		victims, ok := q.planEvictionsLocked(source, len(announced.Host))
+		if !ok {
+			continue
+		}
+		for _, victim := range victims {
+			q.removeQueuedPeerLocked(victim)
 		}
 		q.pushLocked(source, phase, announced, false)
 	}
@@ -166,7 +224,7 @@ func isTrackerPeerIP(host string) bool {
 	return err == nil
 }
 
-func (q *trackerPeerUpdateQueue) pushLocked(source string, phase tracker.Phase, announced tracker.TrackerPeer, isIP bool) {
+func (q *trackerPeerUpdateQueue) pushLocked(source peer.CandidateSource, phase tracker.Phase, announced tracker.TrackerPeer, isIP bool) {
 	q.nextID++
 	entry := &queuedTrackerPeer{
 		peer: tracker.TrackerPeer{
@@ -176,37 +234,182 @@ func (q *trackerPeerUpdateQueue) pushLocked(source string, phase tracker.Phase, 
 		phase: phase, source: source, ip: isIP, id: q.nextID,
 	}
 	if isIP {
-		q.ipPeers.PushBack(entry)
+		entry.queueElement = q.ipPeers.PushBack(entry)
 	} else {
-		q.hosts.PushBack(entry)
+		entry.queueElement = q.hosts.PushBack(entry)
 		q.hostBytes += len(entry.peer.Host)
 	}
+	perSource := q.sourceOrder[source]
+	if perSource == nil {
+		perSource = &queuedPeerSource{}
+		q.sourceOrder[source] = perSource
+	}
+	entry.sourceElement = perSource.all.PushBack(entry)
+	if !isIP {
+		entry.hostSourceEntry = perSource.hosts.PushBack(entry)
+	}
 	q.total++
+	q.sourceCount[source]++
 }
 
-func (q *trackerPeerUpdateQueue) makeRoomForIPLocked() {
+func (q *trackerPeerUpdateQueue) makeRoomForIPLocked(source peer.CandidateSource) bool {
 	if q.total < trackerPeerQueueLimit {
-		return
+		return true
 	}
-	var oldest *list.Element
-	if ip := q.ipPeers.Front(); ip != nil {
-		oldest = ip
+	return q.evictQueuedPeerLocked(source)
+}
+
+func (q *trackerPeerUpdateQueue) planEvictionsLocked(source peer.CandidateSource, newHostBytes int) ([]*queuedTrackerPeer, bool) {
+	if q.total < trackerPeerQueueLimit && (newHostBytes == 0 || q.hostBytes+newHostBytes <= trackerPeerHostBytesLimit) {
+		return nil, true
 	}
-	if host := q.hosts.Front(); host != nil && (oldest == nil || host.Value.(*queuedTrackerPeer).id < oldest.Value.(*queuedTrackerPeer).id) {
-		oldest = host
+	var counts [peerSourceSlots]int
+	var allFronts [peerSourceSlots]*list.Element
+	var hostFronts [peerSourceSlots]*list.Element
+	for source, count := range q.sourceCount {
+		counts[int(source)] = count
+		if order := q.sourceOrder[source]; order != nil {
+			allFronts[int(source)] = order.all.Front()
+			hostFronts[int(source)] = order.hosts.Front()
+		}
 	}
-	if oldest == nil {
-		// The remaining capacity is held by resolver jobs, not queued peers.
-		return
+	total, bytes := q.total, q.hostBytes
+	var victims []*queuedTrackerPeer
+	for total >= trackerPeerQueueLimit || newHostBytes > 0 && bytes+newHostBytes > trackerPeerHostBytesLimit {
+		hostOnly := newHostBytes > 0 && bytes+newHostBytes > trackerPeerHostBytesLimit
+		fronts := allFronts
+		if hostOnly {
+			fronts = hostFronts
+		}
+		victimSource, ok := chooseQueuedSource(source, &counts, &fronts)
+		if !ok {
+			return nil, false
+		}
+		victim := fronts[int(victimSource)].Value.(*queuedTrackerPeer)
+		victims = append(victims, victim)
+		if allFronts[int(victimSource)] != nil && allFronts[int(victimSource)].Value.(*queuedTrackerPeer) == victim {
+			allFronts[int(victimSource)] = allFronts[int(victimSource)].Next()
+		}
+		if victim.hostSourceEntry != nil {
+			if hostFronts[int(victimSource)] != nil && hostFronts[int(victimSource)].Value.(*queuedTrackerPeer) == victim {
+				hostFronts[int(victimSource)] = hostFronts[int(victimSource)].Next()
+			}
+			bytes -= len(victim.peer.Host)
+		}
+		counts[int(victimSource)]--
+		total--
 	}
-	entry := oldest.Value.(*queuedTrackerPeer)
-	if entry.ip {
-		q.ipPeers.Remove(oldest)
+	return victims, true
+}
+
+func (q *trackerPeerUpdateQueue) evictQueuedPeerLocked(source peer.CandidateSource) bool {
+	target, found := q.chooseQueuedSourceLocked(source)
+	if !found {
+		return false
+	}
+	q.removeQueuedPeerLocked(q.sourceOrder[target].all.Front().Value.(*queuedTrackerPeer))
+	return true
+}
+
+func (q *trackerPeerUpdateQueue) chooseQueuedSourceLocked(incoming peer.CandidateSource) (peer.CandidateSource, bool) {
+	ownCount := q.sourceCount[incoming]
+	var maxOther peer.CandidateSource
+	maxOtherCount, hasOther := 0, false
+	for source, count := range q.sourceCount {
+		order := q.sourceOrder[source]
+		if source == incoming || order == nil || order.all.Front() == nil {
+			continue
+		}
+		if !hasOther || count > maxOtherCount || count == maxOtherCount && source < maxOther {
+			maxOther, maxOtherCount, hasOther = source, count, true
+		}
+	}
+	if hasOther && (ownCount == 0 || maxOtherCount > ownCount) {
+		return maxOther, true
+	}
+	if own := q.sourceOrder[incoming]; own != nil && own.all.Front() != nil {
+		return incoming, true
+	}
+	var target peer.CandidateSource
+	maxCount, found := 0, false
+	for source, count := range q.sourceCount {
+		order := q.sourceOrder[source]
+		if order == nil || order.all.Front() == nil {
+			continue
+		}
+		if !found || count > maxCount || count == maxCount && source < target {
+			target, maxCount, found = source, count, true
+		}
+	}
+	return target, found
+}
+
+func chooseQueuedSource(incoming peer.CandidateSource, counts *[peerSourceSlots]int, fronts *[peerSourceSlots]*list.Element) (peer.CandidateSource, bool) {
+	ownCount := counts[int(incoming)]
+	var maxOther peer.CandidateSource
+	maxOtherCount, hasOther := 0, false
+	for index, count := range counts {
+		source := peer.CandidateSource(index)
+		if source == incoming || fronts[index] == nil {
+			continue
+		}
+		if !hasOther || count > maxOtherCount || count == maxOtherCount && source < maxOther {
+			maxOther, maxOtherCount, hasOther = source, count, true
+		}
+	}
+	if hasOther && (ownCount == 0 || maxOtherCount > ownCount) {
+		return maxOther, true
+	}
+	if fronts[int(incoming)] != nil {
+		return incoming, true
+	}
+	var target peer.CandidateSource
+	maxCount, found := 0, false
+	for index, count := range counts {
+		source := peer.CandidateSource(index)
+		if fronts[index] == nil {
+			continue
+		}
+		if !found || count > maxCount || count == maxCount && source < target {
+			target, maxCount, found = source, count, true
+		}
+	}
+	return target, found
+}
+
+func (q *trackerPeerUpdateQueue) detachSourceOrderLocked(item *queuedTrackerPeer) {
+	if item.sourceElement != nil {
+		perSource := q.sourceOrder[item.source]
+		perSource.all.Remove(item.sourceElement)
+		item.sourceElement = nil
+	}
+	if item.hostSourceEntry != nil {
+		perSource := q.sourceOrder[item.source]
+		perSource.hosts.Remove(item.hostSourceEntry)
+		item.hostSourceEntry = nil
+	}
+}
+
+func (q *trackerPeerUpdateQueue) removeQueuedPeerLocked(item *queuedTrackerPeer) {
+	if item.ip {
+		q.ipPeers.Remove(item.queueElement)
 	} else {
-		q.hosts.Remove(oldest)
-		q.hostBytes -= len(entry.peer.Host)
+		q.hosts.Remove(item.queueElement)
+		q.hostBytes -= len(item.peer.Host)
 	}
+	q.detachSourceOrderLocked(item)
+	q.releasePeerLocked(item)
+}
+
+func (q *trackerPeerUpdateQueue) releasePeerLocked(item *queuedTrackerPeer) {
 	q.total--
+	q.sourceCount[item.source]--
+	if q.sourceCount[item.source] == 0 {
+		delete(q.sourceCount, item.source)
+		if order := q.sourceOrder[item.source]; order != nil && order.all.Len() == 0 && order.hosts.Len() == 0 {
+			delete(q.sourceOrder, item.source)
+		}
+	}
 }
 
 func (q *trackerPeerUpdateQueue) takePeer(allowHostname bool) *queuedTrackerPeer {
@@ -216,13 +419,19 @@ func (q *trackerPeerUpdateQueue) takePeer(allowHostname bool) *queuedTrackerPeer
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if newest := q.ipPeers.Back(); newest != nil {
+		item := newest.Value.(*queuedTrackerPeer)
 		q.ipPeers.Remove(newest)
-		return newest.Value.(*queuedTrackerPeer)
+		item.queueElement = nil
+		q.detachSourceOrderLocked(item)
+		return item
 	}
 	if allowHostname {
 		if front := q.hosts.Front(); front != nil {
+			item := front.Value.(*queuedTrackerPeer)
 			q.hosts.Remove(front)
-			return front.Value.(*queuedTrackerPeer)
+			item.queueElement = nil
+			q.detachSourceOrderLocked(item)
+			return item
 		}
 	}
 	return nil
@@ -234,10 +443,15 @@ func (q *trackerPeerUpdateQueue) releasePeer(item *queuedTrackerPeer) {
 	}
 	q.mu.Lock()
 	if q.total > 0 {
-		q.total--
-	}
-	if item != nil && !item.ip {
-		q.hostBytes -= len(item.peer.Host)
+		if item != nil {
+			if item.sourceElement != nil {
+				q.detachSourceOrderLocked(item)
+			}
+			if !item.ip {
+				q.hostBytes -= len(item.peer.Host)
+			}
+			q.releasePeerLocked(item)
+		}
 	}
 	q.mu.Unlock()
 }
@@ -261,6 +475,8 @@ func (q *trackerPeerUpdateQueue) clear() {
 	q.hosts.Init()
 	q.total = 0
 	q.hostBytes = 0
+	q.sourceCount = make(map[peer.CandidateSource]int)
+	q.sourceOrder = make(map[peer.CandidateSource]*queuedPeerSource)
 	q.mu.Unlock()
 	for {
 		select {
@@ -378,6 +594,25 @@ func (a *trackerPeerResolver) pump(ctx context.Context, phase tracker.Phase, poo
 		}
 	}
 resultsDrained:
+	// Give one queued hostname a resolver turn before processing the IP stream.
+	// takeHostname is FIFO, and this one-job allowance keeps IPs preferred while
+	// preventing a continuing stream of literal IPs from starving hostnames.
+	if len(a.jobs) < cap(a.jobs) && work < trackerAdmissionBatch-trackerEventBatch-trackerResolverWorkers {
+		if item := a.queue.takeHostname(); item != nil {
+			if item.phase != phase {
+				a.queue.releasePeer(item)
+				work++
+			} else {
+				select {
+				case a.jobs <- item:
+					work++
+				default:
+					a.queue.requeuePeer(item)
+					return work
+				}
+			}
+		}
+	}
 	for work < trackerAdmissionBatch-trackerEventBatch-trackerResolverWorkers {
 		allowHostname := len(a.jobs) < cap(a.jobs)
 		item := a.queue.takePeer(allowHostname)
@@ -424,17 +659,42 @@ resultsDrained:
 	return work
 }
 
+func (q *trackerPeerUpdateQueue) takeHostname() *queuedTrackerPeer {
+	if q == nil {
+		return nil
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	front := q.hosts.Front()
+	if front == nil {
+		return nil
+	}
+	item := front.Value.(*queuedTrackerPeer)
+	q.hosts.Remove(front)
+	item.queueElement = nil
+	q.detachSourceOrderLocked(item)
+	return item
+}
+
 func (q *trackerPeerUpdateQueue) requeuePeer(item *queuedTrackerPeer) {
 	if q == nil || item == nil {
 		return
 	}
 	q.mu.Lock()
-	if item.ip {
-		q.ipPeers.PushFront(item)
-	} else {
-		q.hosts.PushFront(item)
+	perSource := q.sourceOrder[item.source]
+	if perSource == nil {
+		perSource = &queuedPeerSource{}
+		q.sourceOrder[item.source] = perSource
 	}
+	if item.ip {
+		item.queueElement = q.ipPeers.PushFront(item)
+	} else {
+		item.queueElement = q.hosts.PushFront(item)
+		item.hostSourceEntry = perSource.hosts.PushFront(item)
+	}
+	item.sourceElement = perSource.all.PushFront(item)
 	q.mu.Unlock()
+	q.signal()
 }
 
 func (a *trackerPeerResolver) close() {

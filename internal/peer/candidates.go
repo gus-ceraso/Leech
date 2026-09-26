@@ -24,10 +24,20 @@ var (
 	ErrCandidateDNS   = errors.New("peer candidate resolution failed")
 )
 
-// DefaultCandidateSource is used by Add and Admit when the caller has no
-// source identity. Session code should use AddFrom or AdmitFrom for tracker
-// and magnet announcements.
-const DefaultCandidateSource = "default"
+// CandidateSource is the bounded numeric identity of a peer source. Session
+// code assigns tracker IDs once per tracker update; entries retain only this
+// fixed-size value.
+type CandidateSource uint16
+
+const (
+	// DefaultCandidateSource is used by Add and Admit when the caller has no
+	// source identity.
+	DefaultCandidateSource CandidateSource = iota
+	// MagnetCandidateSource is reserved for magnet-embedded peers.
+	MagnetCandidateSource
+	// FirstTrackerCandidateSource is the first ID available to tracker sources.
+	FirstTrackerCandidateSource
+)
 
 // Candidate is an endpoint received from a tracker or a magnet. Host may be
 // an IP literal or a DNS name. A tracker-supplied peer ID is only an optional
@@ -48,7 +58,7 @@ type ResolvedCandidate struct {
 	// Source is the source that currently owns this candidate's pool slot.
 	// Duplicate announcements refresh the expected peer ID without changing
 	// slot ownership.
-	Source string
+	Source CandidateSource
 }
 
 // String renders an endpoint in the standard host:port form used by dialers
@@ -84,8 +94,8 @@ type CandidatePool struct {
 
 	mu          sync.Mutex
 	candidates  map[Endpoint]*list.Element
-	sourceCount map[string]int
-	sourceOrder map[string]*list.List
+	sourceCount map[CandidateSource]int
+	sourceOrder map[CandidateSource]*list.List
 	order       list.List
 }
 
@@ -111,8 +121,8 @@ func NewCandidatePool(config CandidatePoolConfig) (*CandidatePool, error) {
 		maxCandidates: maxCandidates,
 		maxDNSAnswers: maxDNSAnswers,
 		candidates:    make(map[Endpoint]*list.Element),
-		sourceCount:   make(map[string]int),
-		sourceOrder:   make(map[string]*list.List),
+		sourceCount:   make(map[CandidateSource]int),
+		sourceOrder:   make(map[CandidateSource]*list.List),
 	}, nil
 }
 
@@ -227,17 +237,13 @@ func (p *CandidatePool) Admit(ctx context.Context, candidate Candidate) ([]Resol
 }
 
 // AdmitFrom resolves and adds one candidate under source's capacity share.
-// An empty source uses DefaultCandidateSource.
-func (p *CandidatePool) AdmitFrom(ctx context.Context, source string, candidate Candidate) ([]ResolvedCandidate, error) {
+func (p *CandidatePool) AdmitFrom(ctx context.Context, source CandidateSource, candidate Candidate) ([]ResolvedCandidate, error) {
 	if p == nil {
 		return nil, ErrCandidateConfig
 	}
 	resolved, err := resolveCandidate(ctx, p.resolver, candidate, p.maxDNSAnswers)
 	if err != nil {
 		return nil, err
-	}
-	if source == "" {
-		source = DefaultCandidateSource
 	}
 	added := make([]ResolvedCandidate, 0, len(resolved))
 	for _, item := range resolved {
@@ -268,12 +274,9 @@ func (p *CandidatePool) Add(candidate ResolvedCandidate) (bool, error) {
 // preventing repeated full announcements from one source from cycling out all
 // candidates admitted by another. Slot ownership is independent of endpoint
 // health, live connections, and strikes.
-func (p *CandidatePool) AddFrom(source string, candidate ResolvedCandidate) (bool, error) {
+func (p *CandidatePool) AddFrom(source CandidateSource, candidate ResolvedCandidate) (bool, error) {
 	if p == nil {
 		return false, ErrCandidateConfig
-	}
-	if source == "" {
-		source = DefaultCandidateSource
 	}
 	endpoint, err := NormalizeEndpoint(candidate.Endpoint)
 	if err != nil {
@@ -308,16 +311,18 @@ func (p *CandidatePool) AddFrom(source string, candidate ResolvedCandidate) (boo
 	return true, nil
 }
 
-func (p *CandidatePool) evictForSourceLocked(source string) {
+func (p *CandidatePool) evictForSourceLocked(source CandidateSource) {
 	ownCount := p.sourceCount[source]
 	maxOtherCount := 0
-	maxOtherSource := ""
+	var maxOtherSource CandidateSource
+	hasOther := false
 	for other, count := range p.sourceCount {
 		if other == source {
 			continue
 		}
-		if count > maxOtherCount || count == maxOtherCount && (maxOtherSource == "" || other < maxOtherSource) {
+		if !hasOther || count > maxOtherCount || count == maxOtherCount && other < maxOtherSource {
 			maxOtherCount, maxOtherSource = count, other
+			hasOther = true
 		}
 	}
 
@@ -327,13 +332,11 @@ func (p *CandidatePool) evictForSourceLocked(source string) {
 	// constant time. Otherwise replace source's own oldest candidate.
 	preferOther := ownCount == 0 || maxOtherCount > ownCount
 	target := source
-	if preferOther {
+	if preferOther && hasOther {
 		target = maxOtherSource
 	}
-	if target != "" {
-		if sourceOrder := p.sourceOrder[target]; sourceOrder != nil && sourceOrder.Front() != nil {
-			p.removeEntryLocked(sourceOrder.Front().Value.(*candidatePoolEntry))
-		}
+	if sourceOrder := p.sourceOrder[target]; sourceOrder != nil && sourceOrder.Front() != nil {
+		p.removeEntryLocked(sourceOrder.Front().Value.(*candidatePoolEntry))
 	}
 }
 

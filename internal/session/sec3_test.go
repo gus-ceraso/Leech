@@ -14,8 +14,10 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/gus-ceraso/Leech/internal/bencode"
+	"github.com/gus-ceraso/Leech/internal/limits"
 	"github.com/gus-ceraso/Leech/internal/peer"
 	"github.com/gus-ceraso/Leech/internal/torrent"
 	"github.com/gus-ceraso/Leech/internal/tracker"
@@ -145,6 +147,14 @@ func TestTrackerPeerResolverPreservesSourceAcrossPhases(t *testing.T) {
 				}
 				admitPeers(source, peers)
 			}
+			sourceID := func(source string) peer.CandidateSource {
+				t.Helper()
+				id, err := queue.sourceID(source)
+				if err != nil {
+					t.Fatalf("sourceID(%q): %v", source, err)
+				}
+				return id
+			}
 			byPort := func() map[uint16]peer.ResolvedCandidate {
 				result := make(map[uint16]peer.ResolvedCandidate)
 				for _, candidate := range pool.Snapshot() {
@@ -154,12 +164,14 @@ func TestTrackerPeerResolverPreservesSourceAcrossPhases(t *testing.T) {
 			}
 
 			admit("tracker-A", 51431, 51432, 51433)
+			trackerA := sourceID("tracker-A")
 			for port, candidate := range byPort() {
-				if candidate.Source != "tracker-A" {
-					t.Fatalf("initial endpoint %d source = %q, want tracker-A", port, candidate.Source)
+				if candidate.Source != trackerA {
+					t.Fatalf("initial endpoint %d source = %d, want tracker-A ID %d", port, candidate.Source, trackerA)
 				}
 			}
 			admit("tracker-B", 51434)
+			trackerB := sourceID("tracker-B")
 			admit("tracker-A", 51431, 51432, 51433)
 			candidates := byPort()
 			if _, ok := candidates[51434]; !ok {
@@ -169,7 +181,7 @@ func TestTrackerPeerResolverPreservesSourceAcrossPhases(t *testing.T) {
 			candidates = byPort()
 			for _, port := range []uint16{51434, 51435} {
 				candidate, ok := candidates[port]
-				if !ok || candidate.Source != "tracker-B" {
+				if !ok || candidate.Source != trackerB {
 					t.Fatalf("tracker-B endpoint %d = %+v, present=%t; want source-aware admission", port, candidate, ok)
 				}
 			}
@@ -195,10 +207,302 @@ func TestTrackerPeerResolverPreservesSourceAcrossPhases(t *testing.T) {
 				t.Fatalf("pending peers after resolved tracker-C admission = %d, want 0", got)
 			}
 			candidates = byPort()
-			if candidate, ok := candidates[51436]; !ok || candidate.Source != "tracker-C" {
+			if candidate, ok := candidates[51436]; !ok || candidate.Source != sourceID("tracker-C") {
 				t.Fatalf("resolved tracker-C candidate = %+v, present=%t", candidate, ok)
 			}
 		})
+	}
+}
+
+func TestTrackerPeerQueueFairAdmissionAcrossSourcesAndPhases(t *testing.T) {
+	for _, phase := range []tracker.Phase{tracker.MetadataPhase, tracker.TransferPhase} {
+		name := map[tracker.Phase]string{tracker.MetadataPhase: "metadata", tracker.TransferPhase: "transfer"}[phase]
+		t.Run(name, func(t *testing.T) {
+			queue := newTrackerPeerUpdateQueue()
+			peers := make([]tracker.TrackerPeer, trackerPeerQueueLimit)
+			for i := range peers {
+				peers[i] = tracker.TrackerPeer{Host: "127.0.0.1", Port: uint16(i + 1)}
+			}
+			if err := queue.enqueue(tracker.Update{Tracker: "tracker-A", Phase: phase, Peers: peers}); err != nil {
+				t.Fatal(err)
+			}
+			bPeer := tracker.TrackerPeer{Host: "127.0.0.2", Port: 51413}
+			if err := queue.enqueue(tracker.Update{Tracker: "tracker-B", Phase: phase, Peers: []tracker.TrackerPeer{bPeer}}); err != nil {
+				t.Fatal(err)
+			}
+			if err := queue.enqueue(tracker.Update{Tracker: "tracker-A", Phase: phase, Peers: peers}); err != nil {
+				t.Fatal(err)
+			}
+			if got := queue.pendingPeers(); got != trackerPeerQueueLimit {
+				t.Fatalf("queued peers = %d, want %d", got, trackerPeerQueueLimit)
+			}
+			trackerB, err := queue.sourceID("tracker-B")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := queue.sourceCount[trackerB]; got != 1 {
+				t.Fatalf("tracker-B retained peer count = %d, want 1", got)
+			}
+
+			pool, err := peer.NewCandidatePool(peer.CandidatePoolConfig{MaxCandidates: trackerPeerQueueLimit})
+			if err != nil {
+				t.Fatal(err)
+			}
+			admittedB := false
+			for i := 0; i < trackerPeerQueueLimit; i++ {
+				item := queue.takePeer(false)
+				if item == nil {
+					t.Fatalf("queue ended after %d peers", i)
+				}
+				if item.phase != phase {
+					t.Fatalf("queued phase = %v, want %v", item.phase, phase)
+				}
+				endpoint := peer.Endpoint{Addr: netip.MustParseAddr(item.peer.Host), Port: item.peer.Port}
+				if _, err := pool.AddFrom(item.source, peer.ResolvedCandidate{Endpoint: endpoint}); err != nil {
+					t.Fatalf("admit %s: %v", endpoint, err)
+				}
+				if item.peer == bPeer {
+					admittedB = true
+				}
+				queue.releasePeer(item)
+			}
+			if !admittedB {
+				t.Fatal("tracker-B endpoint was not delivered from the full queue")
+			}
+			if got := queue.pendingPeers(); got != 0 {
+				t.Fatalf("pending peers after drain = %d, want 0", got)
+			}
+			for _, candidate := range pool.Snapshot() {
+				if candidate.Endpoint.Addr == netip.MustParseAddr(bPeer.Host) && candidate.Endpoint.Port == bPeer.Port {
+					if candidate.Source != trackerB {
+						t.Fatalf("tracker-B candidate source = %d, want %d", candidate.Source, trackerB)
+					}
+					return
+				}
+			}
+			t.Fatal("tracker-B endpoint did not reach CandidatePool")
+		})
+	}
+}
+
+func TestTrackerPeerResolverGivesQueuedHostnameAResolverTurn(t *testing.T) {
+	for _, phase := range []tracker.Phase{tracker.MetadataPhase, tracker.TransferPhase} {
+		name := map[tracker.Phase]string{tracker.MetadataPhase: "metadata", tracker.TransferPhase: "transfer"}[phase]
+		t.Run(name, func(t *testing.T) {
+			queue := newTrackerPeerUpdateQueue()
+			peers := make([]tracker.TrackerPeer, trackerPeerQueueLimit)
+			for i := range peers {
+				peers[i] = tracker.TrackerPeer{Host: "127.0.0.1", Port: uint16(i + 1)}
+			}
+			if err := queue.enqueue(tracker.Update{Tracker: "tracker-A", Phase: phase, Peers: peers}); err != nil {
+				t.Fatal(err)
+			}
+			bPeer := tracker.TrackerPeer{Host: "source.test", Port: 51413}
+			if err := queue.enqueue(tracker.Update{Tracker: "tracker-B", Phase: phase, Peers: []tracker.TrackerPeer{bPeer}}); err != nil {
+				t.Fatal(err)
+			}
+			if err := queue.enqueue(tracker.Update{Tracker: "tracker-A", Phase: phase, Peers: peers}); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case <-queue.notify:
+			default:
+			}
+
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			admission := newTrackerPeerResolver(ctx, sec3SourceResolver{}, queue)
+			defer func() {
+				admission.close()
+				queue.clear()
+			}()
+			pool, err := peer.NewCandidatePool(peer.CandidatePoolConfig{MaxCandidates: trackerPeerQueueLimit})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if work := admission.pump(ctx, phase, pool); work == 0 {
+				t.Fatal("pump did no work while a hostname and IPs were queued")
+			}
+			if err := queue.enqueue(tracker.Update{Tracker: "tracker-A", Phase: phase, Peers: peers}); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case <-queue.notify:
+			case <-ctx.Done():
+				t.Fatalf("hostname resolver result was not signaled: %v", ctx.Err())
+			}
+			admission.pump(ctx, phase, pool)
+			trackerB, err := queue.sourceID("tracker-B")
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, candidate := range pool.Snapshot() {
+				if candidate.Endpoint.Port == bPeer.Port && candidate.Source == trackerB {
+					return
+				}
+			}
+			t.Fatal("queued tracker-B hostname did not reach CandidatePool while tracker-A IPs remained")
+		})
+	}
+}
+
+func TestTrackerPeerQueueHostnameAdmissionIsAtomicAndSourceFair(t *testing.T) {
+	queue := newTrackerPeerUpdateQueue()
+	largeHost := strings.Repeat("h", trackerPeerHostLimit)
+	hosts := make([]tracker.TrackerPeer, trackerPeerHostBytesLimit/len(largeHost))
+	for i := range hosts {
+		hosts[i] = tracker.TrackerPeer{Host: largeHost, Port: uint16(i + 1)}
+	}
+	if err := queue.enqueue(tracker.Update{Tracker: "tracker-A", Phase: tracker.MetadataPhase, Peers: hosts}); err != nil {
+		t.Fatal(err)
+	}
+	if queue.hostBytes != trackerPeerHostBytesLimit {
+		t.Fatalf("host bytes = %d, want full limit %d", queue.hostBytes, trackerPeerHostBytesLimit)
+	}
+	shortB := tracker.TrackerPeer{Host: "b.test", Port: 51413}
+	if err := queue.enqueue(tracker.Update{Tracker: "tracker-B", Phase: tracker.MetadataPhase, Peers: []tracker.TrackerPeer{shortB}}); err != nil {
+		t.Fatal(err)
+	}
+	trackerB, err := queue.sourceID("tracker-B")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if queue.sourceCount[trackerB] != 1 || queue.hostBytes > trackerPeerHostBytesLimit {
+		t.Fatalf("tracker-B count/host bytes = %d/%d, want 1 and within cap", queue.sourceCount[trackerB], queue.hostBytes)
+	}
+	if got := queue.sourceOrder[trackerB].hosts.Front().Value.(*queuedTrackerPeer).peer; got != shortB {
+		t.Fatalf("retained tracker-B hostname = %+v, want %+v", got, shortB)
+	}
+	largeA := tracker.TrackerPeer{Host: strings.Repeat("a", trackerPeerHostLimit-6), Port: 51414}
+	if err := queue.enqueue(tracker.Update{Tracker: "tracker-A", Phase: tracker.MetadataPhase, Peers: []tracker.TrackerPeer{largeA}}); err != nil {
+		t.Fatal(err)
+	}
+	if queue.hostBytes != trackerPeerHostBytesLimit {
+		t.Fatalf("host bytes after filling with tracker-A = %d, want %d", queue.hostBytes, trackerPeerHostBytesLimit)
+	}
+
+	// Move every host into in-flight ownership so queued eviction cannot free
+	// its bytes. A rejected addition must leave all queue state unchanged.
+	var inFlight []*queuedTrackerPeer
+	for item := queue.takeHostname(); item != nil; item = queue.takeHostname() {
+		inFlight = append(inFlight, item)
+	}
+	beforeCount, beforeBytes, beforeTotal := queue.sourceCount[trackerB], queue.hostBytes, queue.total
+	if err := queue.enqueue(tracker.Update{Tracker: "tracker-C", Phase: tracker.MetadataPhase, Peers: []tracker.TrackerPeer{{Host: "c.test", Port: 51414}}}); err != nil {
+		t.Fatal(err)
+	}
+	if queue.sourceCount[trackerB] != beforeCount || queue.hostBytes != beforeBytes || queue.total != beforeTotal {
+		t.Fatalf("rejected host admission mutated counts: source=%d hostBytes=%d total=%d, before %d/%d/%d", queue.sourceCount[trackerB], queue.hostBytes, queue.total, beforeCount, beforeBytes, beforeTotal)
+	}
+	for _, item := range inFlight {
+		queue.releasePeer(item)
+	}
+}
+
+func TestTrackerPeerQueueRequeueRestoresSourceIndexes(t *testing.T) {
+	queue := newTrackerPeerUpdateQueue()
+	peerB := tracker.TrackerPeer{Host: "requeue.test", Port: 51413}
+	if err := queue.enqueue(tracker.Update{Tracker: "tracker-B", Phase: tracker.MetadataPhase, Peers: []tracker.TrackerPeer{peerB}}); err != nil {
+		t.Fatal(err)
+	}
+	item := queue.takeHostname()
+	if item == nil || item.queueElement != nil || item.sourceElement != nil || item.hostSourceEntry != nil {
+		t.Fatalf("detached peer indexes = %+v, want nil links", item)
+	}
+	trackerB := item.source
+	queue.requeuePeer(item)
+	perSource := queue.sourceOrder[trackerB]
+	if item.queueElement == nil || item.sourceElement == nil || item.hostSourceEntry == nil || perSource == nil || perSource.all.Len() != 1 || perSource.hosts.Len() != 1 {
+		t.Fatalf("requeued source indexes: item=%+v source=%+v", item, perSource)
+	}
+	if queue.total != 1 || queue.hostBytes != len(peerB.Host) || queue.sourceCount[trackerB] != 1 {
+		t.Fatalf("requeue changed accounting: total=%d bytes=%d source=%d", queue.total, queue.hostBytes, queue.sourceCount[trackerB])
+	}
+	if got := queue.takeHostname(); got != item {
+		t.Fatalf("next queued hostname = %+v, want requeued entry", got)
+	}
+	queue.releasePeer(item)
+	if queue.pendingPeers() != 0 || queue.hostBytes != 0 {
+		t.Fatalf("queue after releasing requeued peer = total %d, bytes %d", queue.pendingPeers(), queue.hostBytes)
+	}
+}
+
+func TestTrackerPeerQueueClearPreservesSourceRegistryAcrossPhases(t *testing.T) {
+	queue := newTrackerPeerUpdateQueue()
+	if err := queue.enqueue(tracker.Update{Tracker: "tracker-A", Phase: tracker.MetadataPhase, Peers: []tracker.TrackerPeer{{Host: "127.0.0.1", Port: 51413}}}); err != nil {
+		t.Fatal(err)
+	}
+	trackerA, err := queue.sourceID("tracker-A")
+	if err != nil {
+		t.Fatal(err)
+	}
+	item := queue.takePeer(false)
+	queue.releasePeer(item)
+	queue.clear()
+	if len(queue.sourceCount) != 0 || len(queue.sourceOrder) != 0 || queue.total != 0 || queue.hostBytes != 0 {
+		t.Fatalf("queue accounting after clear = counts %d orders %d total %d bytes %d", len(queue.sourceCount), len(queue.sourceOrder), queue.total, queue.hostBytes)
+	}
+	if err := queue.enqueue(tracker.Update{Tracker: "tracker-A", Phase: tracker.TransferPhase, Peers: []tracker.TrackerPeer{{Host: "127.0.0.1", Port: 51414}}}); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := queue.sourceID("tracker-A"); err != nil || got != trackerA {
+		t.Fatalf("tracker-A source ID after clear = %d, %v; want %d", got, err, trackerA)
+	}
+	if queue.sourceCount[trackerA] != 1 || queue.sourceOrder[trackerA].all.Len() != 1 {
+		t.Fatalf("transfer queue indexes after clear: count=%d order=%v", queue.sourceCount[trackerA], queue.sourceOrder[trackerA])
+	}
+	if unsafe.Sizeof(queue.ipPeers.Front().Value.(*queuedTrackerPeer).source) != 2 {
+		t.Fatal("peer queue source identity is not a 16-bit value")
+	}
+}
+
+func TestTrackerPeerQueueLongTrackerSourceUsesFixedSizePeerKey(t *testing.T) {
+	queue := newTrackerPeerUpdateQueue()
+	longSource := strings.Repeat("x", 64<<20)
+	peers := make([]tracker.TrackerPeer, 1000)
+	for i := range peers {
+		peers[i] = tracker.TrackerPeer{Host: "127.0.0.1", Port: uint16(i + 1)}
+	}
+	if err := queue.enqueue(tracker.Update{Tracker: longSource, Phase: tracker.MetadataPhase, Peers: peers}); err != nil {
+		t.Fatal(err)
+	}
+	id, err := queue.sourceID(longSource)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id != peer.FirstTrackerCandidateSource || len(queue.sources) != 1 {
+		t.Fatalf("source ID/registry = %d/%d, want %d/1", id, len(queue.sources), peer.FirstTrackerCandidateSource)
+	}
+	for element := queue.ipPeers.Front(); element != nil; element = element.Next() {
+		item := element.Value.(*queuedTrackerPeer)
+		if item.source != id || unsafe.Sizeof(item.source) != 2 {
+			t.Fatalf("peer source key = %d, size %d; want fixed ID %d", item.source, unsafe.Sizeof(item.source), id)
+		}
+	}
+}
+
+func TestTrackerPeerQueueBoundsTrackerSourceRegistry(t *testing.T) {
+	queue := newTrackerPeerUpdateQueue()
+	trackerA, err := queue.sourceID("tracker-A")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if repeated, err := queue.sourceID("tracker-A"); err != nil || repeated != trackerA {
+		t.Fatalf("repeated exact source ID = %d, %v; want %d", repeated, err, trackerA)
+	}
+	if distinct, err := queue.sourceID("tracker-A/"); err != nil || distinct == trackerA {
+		t.Fatalf("distinct source ID = %d, %v; want a different ID from %d", distinct, err, trackerA)
+	}
+	for i := 0; len(queue.sources) < limits.Trackers; i++ {
+		if _, err := queue.sourceID(fmt.Sprintf("tracker-%d", i)); err != nil {
+			t.Fatalf("sourceID(%d): %v", i, err)
+		}
+	}
+	if len(queue.sources) != limits.Trackers {
+		t.Fatalf("source registry size = %d, want %d", len(queue.sources), limits.Trackers)
+	}
+	if _, err := queue.sourceID("tracker-over-limit"); !errors.Is(err, ErrTrackerSourceLimit) {
+		t.Fatalf("source beyond configured tracker cap = %v, want %v", err, ErrTrackerSourceLimit)
 	}
 }
 
