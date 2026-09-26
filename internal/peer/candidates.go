@@ -20,8 +20,9 @@ var (
 	ErrCandidate       = errors.New("invalid peer candidate")
 	// ErrCandidateLimit is retained for source compatibility; a full pool now
 	// replaces its least-recently announced endpoint instead of returning it.
-	ErrCandidateLimit = errors.New("peer candidate limit reached")
-	ErrCandidateDNS   = errors.New("peer candidate resolution failed")
+	ErrCandidateLimit       = errors.New("peer candidate limit reached")
+	ErrCandidateDNS         = errors.New("peer candidate resolution failed")
+	ErrEndpointBudgetConfig = errors.New("endpoint attempt limit is outside the supported range")
 )
 
 // CandidateSource is the bounded numeric identity of a peer source. Session
@@ -390,10 +391,13 @@ func (p *CandidatePool) Len() int {
 // entries persist for the run. It does not record corruption strikes; protocol
 // and piece penalties remain coordinator-owned.
 type EndpointBackoff struct {
-	mu          sync.Mutex
-	states      map[Endpoint]*list.Element
-	blacklisted map[Endpoint]struct{}
-	order       list.List
+	mu           sync.Mutex
+	states       map[Endpoint]*list.Element
+	blacklisted  map[Endpoint]struct{}
+	attempted    map[Endpoint]struct{}
+	attemptLimit int
+	budgetErr    *EndpointBudgetError
+	order        list.List
 }
 
 type endpointBackoffState struct {
@@ -415,10 +419,62 @@ const (
 
 // NewEndpointBackoff creates empty endpoint health state.
 func NewEndpointBackoff() *EndpointBackoff {
-	return &EndpointBackoff{
-		states:      make(map[Endpoint]*list.Element),
-		blacklisted: make(map[Endpoint]struct{}),
+	return newEndpointBackoff(limits.EndpointAttempts)
+}
+
+// NewEndpointBackoffWithLimit creates an endpoint backoff with a smaller
+// distinct-endpoint attempt limit. Production callers should use
+// NewEndpointBackoff, which fixes the limit at the supported run-wide bound.
+func NewEndpointBackoffWithLimit(limit int) (*EndpointBackoff, error) {
+	if limit < 1 || limit > limits.EndpointAttempts {
+		return nil, ErrEndpointBudgetConfig
 	}
+	return newEndpointBackoff(limit), nil
+}
+
+func newEndpointBackoff(limit int) *EndpointBackoff {
+	return &EndpointBackoff{
+		states:       make(map[Endpoint]*list.Element),
+		blacklisted:  make(map[Endpoint]struct{}),
+		attempted:    make(map[Endpoint]struct{}),
+		attemptLimit: limit,
+		budgetErr:    &EndpointBudgetError{Limit: limit},
+	}
+}
+
+// beginAttempt reserves an endpoint identity before its first transport race.
+// Retries of an already-attempted endpoint remain allowed without using more
+// budget. Callers hold their race slot before invoking this method.
+func (b *EndpointBackoff) beginAttempt(endpoint Endpoint, now time.Time) error {
+	if b == nil {
+		return nil
+	}
+	endpoint, err := NormalizeEndpoint(endpoint)
+	if err != nil {
+		return err
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if _, ok := b.blacklisted[endpoint]; ok {
+		return fmt.Errorf("%w: endpoint is blacklisted", ErrCandidate)
+	}
+	if element := b.states[endpoint]; element != nil {
+		state := element.Value.(*endpointBackoffEntry).state
+		if now.Before(state.notBefore) {
+			return fmt.Errorf("%w: endpoint backoff is active", ErrCandidate)
+		}
+	}
+	if _, exists := b.attempted[endpoint]; exists {
+		return nil
+	}
+	if len(b.attempted) >= b.attemptLimit {
+		return b.budgetErr
+	}
+	b.attempted[endpoint] = struct{}{}
+	return nil
 }
 
 // Ready reports whether an endpoint may be attempted at now. A zero now uses

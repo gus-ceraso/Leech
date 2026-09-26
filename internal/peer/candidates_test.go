@@ -16,6 +16,20 @@ const (
 	trackerSourceB
 )
 
+func TestEndpointBackoffLimitValidation(t *testing.T) {
+	for _, limit := range []int{0, -1, limits.EndpointAttempts + 1} {
+		if _, err := NewEndpointBackoffWithLimit(limit); !errors.Is(err, ErrEndpointBudgetConfig) {
+			t.Fatalf("NewEndpointBackoffWithLimit(%d) error = %v, want config error", limit, err)
+		}
+	}
+	if _, err := NewEndpointBackoffWithLimit(limits.EndpointAttempts); err != nil {
+		t.Fatalf("production maximum rejected by bounded constructor: %v", err)
+	}
+	if got := NewEndpointBackoff().attemptLimit; got != limits.EndpointAttempts {
+		t.Fatalf("production endpoint attempt limit = %d, want %d", got, limits.EndpointAttempts)
+	}
+}
+
 type candidateResolver struct {
 	answers []net.IPAddr
 	err     error

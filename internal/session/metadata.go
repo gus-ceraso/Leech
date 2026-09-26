@@ -1039,6 +1039,11 @@ func (d *MetadataDiscovery) Run(ctx context.Context) (result MetadataResult, pri
 				}
 				return result, nil
 			}
+			var budgetErr *peer.EndpointBudgetError
+			if errors.As(err, &budgetErr) {
+				primary = budgetErr
+				break
+			}
 			if errors.Is(err, ErrMetadataInvalid) {
 				count := strikes[candidate.Endpoint]
 				if count >= 3 {

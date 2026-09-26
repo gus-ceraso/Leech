@@ -350,6 +350,10 @@ func (t *Transfer) Run(ctx context.Context) error {
 			}
 			continue
 		}
+		if result.AdmissionErr != nil {
+			primary = result.AdmissionErr
+			break
+		}
 		if result.CandidateClosed {
 			acquired = nil
 			if countLive(peers) == 0 {
@@ -563,6 +567,7 @@ func (t *Transfer) drive(ctx context.Context, peers *[]*transferPeer) error {
 
 type acquireResult struct {
 	peer ConnectedPeer
+	err  error
 }
 
 func (t *Transfer) acquireLoop(ctx context.Context, results chan<- acquireResult, wg *sync.WaitGroup) {
@@ -582,6 +587,14 @@ func (t *Transfer) acquireLoop(ctx context.Context, results chan<- acquireResult
 			}
 			delay = peerAcquireBase
 			continue
+		}
+		var budgetErr *peer.EndpointBudgetError
+		if errors.As(err, &budgetErr) {
+			select {
+			case results <- acquireResult{err: budgetErr}:
+			case <-ctx.Done():
+			}
+			return
 		}
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			if ctx.Err() != nil {
@@ -760,6 +773,9 @@ func (t *Transfer) drainAcquired(candidates <-chan acquireResult) {
 		case result, ok := <-candidates:
 			if !ok {
 				return
+			}
+			if result.err != nil {
+				continue
 			}
 			if result.peer.Conn != nil {
 				_ = result.peer.Conn.Close()
@@ -1087,6 +1103,7 @@ type peerWaitResult struct {
 	Event           peer.PeerEvent
 	Index           int
 	Candidate       *ConnectedPeer
+	AdmissionErr    error
 	CandidateClosed bool
 	PeerClosed      bool
 	ReplacementTick bool
@@ -1134,6 +1151,9 @@ func waitPeerEventWithAdmission(ctx context.Context, peers []*transferPeer, cand
 			return peerWaitResult{CandidateClosed: true}
 		}
 		result := value.Interface().(acquireResult)
+		if result.err != nil {
+			return peerWaitResult{AdmissionErr: result.err, OK: true}
+		}
 		return peerWaitResult{Candidate: &result.peer, OK: true}
 	}
 	if chosen == replacementCase {

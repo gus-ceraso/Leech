@@ -18,10 +18,26 @@ var (
 	ErrRaceLimit       = errors.New("concurrent endpoint race limit reached")
 	ErrPeerIDCollision = errors.New("peer ID is already connected")
 	ErrLivePeerLimit   = errors.New("live peer limit reached")
+	ErrEndpointBudget  = errors.New("distinct peer endpoint attempt budget exhausted")
 	// ErrExpectedPeerIDMismatch means a tracker assertion did not match the
 	// handshake. It is candidate metadata failure, not peer-origin misconduct.
 	ErrExpectedPeerIDMismatch = errors.New("tracker-supplied peer ID does not match handshake")
 )
+
+// EndpointBudgetError reports that the run has attempted its maximum number
+// of distinct resolved IP:port endpoints.
+type EndpointBudgetError struct {
+	Limit int
+}
+
+func (e *EndpointBudgetError) Error() string {
+	if e == nil {
+		return ErrEndpointBudget.Error()
+	}
+	return fmt.Sprintf("%s (%d)", ErrEndpointBudget, e.Limit)
+}
+
+func (e *EndpointBudgetError) Is(target error) bool { return target == ErrEndpointBudget }
 
 const defaultUTPHeadStart = 100 * time.Millisecond
 
@@ -174,10 +190,16 @@ func (m *DialManager) Race(ctx context.Context, candidate ResolvedCandidate) (Ha
 		return HandshakeResult{}, ctx.Err()
 	}
 	defer func() { <-m.races }()
+	if err := ctx.Err(); err != nil {
+		return HandshakeResult{}, err
+	}
 	config := m.raceConfig
 	if candidate.HasExpectedID {
 		expected := candidate.ExpectedPeerID
 		config.ExpectedPeerID = &expected
+	}
+	if err := m.backoff.beginAttempt(endpoint, m.now()); err != nil {
+		return HandshakeResult{}, err
 	}
 	result, err := RaceEndpoint(ctx, endpoint, config)
 	if err != nil {

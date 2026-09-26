@@ -16,6 +16,7 @@ const (
 	Pieces                  = 2_000_000
 	PieceBytes        int64 = 64 << 20
 	Trackers                = 64
+	EndpointAttempts        = 100_000
 	DNSAnswers              = 64
 	MagnetPeers             = 1_024
 	Candidates              = 20_000

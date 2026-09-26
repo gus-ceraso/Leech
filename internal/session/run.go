@@ -63,6 +63,7 @@ type RunConfig struct {
 	// are nil Run builds the production set and bounded update queue itself.
 	TrackerSet *tracker.TrackerSet
 	Updates    <-chan tracker.Update
+	backoff    *peer.EndpointBackoff
 
 	OnPhase     func(string)
 	OnProgress  func(RunProgress)
@@ -151,7 +152,11 @@ func Run(ctx context.Context, config RunConfig) (result RunResult, err error) {
 		}
 	}
 
-	run := &coordinator{config: config, identity: identity, backoff: peer.NewEndpointBackoff(), verifiedOutput: &verifiedOutput}
+	backoff := config.backoff
+	if backoff == nil {
+		backoff = peer.NewEndpointBackoff()
+	}
+	run := &coordinator{config: config, identity: identity, backoff: backoff, verifiedOutput: &verifiedOutput}
 	run.updateQueue = newTrackerPeerUpdateQueue()
 	run.ownSet = config.TrackerSet == nil
 	defer func() {
@@ -589,6 +594,10 @@ func (c *coordinator) startTransferPhase(ctx context.Context, source torrent.Sou
 				admitted, dialErr := manager.Dial(dialCtx, candidate)
 				dialCancel()
 				if dialErr != nil {
+					var budgetErr *peer.EndpointBudgetError
+					if errors.As(dialErr, &budgetErr) {
+						return ConnectedPeer{}, budgetErr
+					}
 					break
 				}
 				liveMu.Lock()

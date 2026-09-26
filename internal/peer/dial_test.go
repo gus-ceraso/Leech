@@ -475,6 +475,132 @@ func TestDialManagerBlacklistsProtocolViolationsAndBacksOffOrdinaryFailures(t *t
 	})
 }
 
+func TestDialManagerBudgetAllowsRetriesAndCountsNormalizedEndpointsOnce(t *testing.T) {
+	backoff, err := NewEndpointBackoffWithLimit(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Unix(100, 0)
+	var calls atomic.Int32
+	manager, err := NewDialManager(DialManagerConfig{
+		Race: RaceConfig{
+			LocalHandshake: testHandshake(),
+			TCPDial: func(context.Context, string, string) (net.Conn, error) {
+				calls.Add(1)
+				return nil, errors.New("fixture dial failure")
+			},
+		},
+		Backoff: backoff,
+		Now:     func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	v4Mapped := Endpoint{Addr: netip.MustParseAddr("::ffff:127.0.0.1"), Port: 51413}
+	ipv4 := Endpoint{Addr: netip.MustParseAddr("127.0.0.1"), Port: 51413}
+	if _, err := manager.Race(context.Background(), ResolvedCandidate{Endpoint: v4Mapped}); err == nil {
+		t.Fatal("first fixture race unexpectedly succeeded")
+	}
+	if len(backoff.attempted) != 1 {
+		t.Fatalf("attempted endpoint count after first race = %d, want 1", len(backoff.attempted))
+	}
+
+	// Retry the same normalized endpoint after ordinary backoff expires. It
+	// starts another transport race without consuming another unique slot.
+	now = now.Add(time.Second)
+	if _, err := manager.Race(context.Background(), ResolvedCandidate{Endpoint: ipv4}); err == nil {
+		t.Fatal("retry fixture race unexpectedly succeeded")
+	}
+	if len(backoff.attempted) != 1 || calls.Load() != 2 {
+		t.Fatalf("retry attempts/calls = %d/%d, want one identity and two races", len(backoff.attempted), calls.Load())
+	}
+
+	budgetEndpoint := Endpoint{Addr: netip.MustParseAddr("127.0.0.2"), Port: 51413}
+	_, err = manager.Race(context.Background(), ResolvedCandidate{Endpoint: budgetEndpoint})
+	var budgetErr *EndpointBudgetError
+	if !errors.As(err, &budgetErr) || !errors.Is(err, ErrEndpointBudget) || budgetErr.Limit != 1 {
+		t.Fatalf("next distinct endpoint error = %v, want typed one-endpoint budget error", err)
+	}
+	if calls.Load() != 2 || len(backoff.attempted) != 1 {
+		t.Fatalf("budget rejection started work: calls=%d attempted=%d", calls.Load(), len(backoff.attempted))
+	}
+}
+
+func TestDialManagerEndpointBudgetIsSharedAcrossPhasesAndConcurrentRaces(t *testing.T) {
+	const limit = 8
+	backoff, err := NewEndpointBackoffWithLimit(limit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var calls atomic.Int32
+	dial := func(context.Context, string, string) (net.Conn, error) {
+		calls.Add(1)
+		return nil, errors.New("fixture dial failure")
+	}
+	newManager := func() *DialManager {
+		manager, err := NewDialManager(DialManagerConfig{
+			Race: RaceConfig{LocalHandshake: testHandshake(), TCPDial: dial}, Backoff: backoff,
+		})
+		if err != nil {
+			t.Fatalf("NewDialManager: %v", err)
+		}
+		return manager
+	}
+	metadataManager := newManager()
+	transferManager := newManager()
+
+	type raceResult struct {
+		err error
+	}
+	const total = 32
+	results := make(chan raceResult, total)
+	var wg sync.WaitGroup
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	for i := 0; i < total; i++ {
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			endpoint := Endpoint{Addr: netip.MustParseAddr("127.0.0.1"), Port: uint16(10000 + index)}
+			manager := metadataManager
+			if index%2 != 0 {
+				manager = transferManager
+			}
+			_, err := manager.Race(ctx, ResolvedCandidate{Endpoint: endpoint})
+			results <- raceResult{err: err}
+		}(i)
+	}
+	wg.Wait()
+	close(results)
+	budgetErrors := 0
+	for result := range results {
+		var budgetErr *EndpointBudgetError
+		if errors.As(result.err, &budgetErr) {
+			budgetErrors++
+			if budgetErr != backoff.budgetErr {
+				t.Fatalf("budget error pointer = %p, want shared error %p", budgetErr, backoff.budgetErr)
+			}
+		}
+	}
+	if got := len(backoff.attempted); got != limit {
+		t.Fatalf("concurrent unique attempts = %d, want %d", got, limit)
+	}
+	if got := calls.Load(); got != limit {
+		t.Fatalf("transport dials = %d, want %d; over-budget endpoints must not start", got, limit)
+	}
+	if budgetErrors != total-limit {
+		t.Fatalf("budget errors = %d, want %d", budgetErrors, total-limit)
+	}
+
+	// A second manager standing in for the next session phase shares the same
+	// backoff authority and cannot start a new endpoint after the global cap.
+	_, err = transferManager.Race(ctx, ResolvedCandidate{Endpoint: Endpoint{Addr: netip.MustParseAddr("127.0.0.2"), Port: 51413}})
+	var budgetErr *EndpointBudgetError
+	if !errors.As(err, &budgetErr) || calls.Load() != limit {
+		t.Fatalf("cross-phase race = %v, dials=%d; want shared fatal budget and no new dial", err, calls.Load())
+	}
+}
+
 type closeSpy struct {
 	net.Conn
 	closed atomic.Bool
