@@ -288,6 +288,36 @@ func TestRunNoProgressTimeoutRemainsPrimaryShutdownError(t *testing.T) {
 }
 
 func TestRunNoProgressTimeoutReportsStagedCloseFailure(t *testing.T) {
+	secondary := make(chan error, 1)
+	err, closes, closeErr := runNoProgressTimeoutWithStagedCloseFailure(t, func(err error) { secondary <- err })
+	if !errors.Is(err, ErrNoProgressTimeout) {
+		t.Fatalf("Run error = %v, want no-progress timeout", err)
+	}
+	select {
+	case secondaryErr := <-secondary:
+		if !errors.Is(secondaryErr, closeErr) {
+			t.Fatalf("secondary error = %v, want staged close failure", secondaryErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("staged close failure was not reported as secondary")
+	}
+	if closes != 1 {
+		t.Errorf("stage close count = %d, want 1", closes)
+	}
+}
+
+func TestRunNoProgressTimeoutWithNilSecondaryCallback(t *testing.T) {
+	err, closes, _ := runNoProgressTimeoutWithStagedCloseFailure(t, nil)
+	if !errors.Is(err, ErrNoProgressTimeout) {
+		t.Fatalf("Run error = %v, want no-progress timeout", err)
+	}
+	if closes != 1 {
+		t.Errorf("stage close count = %d, want 1", closes)
+	}
+}
+
+func runNoProgressTimeoutWithStagedCloseFailure(t *testing.T, onSecondary func(error)) (error, int, error) {
+	t.Helper()
 	data := []byte("withheld payload")
 	hash := sha1.Sum(data)
 	info := bencode.Value{Type: bencode.Dictionary, Dict: []bencode.Entry{
@@ -374,7 +404,6 @@ func TestRunNoProgressTimeoutReportsStagedCloseFailure(t *testing.T) {
 	opened := make(chan struct{})
 	closed := 0
 	var closeMu sync.Mutex
-	secondary := make(chan error, 1)
 	runDone := make(chan error, 1)
 	go func() {
 		_, runErr := Run(context.Background(), RunConfig{
@@ -390,7 +419,7 @@ func TestRunNoProgressTimeoutReportsStagedCloseFailure(t *testing.T) {
 				close(opened)
 				return runCloseFailureFile{File: file, err: closeErr, closes: &closed, mu: &closeMu}, nil
 			},
-			OnSecondary: func(err error) { secondary <- err },
+			OnSecondary: onSecondary,
 		})
 		runDone <- runErr
 	}()
@@ -409,26 +438,13 @@ func TestRunNoProgressTimeoutReportsStagedCloseFailure(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("Run did not finish after no-progress timeout")
 	}
-	if !errors.Is(err, ErrNoProgressTimeout) {
-		t.Fatalf("Run error = %v, want no-progress timeout", err)
-	}
-	select {
-	case secondaryErr := <-secondary:
-		if !errors.Is(secondaryErr, closeErr) {
-			t.Fatalf("secondary error = %v, want staged close failure", secondaryErr)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("staged close failure was not reported as secondary")
-	}
 	closeMu.Lock()
 	gotCloses := closed
 	closeMu.Unlock()
-	if gotCloses != 1 {
-		t.Errorf("stage close count = %d, want 1", gotCloses)
-	}
 	if err := <-peerDone; err != nil {
 		t.Errorf("peer fixture: %v", err)
 	}
+	return err, gotCloses, closeErr
 }
 
 type runCloseFailureFile struct {
