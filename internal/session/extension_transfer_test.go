@@ -44,8 +44,11 @@ func startExtensionTransferFixture(t *testing.T, localExtension, remoteExtension
 		remote.Reserved[7] = peer.FastExtensionBit
 	}
 	transfer, err := NewTransfer(TransferConfig{
-		Selection:      selection,
-		Output:         &storage.Plan{},
+		Selection: selection,
+		Output:    &storage.Plan{},
+		Stager: storage.NewStager(storage.StagerConfig{
+			CacheRoot: t.TempDir(), MaxPieces: 1, MaxBytes: int64(len(data)),
+		}),
 		LocalHandshake: local,
 		Peers: []ConnectedPeer{{
 			ID: "extension-peer", Endpoint: endpoint(97), Conn: localConn, Handshake: remote,
@@ -280,5 +283,83 @@ func TestTransferMalformedExtensionHandshakeBlacklistsEndpoint(t *testing.T) {
 	err := deliverTransferExtension(t, fixture, extensionFrame(0, []byte("d4:reqqi-1ee")))
 	if !errors.Is(err, peer.ErrProtocolViolation) || !fixture.peer.done || !fixture.transfer.scheduler.IsBlacklisted(fixture.peer.input.Endpoint) {
 		t.Fatalf("malformed extension = %v, done=%t, blacklisted=%t", err, fixture.peer.done, fixture.transfer.scheduler.IsBlacklisted(fixture.peer.input.Endpoint))
+	}
+}
+
+func TestTransferDrainsQueuedReqQBeforeScheduling(t *testing.T) {
+	fixture := startExtensionTransferFixture(t, true, true, false)
+	if err := fixture.transfer.stager.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = fixture.peer.worker.Close()
+		_ = fixture.transfer.stager.Cleanup(nil)
+	})
+	if err := writeFixtureFrame(fixture.remote, peer.UnchokeID, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeFixtureFrame(fixture.remote, peer.HaveID, []byte{0, 0, 0, 0}); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeTestFrame(fixture.remote, extensionFrame(0, []byte("d4:reqqi1ee"))); err != nil {
+		t.Fatal(err)
+	}
+	timer := time.NewTimer(2 * time.Second)
+	defer timer.Stop()
+	tick := time.NewTicker(time.Millisecond)
+	defer tick.Stop()
+	for len(fixture.peer.worker.Events()) < 3 {
+		select {
+		case <-tick.C:
+		case <-timer.C:
+			t.Fatal("peer did not queue Unchoke, Have, and reqq before scheduling")
+		}
+	}
+	peers := []*transferPeer{fixture.peer}
+	if err := fixture.transfer.drainQueuedPeerEvents(context.Background(), peers, false); err != nil {
+		t.Fatal(err)
+	}
+	if fixture.peer.state.ReqQ() != 1 {
+		t.Fatalf("queued reqq = %d, want 1", fixture.peer.state.ReqQ())
+	}
+	if err := fixture.transfer.drive(context.Background(), &peers); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.remote.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	for index, wantID := range []byte{peer.InterestedID, peer.RequestID} {
+		message, err := peer.ReadMessage(fixture.remote)
+		if err != nil || message.ID != wantID {
+			t.Fatalf("outbound frame %d = %#v, %v; want ID %d", index, message, err, wantID)
+		}
+	}
+	expectNoTransferOutput(t, fixture.remote)
+}
+
+func TestTransferBlockedMetadataRejectDisconnectsWithoutStrike(t *testing.T) {
+	fixture := startExtensionTransferFixture(t, true, true, false)
+	if err := deliverTransferExtension(t, fixture, extensionFrame(0, []byte("d1:md11:ut_metadatai9eee"))); err != nil {
+		t.Fatal(err)
+	}
+	request := peer.PeerEvent{Message: peer.Message{
+		ID: peer.ExtendedID, Payload: append([]byte{1}, []byte("d8:msg_typei0e5:piecei0ee")...),
+	}}
+	started := time.Now()
+	var err error
+	for i := 0; i < limits.PeerCommands+3; i++ {
+		err = fixture.transfer.handleEvent(context.Background(), fixture.peer, request)
+		if err != nil {
+			break
+		}
+	}
+	if !errors.Is(err, context.DeadlineExceeded) || !fixture.peer.done {
+		t.Fatalf("blocked reject = %v, peer done=%t", err, fixture.peer.done)
+	}
+	if fixture.transfer.scheduler.IsBlacklisted(fixture.peer.input.Endpoint) {
+		t.Fatal("blocked reader received a corruption strike")
+	}
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Fatalf("blocked command took %s to disconnect", elapsed)
 	}
 }

@@ -140,9 +140,21 @@ type transferPeer struct {
 	released   bool
 }
 
+func (p *transferPeer) sendCommand(ctx context.Context, message peer.Message) error {
+	commandCtx, cancel := context.WithTimeout(ctx, peerCommandTimeout)
+	defer cancel()
+	return p.worker.SendContext(commandCtx, message)
+}
+
+func (p *transferPeer) sendMetadataReject(ctx context.Context, piece uint32) error {
+	commandCtx, cancel := context.WithTimeout(ctx, peerCommandTimeout)
+	defer cancel()
+	return p.worker.SendMetadataRejectContext(commandCtx, p.extensions, piece)
+}
+
 const (
 	peerRequestTimeout = 30 * time.Second
-	peerCancelTimeout  = 100 * time.Millisecond
+	peerCommandTimeout = 100 * time.Millisecond
 	peerIdleLimit      = 60 * time.Second
 	peerAcquireBase    = 100 * time.Millisecond
 	peerAcquireMax     = 5 * time.Second
@@ -330,6 +342,10 @@ func (t *Transfer) Run(ctx context.Context) error {
 			primary = err
 			break
 		}
+		if err := t.drainQueuedPeerEvents(ctx, peers, acquired != nil); err != nil {
+			primary = err
+			break
+		}
 		if err := t.drive(ctx, &peers); err != nil {
 			if errors.Is(err, peer.ErrWorkerClosed) && (countLive(peers) > 0 || acquired != nil) {
 				continue
@@ -385,13 +401,7 @@ func (t *Transfer) Run(ctx context.Context) error {
 			}
 			break
 		}
-		if err := t.handleEventWithPeers(ctx, peers, peers[result.Index], result.Event); err != nil {
-			// A single endpoint failure is recoverable when another connected
-			// peer can finish the work. Protocol failures blacklist only that
-			// endpoint and follow the same reassignment path.
-			if peers[result.Index].done && (countLive(peers) > 0 || acquired != nil) && !errors.Is(err, storage.ErrStagingFatal) {
-				continue
-			}
+		if err := t.handleRunPeerEvent(ctx, peers, result.Index, result.Event, acquired != nil); err != nil {
 			primary = err
 		}
 	}
@@ -417,6 +427,38 @@ func (t *Transfer) Run(ctx context.Context) error {
 		}
 	}
 	return t.stager.Cleanup(primary)
+}
+
+// Drain only the events already buffered at the start of each peer's turn.
+// Each worker queue is bounded, so a flooding peer cannot postpone scheduling
+// indefinitely; channel order preserves a queued reqq update behind Have.
+func (t *Transfer) drainQueuedPeerEvents(ctx context.Context, peers []*transferPeer, canAcquire bool) error {
+	for index, p := range peers {
+		if p == nil || p.done {
+			continue
+		}
+		queued := len(p.worker.Events())
+		for i := 0; i < queued && !p.done; i++ {
+			event, ok := <-p.worker.Events()
+			if !ok {
+				break
+			}
+			if err := t.handleRunPeerEvent(ctx, peers, index, event, canAcquire); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (t *Transfer) handleRunPeerEvent(ctx context.Context, peers []*transferPeer, index int, event peer.PeerEvent, canAcquire bool) error {
+	err := t.handleEventWithPeers(ctx, peers, peers[index], event)
+	// A single endpoint failure is recoverable when another connected peer or
+	// the admission loop can finish the work.
+	if err != nil && peers[index].done && (countLive(peers) > 0 || canAcquire) && !errors.Is(err, storage.ErrStagingFatal) {
+		return nil
+	}
+	return err
 }
 
 func (t *Transfer) callBeforePeerShutdown(primary error) error {
@@ -563,9 +605,16 @@ func (t *Transfer) drive(ctx context.Context, peers *[]*transferPeer) error {
 			}
 			p.active[request.Block] = t.clock()
 			message := peer.Message{ID: peer.RequestID, Payload: blockPayload(request.Block)}
-			if err := p.worker.SendContext(ctx, message); err != nil {
+			if err := p.sendCommand(ctx, message); err != nil {
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
 				if p.worker.Err() != nil || errors.Is(err, peer.ErrWorkerClosed) {
 					return t.disconnectWorker(p)
+				}
+				if errors.Is(err, context.DeadlineExceeded) {
+					_ = t.disconnectPeer(p, err)
+					break
 				}
 				_ = p.state.CancelRequest(request.Block)
 				_ = t.scheduler.RejectBlock(p.input.ID, request.Block)
@@ -721,9 +770,9 @@ func (t *Transfer) expireRequests(ctx context.Context, peers []*transferPeer) er
 			}
 			p.tombstoned[block] = struct{}{}
 			if cancelCtx == nil {
-				cancelCtx, cancel = context.WithTimeout(ctx, peerCancelTimeout)
+				cancelCtx, cancel = context.WithTimeout(ctx, peerCommandTimeout)
 			}
-			if err := p.worker.SendContext(cancelCtx, peer.Message{ID: peer.CancelID, Payload: blockPayload(block)}); err != nil {
+			if err := p.sendCommand(cancelCtx, peer.Message{ID: peer.CancelID, Payload: blockPayload(block)}); err != nil {
 				_ = t.disconnectPeer(p, err)
 				break
 			}
@@ -862,7 +911,7 @@ func (t *Transfer) handleEventWithPeers(ctx context.Context, peers []*transferPe
 		}
 	}
 	if effect.Response != nil {
-		if err := p.worker.SendContext(ctx, *effect.Response); err != nil {
+		if err := p.sendCommand(ctx, *effect.Response); err != nil {
 			return t.disconnectPeer(p, err)
 		}
 	}
@@ -874,7 +923,7 @@ func (t *Transfer) handleEventWithPeers(ctx context.Context, peers []*transferPe
 		if effect.Interested {
 			id = peer.InterestedID
 		}
-		if err := p.worker.SendContext(ctx, peer.Message{ID: id}); err != nil {
+		if err := p.sendCommand(ctx, peer.Message{ID: id}); err != nil {
 			return t.disconnectPeer(p, err)
 		}
 	}
@@ -952,7 +1001,7 @@ func (t *Transfer) handleExtensionMessage(ctx context.Context, p *transferPeer, 
 		}
 	}
 	if event.Metadata != nil && event.Metadata.Type == peer.MetadataRequest && len(event.Response) != 0 {
-		if err := p.worker.SendMetadataRejectContext(ctx, p.extensions, event.Metadata.Piece); err != nil {
+		if err := p.sendMetadataReject(ctx, event.Metadata.Piece); err != nil {
 			return t.disconnectPeer(p, err)
 		}
 	}
@@ -1001,7 +1050,7 @@ func (t *Transfer) cancelRedundant(ctx context.Context, peers []*transferPeer, c
 		}
 		delete(loser.active, request.Block)
 		loser.tombstoned[request.Block] = struct{}{}
-		if err := loser.worker.SendContext(ctx, peer.Message{ID: peer.CancelID, Payload: blockPayload(request.Block)}); err != nil {
+		if err := loser.sendCommand(ctx, peer.Message{ID: peer.CancelID, Payload: blockPayload(request.Block)}); err != nil {
 			_ = t.disconnectPeer(loser, err)
 		}
 	}
