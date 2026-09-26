@@ -27,9 +27,10 @@ func (f fixtureResolverFunc) LookupIPAddr(ctx context.Context, host string) ([]n
 }
 
 type signaledContext struct {
-	done    chan struct{}
-	entered chan struct{}
-	once    sync.Once
+	done       chan struct{}
+	entered    chan struct{}
+	once       sync.Once
+	cancelOnce sync.Once
 }
 
 func newSignaledContext() *signaledContext {
@@ -49,7 +50,7 @@ func (c *signaledContext) Err() error {
 	}
 }
 func (c *signaledContext) Value(any) any { return nil }
-func (c *signaledContext) cancel()       { close(c.done) }
+func (c *signaledContext) cancel()       { c.cancelOnce.Do(func() { close(c.done) }) }
 
 type fixtureDialer struct {
 	conn    *fixtureConn
@@ -862,9 +863,57 @@ func TestUDPRetiringEndpointWaitsForSocketClose(t *testing.T) {
 		t.Fatal(err)
 	}
 	closeEntered, closeRelease := make(chan struct{}), make(chan struct{})
+	var releaseOnce sync.Once
+	releaseClose := func() { releaseOnce.Do(func() { close(closeRelease) }) }
 	conn := newFixtureConn(nil)
 	conn.onClose = func() { close(closeEntered); <-closeRelease }
 	retiring.conn = conn
+
+	var firstDone chan struct {
+		s   *udpSession
+		err error
+	}
+	var thirdDone chan struct {
+		s   *udpSession
+		err error
+	}
+	var cancelDone chan error
+	var thirdCtx *signaledContext
+	firstJoined, thirdJoined, cancelJoined := false, false, false
+	cancelCtx := newSignaledContext()
+	joinSession := func(done <-chan struct {
+		s   *udpSession
+		err error
+	}) bool {
+		select {
+		case <-done:
+			return true
+		case <-time.After(time.Second):
+			t.Errorf("timed out joining UDP session acquisition")
+			return false
+		}
+	}
+	t.Cleanup(func() {
+		releaseClose()
+		_ = client.Close()
+		cancelCtx.cancel()
+		if thirdCtx != nil {
+			thirdCtx.cancel()
+		}
+		if firstDone != nil && !firstJoined {
+			firstJoined = joinSession(firstDone)
+		}
+		if cancelDone != nil && !cancelJoined {
+			select {
+			case <-cancelDone:
+			case <-time.After(time.Second):
+				t.Errorf("timed out joining canceled endpoint waiter")
+			}
+		}
+		if thirdDone != nil && !thirdJoined {
+			thirdJoined = joinSession(thirdDone)
+		}
+	})
 
 	busy := make([]*udpSession, 0, udpSessionCapacity-1)
 	for i := 0; i < udpSessionCapacity-1; i++ {
@@ -878,12 +927,16 @@ func TestUDPRetiringEndpointWaitsForSocketClose(t *testing.T) {
 	client.releaseSession(retiring)
 
 	firstEndpoint := netip.MustParseAddrPort("198.51.100.1:1")
-	first := make(chan *udpSession, 1)
-	firstErr := make(chan error, 1)
+	firstDone = make(chan struct {
+		s   *udpSession
+		err error
+	}, 1)
 	go func() {
 		s, err := client.acquireSession(context.Background(), sessionKey(&udpSession{endpoint: firstEndpoint}), firstEndpoint)
-		first <- s
-		firstErr <- err
+		firstDone <- struct {
+			s   *udpSession
+			err error
+		}{s, err}
 	}()
 	select {
 	case <-closeEntered:
@@ -903,11 +956,10 @@ func TestUDPRetiringEndpointWaitsForSocketClose(t *testing.T) {
 	// Same-endpoint acquisition must wait rather than overwrite the retiring
 	// map entry after the second retirement opens a map slot. Its wait is
 	// cancellable even while the old endpoint remains mapped.
-	cancelCtx := newSignaledContext()
-	canceled := make(chan error, 1)
+	cancelDone = make(chan error, 1)
 	go func() {
 		_, err := client.acquireSession(cancelCtx, retiringKey, retiringEndpoint)
-		canceled <- err
+		cancelDone <- err
 	}()
 	select {
 	case <-cancelCtx.entered:
@@ -916,7 +968,8 @@ func TestUDPRetiringEndpointWaitsForSocketClose(t *testing.T) {
 	}
 	cancelCtx.cancel()
 	select {
-	case err := <-canceled:
+	case err := <-cancelDone:
+		cancelJoined = true
 		if !errors.Is(err, context.Canceled) {
 			t.Fatalf("same-endpoint cancellation error = %v", err)
 		}
@@ -924,22 +977,27 @@ func TestUDPRetiringEndpointWaitsForSocketClose(t *testing.T) {
 		t.Fatal("same-endpoint cancellation did not return")
 	}
 
-	ctx := newSignaledContext()
-	third := make(chan *udpSession, 1)
-	thirdErr := make(chan error, 1)
+	thirdCtx = newSignaledContext()
+	thirdDone = make(chan struct {
+		s   *udpSession
+		err error
+	}, 1)
 	go func() {
-		s, err := client.acquireSession(ctx, retiringKey, retiringEndpoint)
-		third <- s
-		thirdErr <- err
+		s, err := client.acquireSession(thirdCtx, retiringKey, retiringEndpoint)
+		thirdDone <- struct {
+			s   *udpSession
+			err error
+		}{s, err}
 	}()
 	select {
-	case <-ctx.entered:
+	case <-thirdCtx.entered:
 	case <-time.After(time.Second):
 		t.Fatal("same-endpoint caller did not wait on retirement")
 	}
 	select {
-	case s := <-third:
-		t.Fatalf("same-endpoint caller acquired before close: %p", s)
+	case value := <-thirdDone:
+		thirdJoined = true
+		t.Fatalf("same-endpoint caller acquired before close: %p", value.s)
 	default:
 	}
 	client.mu.Lock()
@@ -949,19 +1007,21 @@ func TestUDPRetiringEndpointWaitsForSocketClose(t *testing.T) {
 		t.Fatal("retiring endpoint was overwritten before its socket closed")
 	}
 
-	close(closeRelease)
+	releaseClose()
 	select {
-	case s := <-first:
-		if err := <-firstErr; err != nil || s == nil {
-			t.Fatalf("first acquisition: session=%p err=%v", s, err)
+	case value := <-firstDone:
+		firstJoined = true
+		if value.err != nil || value.s == nil {
+			t.Fatalf("first acquisition: session=%p err=%v", value.s, value.err)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("first acquisition did not resume after close")
 	}
 	select {
-	case s := <-third:
-		if err := <-thirdErr; err != nil || s == retiring {
-			t.Fatalf("same-endpoint acquisition: session=%p err=%v", s, err)
+	case value := <-thirdDone:
+		thirdJoined = true
+		if value.err != nil || value.s == retiring {
+			t.Fatalf("same-endpoint acquisition: session=%p err=%v", value.s, value.err)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("same-endpoint acquisition did not resume after close")
@@ -977,9 +1037,24 @@ func TestUDPCloseRacingSocketEviction(t *testing.T) {
 		t.Fatal(err)
 	}
 	closeEntered, closeRelease := make(chan struct{}), make(chan struct{})
+	var releaseOnce sync.Once
+	releaseClose := func() { releaseOnce.Do(func() { close(closeRelease) }) }
 	conn := newFixtureConn(nil)
 	conn.onClose = func() { close(closeEntered); <-closeRelease }
 	retiring.conn = conn
+	var result chan error
+	resultJoined := false
+	t.Cleanup(func() {
+		releaseClose()
+		_ = client.Close()
+		if result != nil && !resultJoined {
+			select {
+			case <-result:
+			case <-time.After(time.Second):
+				t.Errorf("timed out joining eviction after client close")
+			}
+		}
+	})
 	busy := make([]*udpSession, 0, udpSessionCapacity-1)
 	for i := 0; i < udpSessionCapacity-1; i++ {
 		addr := netip.AddrPortFrom(netip.AddrFrom4([4]byte{10, byte(i), 0, 1}), 1)
@@ -991,7 +1066,7 @@ func TestUDPCloseRacingSocketEviction(t *testing.T) {
 	}
 	client.releaseSession(retiring)
 	newEndpoint := netip.MustParseAddrPort("198.51.100.20:1")
-	result := make(chan error, 1)
+	result = make(chan error, 1)
 	go func() {
 		_, err := client.acquireSession(context.Background(), sessionKey(&udpSession{endpoint: newEndpoint}), newEndpoint)
 		result <- err
@@ -1004,9 +1079,10 @@ func TestUDPCloseRacingSocketEviction(t *testing.T) {
 	if err := client.Close(); err != nil {
 		t.Fatal(err)
 	}
-	close(closeRelease)
+	releaseClose()
 	select {
 	case err := <-result:
+		resultJoined = true
 		if !errors.Is(err, ErrClientClosed) {
 			t.Fatalf("acquisition after close race = %v", err)
 		}
