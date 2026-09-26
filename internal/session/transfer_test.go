@@ -858,6 +858,159 @@ func singleFileMeta(data []byte) torrent.Metainfo {
 	}
 }
 
+func TestFinalizePieceCorruptStageCloseFailurePropagatesFatal(t *testing.T) {
+	data := []byte("good")
+	meta := singleFileMeta(data)
+	selection, err := torrent.Select(meta, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	plan, err := storage.Validate(root, meta, selection.SelectedIndices())
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeErr := errors.New("injected staged close failure")
+	var closes atomic.Int32
+	stager := storage.NewStager(storage.StagerConfig{
+		CacheRoot: filepath.Join(t.TempDir(), "cache"), MaxPieces: 1, MaxBytes: int64(len(data)),
+		OpenFile: func(path string, flag int, mode os.FileMode) (storage.StagingFile, error) {
+			file, err := os.OpenFile(path, flag, mode)
+			if err != nil {
+				return nil, err
+			}
+			return &closeErrorStageFile{StagingFile: file, closeErr: closeErr, closes: &closes}, nil
+		},
+	})
+	if err := stager.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	piece := selection.PiecePlans()[0].Piece
+	stage, err := stager.AdmitPiece(piece)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := stage.WriteBlock(0, []byte("evil")); err != nil {
+		t.Fatal(err)
+	}
+	scheduler, err := NewScheduler(selection, Config{Shuffle: keepTieOrder})
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpoint := endpoint(1)
+	if err := scheduler.AddPeer("contributor", endpoint); err != nil {
+		t.Fatal(err)
+	}
+	if err := scheduler.SetAvailability("contributor", []int{0}); err != nil {
+		t.Fatal(err)
+	}
+	offer, ok, err := scheduler.ReservePiece("contributor")
+	if err != nil || !ok {
+		t.Fatalf("reserve = %#v, %v", offer, err)
+	}
+	if err := scheduler.AdmitPiece(offer); err != nil {
+		t.Fatal(err)
+	}
+	requests, err := scheduler.NextRequests("contributor", 1)
+	if err != nil || len(requests) != 1 {
+		t.Fatalf("requests = %#v, %v", requests, err)
+	}
+	if _, err := scheduler.AcceptBlock("contributor", requests[0].Block); err != nil {
+		t.Fatal(err)
+	}
+	transfer := &Transfer{scheduler: scheduler, stager: stager, output: plan, stages: map[int]*storage.PieceStage{0: stage}}
+	if err := transfer.finalizePiece(context.Background(), 0); !errors.Is(err, closeErr) || !errors.Is(err, storage.ErrStagingFatal) {
+		t.Fatalf("finalizePiece error = %v, want injected close error and ErrStagingFatal", err)
+	}
+	if got := scheduler.StrikeCount(endpoint); got != 1 {
+		t.Fatalf("contributor strikes = %d, want exactly one", got)
+	}
+	if closes.Load() != 1 {
+		t.Fatalf("staged file closes = %d, want one", closes.Load())
+	}
+	if _, err := os.Stat(filepath.Join(root, "fixture")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("corrupt output exists or stat failed: %v", err)
+	}
+	_ = stager.Cleanup(nil)
+}
+
+type closeErrorStageFile struct {
+	storage.StagingFile
+	closeErr error
+	closes   *atomic.Int32
+}
+
+func (f *closeErrorStageFile) Close() error {
+	f.closes.Add(1)
+	_ = f.StagingFile.Close()
+	return f.closeErr
+}
+
+func TestTransferFatalCorruptStageCloseFailureShutsDownImmediately(t *testing.T) {
+	data := []byte("good")
+	meta := singleFileMeta(data)
+	selection, err := torrent.Select(meta, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	plan, err := storage.Validate(root, meta, selection.SelectedIndices())
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeErr := errors.New("injected staged close failure")
+	var closes atomic.Int32
+	stager := storage.NewStager(storage.StagerConfig{
+		CacheRoot: filepath.Join(t.TempDir(), "cache"), MaxPieces: 1, MaxBytes: int64(len(data)),
+		OpenFile: func(path string, flag int, mode os.FileMode) (storage.StagingFile, error) {
+			file, err := os.OpenFile(path, flag, mode)
+			if err != nil {
+				return nil, err
+			}
+			return &closeErrorStageFile{StagingFile: file, closeErr: closeErr, closes: &closes}, nil
+		},
+	})
+	infoHash := [20]byte{1, 3, 5}
+	conn, remoteDone := startFixturePeer(t, infoHash, []fixturePiece{{index: 0, data: data}}, true, false)
+	transfer, err := NewTransfer(TransferConfig{
+		Selection: selection, Output: plan, Stager: stager,
+		LocalHandshake: peer.Handshake{InfoHash: infoHash, PeerID: [20]byte{4, 5, 6}},
+		Peers:          []ConnectedPeer{{ID: "fatal-peer", Endpoint: endpoint(1), Conn: conn, Handshake: peer.Handshake{InfoHash: infoHash, PeerID: [20]byte{3, 2, 1}}}},
+		PieceCount:     1, PieceLength: uint32(len(data)), LastPieceLength: uint32(len(data)),
+	})
+	if err != nil {
+		conn.Close()
+		t.Fatal(err)
+	}
+	result := make(chan error, 1)
+	go func() { result <- transfer.Run(context.Background()) }()
+	select {
+	case err := <-result:
+		if !errors.Is(err, closeErr) || !errors.Is(err, storage.ErrStagingFatal) {
+			t.Fatalf("Transfer.Run error = %v, want close failure and ErrStagingFatal", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("fatal stage-close failure did not end transfer promptly")
+	}
+	select {
+	case err := <-remoteDone:
+		if err != nil {
+			t.Fatalf("fixture peer: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("fixture peer was not joined during graceful shutdown")
+	}
+	if closes.Load() != 1 {
+		t.Fatalf("staged file closes = %d, want exactly one without retry", closes.Load())
+	}
+	if got := transfer.scheduler.StrikeCount(endpoint(1)); got != 1 {
+		t.Fatalf("contributor strikes = %d, want exactly one", got)
+	}
+	if output, err := os.ReadFile(filepath.Join(root, "fixture")); err != nil || len(output) != 0 {
+		t.Fatalf("corrupt output = %q, err=%v; want empty prepared output", output, err)
+	}
+}
+
 func TestTransferCorruptPieceRetriesWithoutOutput(t *testing.T) {
 	data := []byte("good")
 	meta := singleFileMeta(data)

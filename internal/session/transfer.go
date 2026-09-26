@@ -1179,7 +1179,7 @@ func (t *Transfer) finalizePiece(ctx context.Context, index int) error {
 			for _, endpoint := range verification.Blacklisted {
 				t.notifyBlacklisted(endpoint)
 			}
-			return verifyErr
+			return errors.Join(verifyErr, t.stager.Fatal())
 		}
 	}
 	return t.settleFinalizedPiece(index, snapshot.Piece, finalized, err)

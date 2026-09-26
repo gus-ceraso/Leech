@@ -67,6 +67,9 @@ piece/request state, and `transfer.go` coordinates peer I/O and finalization.
   productive flag. Ordinary stalls do not earn strikes. A failed piece gives
   one strike per distinct contributor; three strikes blacklist. Invalid complete
   metadata strikes its sole supplier; severe violations blacklist immediately.
+  After hash-mismatch accounting, propagate any recorded `Stager.Fatal()` with
+  the scheduler result so storage failure cannot be treated as retryable peer
+  corruption.
 - Count every received file-payload byte for tracker accounting, including
   discarded data. Draining queued events can complete the download; recheck
   completion before scheduling again. Advance completion and the no-progress
