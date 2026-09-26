@@ -655,11 +655,12 @@ func (c *coordinator) startTransferPhase(ctx context.Context, source torrent.Sou
 	for _, span := range resume.VerifiedRanges {
 		verifiedSelected += span.Range.End - span.Range.Begin
 	}
+	stager := storage.NewStager(storage.StagerConfig{
+		CacheRoot: c.config.CacheRoot,
+		OpenFile:  c.config.StageFileOpener,
+	})
 	transfer, err := NewTransfer(TransferConfig{
-		Selection: selection, Output: output, Stager: storage.NewStager(storage.StagerConfig{
-			CacheRoot: c.config.CacheRoot,
-			OpenFile:  c.config.StageFileOpener,
-		}),
+		Selection: selection, Output: output, Stager: stager,
 		PrepareMode:     prepareMode,
 		SchedulerConfig: Config{Streaming: c.config.Streaming}, LocalHandshake: local,
 		PieceCount: uint32(len(meta.Pieces)), PieceLength: uint32(meta.PieceLength),
@@ -764,6 +765,10 @@ func (c *coordinator) startTransferPhase(ctx context.Context, source torrent.Sou
 	err = transferErr
 	if errors.Is(err, context.Canceled) && ctx.Err() == nil && timeoutFired.Load() {
 		err = fmt.Errorf("%w: %s", ErrNoProgressTimeout, c.config.Timeout)
+		// Transfer.Run has joined its cleanup; idempotent Close retrieves its recorded result.
+		if cleanupErr := stager.Close(); cleanupErr != nil && c.config.OnSecondary != nil {
+			c.config.OnSecondary(cleanupErr)
+		}
 	}
 	if err == nil {
 		for _, pending := range resume.PendingTruncations {

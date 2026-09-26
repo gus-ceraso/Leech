@@ -75,6 +75,9 @@ piece/request state, and `transfer.go` coordinates peer I/O and finalization.
   completion before scheduling again. Advance completion and the no-progress
   timer only after a newly verified file piece commits. Whole-torrent `left`
   differs from selected progress; see [tracker guidance](../tracker/AGENTS.md).
+  When classifying the session-owned no-progress timeout, retrieve the stager's
+  recorded close result and report it through optional `OnSecondary`; leave
+  ordinary cancellation and final tracker errors on their existing paths.
 - Preserve primary errors. Cleanup failure replaces success, while final tracker
   event failures remain secondary. Honor committed-output reporting even when
   later staged-file removal fails.

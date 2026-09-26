@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/gus-ceraso/Leech/internal/bencode"
 	"github.com/gus-ceraso/Leech/internal/peer"
+	"github.com/gus-ceraso/Leech/internal/storage"
 	"github.com/gus-ceraso/Leech/internal/torrent"
 	"github.com/gus-ceraso/Leech/internal/tracker"
 )
@@ -283,6 +285,165 @@ func TestRunNoProgressTimeoutRemainsPrimaryShutdownError(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("tracker final-event failure was not reported as secondary")
 	}
+}
+
+func TestRunNoProgressTimeoutReportsStagedCloseFailure(t *testing.T) {
+	data := []byte("withheld payload")
+	hash := sha1.Sum(data)
+	info := bencode.Value{Type: bencode.Dictionary, Dict: []bencode.Entry{
+		{Key: []byte("length"), Value: bencode.Value{Type: bencode.Integer, Int: int64(len(data))}},
+		{Key: []byte("name"), Value: bencode.Value{Type: bencode.Bytes, Bytes: []byte("payload")}},
+		{Key: []byte("piece length"), Value: bencode.Value{Type: bencode.Integer, Int: int64(len(data))}},
+		{Key: []byte("pieces"), Value: bencode.Value{Type: bencode.Bytes, Bytes: hash[:]}},
+	}}
+	encoded, err := bencode.Encode(bencode.Value{Type: bencode.Dictionary, Dict: []bencode.Entry{{Key: []byte("info"), Value: info}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	torrentPath := filepath.Join(root, "payload.torrent")
+	if err := os.WriteFile(torrentPath, encoded, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	meta, err := torrent.LoadMetainfo(torrentPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	trackerFixture := &metadataFixtureTracker{port: uint16(listener.Addr().(*net.TCPAddr).Port)}
+	peerRequested := make(chan struct{})
+	peerDone := make(chan error, 1)
+	go func() {
+		conn, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			peerDone <- acceptErr
+			return
+		}
+		defer conn.Close()
+		var infoHash [20]byte
+		copy(infoHash[:], meta.InfoHash[:])
+		if _, err := peer.ReadHandshake(conn, &infoHash, nil); err != nil {
+			peerDone <- err
+			return
+		}
+		if err := peer.WriteHandshake(conn, infoHash, [20]byte{7, 6, 5}, [8]byte{}); err != nil {
+			peerDone <- err
+			return
+		}
+		if err := writeFixtureFrame(conn, peer.BitfieldID, []byte{0x80}); err != nil {
+			peerDone <- err
+			return
+		}
+		if err := writeFixtureFrame(conn, peer.UnchokeID, nil); err != nil {
+			peerDone <- err
+			return
+		}
+		for {
+			message, err := peer.ReadMessage(conn)
+			if err != nil {
+				peerDone <- err
+				return
+			}
+			if message.KeepAlive || message.ID == peer.InterestedID {
+				continue
+			}
+			if message.ID != peer.RequestID || len(message.Payload) != 12 {
+				peerDone <- fmt.Errorf("peer message = %#v, want request", message)
+				return
+			}
+			break
+		}
+		close(peerRequested)
+		_, readErr := peer.ReadMessage(conn) // Withhold the requested block until shutdown.
+		if readErr != nil && !errors.Is(readErr, io.EOF) && !errors.Is(readErr, net.ErrClosed) && !strings.Contains(readErr.Error(), "use of closed network connection") {
+			peerDone <- readErr
+			return
+		}
+		peerDone <- nil
+	}()
+
+	outputRoot := filepath.Join(root, "out")
+	if err := os.Mkdir(outputRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	closeErr := errors.New("injected staged close failure")
+	opened := make(chan struct{})
+	closed := 0
+	var closeMu sync.Mutex
+	secondary := make(chan error, 1)
+	runDone := make(chan error, 1)
+	go func() {
+		_, runErr := Run(context.Background(), RunConfig{
+			Source: torrent.Source{Kind: torrent.SourcePath, Path: torrentPath}, OutputDir: outputRoot,
+			HTTP: trackerFixture, TCPDial: (&net.Dialer{}).DialContext,
+			UTPDial:   func(ctx context.Context, _, _ string) (net.Conn, error) { <-ctx.Done(); return nil, ctx.Err() },
+			CacheRoot: filepath.Join(root, "cache"), Timeout: 500 * time.Millisecond,
+			StageFileOpener: func(path string, flag int, mode os.FileMode) (storage.StagingFile, error) {
+				file, err := os.OpenFile(path, flag, mode)
+				if err != nil {
+					return nil, err
+				}
+				close(opened)
+				return runCloseFailureFile{File: file, err: closeErr, closes: &closed, mu: &closeMu}, nil
+			},
+			OnSecondary: func(err error) { secondary <- err },
+		})
+		runDone <- runErr
+	}()
+	select {
+	case <-opened:
+	case <-time.After(time.Second):
+		t.Fatal("stage was not opened")
+	}
+	select {
+	case <-peerRequested:
+	case <-time.After(time.Second):
+		t.Fatal("peer did not receive requested block")
+	}
+	select {
+	case err = <-runDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not finish after no-progress timeout")
+	}
+	if !errors.Is(err, ErrNoProgressTimeout) {
+		t.Fatalf("Run error = %v, want no-progress timeout", err)
+	}
+	select {
+	case secondaryErr := <-secondary:
+		if !errors.Is(secondaryErr, closeErr) {
+			t.Fatalf("secondary error = %v, want staged close failure", secondaryErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("staged close failure was not reported as secondary")
+	}
+	closeMu.Lock()
+	gotCloses := closed
+	closeMu.Unlock()
+	if gotCloses != 1 {
+		t.Errorf("stage close count = %d, want 1", gotCloses)
+	}
+	if err := <-peerDone; err != nil {
+		t.Errorf("peer fixture: %v", err)
+	}
+}
+
+type runCloseFailureFile struct {
+	*os.File
+	err    error
+	closes *int
+	mu     *sync.Mutex
+}
+
+func (f runCloseFailureFile) Close() error {
+	f.mu.Lock()
+	(*f.closes)++
+	f.mu.Unlock()
+	_ = f.File.Close()
+	return f.err
 }
 
 func TestPayloadRateUsesOnlyRecentBoundedWindow(t *testing.T) {

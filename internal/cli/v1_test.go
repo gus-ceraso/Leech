@@ -667,6 +667,83 @@ func TestV1CLITimeoutCleansPieceWorkspace(t *testing.T) {
 	assertV1StoppedTrace(t, urls, requests, torrent.DefaultTracker, int64(len(data)))
 }
 
+func TestV1CLITimeoutReportsStagedCloseFailureSeparately(t *testing.T) {
+	data := []byte("withheld after request")
+	infoBytes, infoHash := v1Info(t, data)
+	torrentPath := writeV1Torrent(t, v1Metainfo(t, infoBytes, ""))
+	output, cacheRoot := t.TempDir(), filepath.Join(t.TempDir(), "cache")
+	trackerFixture := &v1Tracker{}
+	peers := newV1Peers(t, infoHash, infoBytes, data, false)
+	peers.withhold = true
+	defer peers.close()
+	config := v1SessionConfig(t, trackerFixture, peers)
+	config.CacheRoot = cacheRoot
+	closeErr := errors.New("injected staged close failure")
+	stageOpened := make(chan struct{})
+	config.StageFileOpener = func(path string, flag int, mode os.FileMode) (storage.StagingFile, error) {
+		file, err := os.OpenFile(path, flag, mode)
+		if err != nil {
+			return nil, err
+		}
+		close(stageOpened)
+		return v1CloseFailureStageFile{File: file, err: closeErr}, nil
+	}
+	opts := parseV1Options(t, "--output", output, "--timeout", "500ms", "--loglevel", "error", torrentPath)
+	var stderr bytes.Buffer
+	runDone := make(chan error, 1)
+	go func() { runDone <- RunWithSession(context.Background(), opts, &bytes.Buffer{}, &stderr, config) }()
+	select {
+	case <-stageOpened:
+	case <-time.After(time.Second):
+		t.Fatal("stage was not opened before timeout")
+	}
+	var runErr error
+	select {
+	case runErr = <-runDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("CLI did not finish after timeout")
+	}
+	if !errors.Is(runErr, session.ErrNoProgressTimeout) {
+		t.Fatalf("CLI error = %v, want no-progress timeout", runErr)
+	}
+	peers.close()
+	if err := peers.wait(t); err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(stderr.String()), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("diagnostics = %q, want one primary and one secondary line", stderr.String())
+	}
+	var primary, cleanup bool
+	for _, line := range lines {
+		if strings.Contains(line, "failure: no verified file pieces before timeout") {
+			primary = true
+			if strings.Contains(line, closeErr.Error()) {
+				t.Errorf("primary timeout diagnostic includes cleanup failure: %q", line)
+			}
+		}
+		if strings.Contains(line, "shutdown: ") && strings.Contains(line, closeErr.Error()) {
+			cleanup = true
+		}
+		if !strings.HasPrefix(line, "error: ") {
+			t.Errorf("diagnostic = %q, want error-level prefix", line)
+		}
+	}
+	if !primary || !cleanup {
+		t.Fatalf("diagnostics = %q, want distinct timeout and cleanup failures", stderr.String())
+	}
+}
+
+type v1CloseFailureStageFile struct {
+	*os.File
+	err error
+}
+
+func (f v1CloseFailureStageFile) Close() error {
+	_ = f.File.Close()
+	return f.err
+}
+
 func TestV1CLIStagedReadFailureStopsAndCleansSession(t *testing.T) {
 	data := []byte("fail staged read")
 	infoBytes, infoHash := v1Info(t, data)
@@ -1071,6 +1148,7 @@ type v1PeerFixture struct {
 	bitfield        []byte
 	metadataFirst   bool
 	stall           bool
+	withhold        bool
 	calls           atomic.Int32
 	done            chan error
 	mu              sync.Mutex
@@ -1181,6 +1259,18 @@ func (f *v1PeerFixture) serveTransfer(conn net.Conn) error {
 	}
 	if err := v1WriteFrame(conn, v1RawMessage(peer.UnchokeID, nil)); err != nil {
 		return err
+	}
+	if f.withhold {
+		for {
+			message, err := peer.ReadMessage(conn)
+			if err != nil {
+				return err
+			}
+			if message.ID == peer.RequestID {
+				_, err = io.Copy(io.Discard, conn)
+				return err
+			}
+		}
 	}
 	requested := false
 	covered := make([]bool, len(f.data))
