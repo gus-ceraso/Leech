@@ -459,8 +459,9 @@ func (t *Transfer) drainQueuedPeerEvents(ctx context.Context, peers []*transferP
 		if p.done {
 			continue
 		}
-		backlog := p.worker.PendingEvent() || len(p.worker.Events()) != 0
-		if processed == peerEventDrainLimit && backlog {
+		pending := p.worker.PendingEvent()
+		queued := len(p.worker.Events())
+		if processed == peerEventDrainLimit && queued != 0 {
 			cause := fmt.Errorf("peer event backlog exceeded %d messages", peerEventDrainLimit)
 			_ = t.disconnectPeer(p, cause)
 			if countLive(peers) == 0 && !canAcquire {
@@ -468,7 +469,7 @@ func (t *Transfer) drainQueuedPeerEvents(ctx context.Context, peers []*transferP
 			}
 			continue
 		}
-		p.deferDrive = backlog
+		p.deferDrive = pending || queued != 0
 	}
 	return nil
 }

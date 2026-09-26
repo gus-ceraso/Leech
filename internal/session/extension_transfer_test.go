@@ -320,24 +320,36 @@ func TestTransferDrainsQueuedReqQBeforeScheduling(t *testing.T) {
 			t.Fatal("four queued frames did not hold the fifth reqq frame behind backpressure")
 		}
 	}
+	pendingTimer := time.NewTimer(2 * time.Second)
+	defer pendingTimer.Stop()
 	peers := []*transferPeer{fixture.peer}
 	if err := fixture.transfer.drainQueuedPeerEvents(context.Background(), peers, false); err != nil {
 		t.Fatal(err)
 	}
-	if fixture.peer.deferDrive {
+	for fixture.peer.deferDrive {
 		if err := fixture.transfer.drive(context.Background(), &peers); err != nil {
 			t.Fatal(err)
 		}
 		if active := fixture.transfer.scheduler.peers[fixture.peer.input.ID].active; active != 0 {
 			t.Fatalf("scheduled %d requests before the held reqq update", active)
 		}
-		select {
-		case event := <-fixture.peer.worker.Events():
-			if err := fixture.transfer.handleRunPeerEvent(context.Background(), peers, 0, event, false); err != nil {
-				t.Fatal(err)
+		if fixture.peer.state.ReqQ() != 1 {
+			select {
+			case event := <-fixture.peer.worker.Events():
+				if err := fixture.transfer.handleRunPeerEvent(context.Background(), peers, 0, event, false); err != nil {
+					t.Fatal(err)
+				}
+			case <-pendingTimer.C:
+				t.Fatal("held reqq frame was not delivered")
 			}
-		case <-time.After(2 * time.Second):
-			t.Fatal("held reqq frame was not delivered")
+		} else {
+			// The reader may still be clearing PendingEvent after its frame
+			// was delivered. The next coordinator wake rechecks it.
+			select {
+			case <-tick.C:
+			case <-pendingTimer.C:
+				t.Fatal("delivered reqq retained a pending signal")
+			}
 		}
 		if err := fixture.transfer.drainQueuedPeerEvents(context.Background(), peers, false); err != nil {
 			t.Fatal(err)
