@@ -34,18 +34,75 @@ func TestTrackerWarningsCoalesceRecoverAndKeepFinalFailuresSecondary(t *testing.
 	}}
 	endpoint := "https://user:password@example.test/private?token=secret"
 	failure := &tracker.HTTPError{Code: tracker.HTTPErrorTimeout, Err: errors.New("timeout")}
+	coordinator.observeTracker(tracker.Update{Tracker: endpoint, Phase: tracker.TransferPhase, Err: failure})
 	coordinator.observeTracker(tracker.Update{Tracker: endpoint, Phase: tracker.TransferPhase, Request: tracker.AnnounceRequest{Event: tracker.EventStarted}, Attempted: true, Transmitted: true, Err: failure})
 	coordinator.observeTracker(tracker.Update{Tracker: endpoint, Phase: tracker.TransferPhase, Request: tracker.AnnounceRequest{Event: tracker.EventNone}, Attempted: true, Err: failure})
 	coordinator.observeTracker(tracker.Update{Tracker: endpoint, Phase: tracker.TransferPhase, Request: tracker.AnnounceRequest{Event: tracker.EventNone}, Attempted: true, Activated: true})
+	coordinator.observeTracker(tracker.Update{Tracker: endpoint, Phase: tracker.TransferPhase, Request: tracker.AnnounceRequest{Event: tracker.EventNone}, Attempted: true, Err: failure})
 	coordinator.observeTracker(tracker.Update{Tracker: endpoint, Phase: tracker.TransferPhase, Request: tracker.AnnounceRequest{Event: tracker.EventStopped}, Attempted: true, Transmitted: true, Err: failure})
-	if len(warnings) != 2 || !strings.Contains(warnings[0], "retrying") || !strings.Contains(warnings[1], "recovered") {
+	coordinator.drainTrackerWarnings()
+	if len(warnings) != 3 || !strings.Contains(warnings[0], "retrying") || !strings.Contains(warnings[1], "recovered") || !strings.Contains(warnings[2], "retrying") {
 		t.Fatalf("coalesced failure/recovery warnings = %q", warnings)
 	}
 	if strings.Contains(strings.Join(warnings, " "), "password") || strings.Contains(strings.Join(warnings, " "), "token=secret") {
 		t.Fatalf("tracker warning leaked URL credentials: %q", warnings)
 	}
-	if len(diagnostics) != 4 || !strings.Contains(diagnostics[3].Detail, "stopped attempted, transmitted, response failed, final event") || strings.Contains(diagnostics[3].Detail, "retrying") {
+	hugeURL := "https://user:password@" + strings.Repeat("h", 10_000) + "/private?token=secret"
+	coordinator.observeTracker(tracker.Update{Tracker: hugeURL, Phase: tracker.TransferPhase, Request: tracker.AnnounceRequest{Event: tracker.EventStarted}, Attempted: true, Err: failure})
+	coordinator.drainTrackerWarnings()
+	hugeWarning := warnings[len(warnings)-1]
+	if len(hugeWarning) > 4096 || strings.Contains(hugeWarning, "user") || strings.Contains(hugeWarning, "password") || strings.Contains(hugeWarning, "/private") || strings.Contains(hugeWarning, "token=secret") {
+		t.Fatalf("tracker warning escaped bound/redaction: len=%d text=%q", len(hugeWarning), hugeWarning)
+	}
+	if len(diagnostics) != 6 || !strings.Contains(diagnostics[4].Detail, "stopped attempted, transmitted, response failed, final event") || strings.Contains(diagnostics[4].Detail, "retrying") {
 		t.Fatalf("tracker attempt diagnostics = %+v", diagnostics)
+	}
+}
+
+func TestTrackerWarningDeliveryDoesNotBlockTrackerUpdateCallback(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	coordinator := &coordinator{config: RunConfig{OnWarning: func(string) {
+		close(entered)
+		<-release
+	}}}
+	coordinator.updateQueue = newTrackerPeerUpdateQueue()
+	for i := 0; i < cap(coordinator.updateQueue.events); i++ {
+		coordinator.updateQueue.events <- tracker.Update{}
+	}
+	update := tracker.Update{Tracker: "http://tracker.test/announce", Phase: tracker.TransferPhase,
+		Request: tracker.AnnounceRequest{Event: tracker.EventStarted}, Attempted: true,
+		Err: &tracker.HTTPError{Class: tracker.HTTPFailureTransient, Code: tracker.HTTPErrorTimeout}}
+	callbackDone := make(chan struct{})
+	go func() {
+		coordinator.enqueueUpdate(update)
+		close(callbackDone)
+	}()
+	select {
+	case <-callbackDone:
+	case <-time.After(time.Second):
+		t.Fatal("tracker update callback blocked on warning delivery")
+	}
+	select {
+	case <-entered:
+		t.Fatal("warning callback ran on tracker update callback")
+	default:
+	}
+	drainDone := make(chan struct{})
+	go func() {
+		coordinator.drainTrackerWarnings()
+		close(drainDone)
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("session warning consumer did not deliver warning")
+	}
+	close(release)
+	select {
+	case <-drainDone:
+	case <-time.After(time.Second):
+		t.Fatal("warning consumer did not join")
 	}
 }
 

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/gus-ceraso/Leech/internal/bencode"
+	"github.com/gus-ceraso/Leech/internal/limits"
 	"github.com/gus-ceraso/Leech/internal/peer"
 	"github.com/gus-ceraso/Leech/internal/torrent"
 	"github.com/gus-ceraso/Leech/internal/tracker"
@@ -440,6 +441,28 @@ func TestMetadataDiscoveryRotatesRefusalAndAcceptsRepeatedExtensionID(t *testing
 	}
 	if result.Metainfo.InfoHash != expected {
 		t.Fatalf("info hash = %x, want %x", result.Metainfo.InfoHash, expected)
+	}
+}
+
+func TestTrackerResolverObservesProductionCandidateCapacityReplacement(t *testing.T) {
+	pool, err := peer.NewCandidatePool(peer.CandidatePoolConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	queue := newTrackerPeerUpdateQueue()
+	var replacementCount int
+	resolver := newTrackerPeerResolver(context.Background(), nil, queue, func(event Diagnostic) {
+		if event.Phase == "transfer" && event.Detail == "candidate replaced at capacity" {
+			replacementCount++
+		}
+	})
+	defer resolver.close()
+	for port := 1; port <= limits.Candidates+1; port++ {
+		queue.enqueuePeers(tracker.TransferPhase, []tracker.TrackerPeer{{Host: "127.0.0.1", Port: uint16(port)}})
+		resolver.pump(context.Background(), tracker.TransferPhase, pool)
+	}
+	if pool.Len() != limits.Candidates || replacementCount != 1 {
+		t.Fatalf("candidate pool size=%d replacements=%d, want %d and 1", pool.Len(), replacementCount, limits.Candidates)
 	}
 }
 

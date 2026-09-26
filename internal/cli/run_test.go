@@ -209,11 +209,14 @@ func TestRunWithSessionReportsRedactedProductionTrackerFailure(t *testing.T) {
 		t.Fatal("session did not join after cancellation")
 	}
 	got := stderr.String()
-	if !strings.Contains(got, "warning: tracker http://[2001:db8::1]:8080 tracker failure; retrying") {
+	if !strings.Contains(got, "warning: tracker http://[2001:db8::1]:8080 failure; retrying") {
 		t.Fatalf("tracker warning missing safe endpoint: %q", got)
 	}
 	if !strings.Contains(got, "debug: tracker attempt phase=transfer") || !strings.Contains(got, "retrying: transaction failed") {
 		t.Fatalf("tracker debug detail missing: %q", got)
+	}
+	if !strings.Contains(got, "stopped attempted, transmitted, response failed, final event") || strings.Contains(got, "stopped attempted, transmitted, response failed, retrying") {
+		t.Fatalf("final tracker failure was not distinguished: %q", got)
 	}
 	for _, secret := range []string{"user", "password", "/private", "token=secret"} {
 		if strings.Contains(got, secret) {

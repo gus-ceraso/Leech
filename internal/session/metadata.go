@@ -512,6 +512,7 @@ type trackerPeerResolver struct {
 	cancel       context.CancelFunc
 	resolver     peer.Resolver
 	onDiagnostic func(Diagnostic)
+	onPump       func()
 	queue        *trackerPeerUpdateQueue
 	jobs         chan *queuedTrackerPeer
 	results      chan trackerResolveResult
@@ -582,7 +583,12 @@ func (a *trackerPeerResolver) pump(ctx context.Context, phase tracker.Phase, poo
 		return 0
 	}
 	a.mu.Lock()
-	defer a.mu.Unlock()
+	defer func() {
+		a.mu.Unlock()
+		if a.onPump != nil {
+			a.onPump()
+		}
+	}()
 	work := 0
 	for work < trackerResolverWorkers {
 		select {
@@ -789,6 +795,7 @@ type MetadataConfig struct {
 	Now            func() time.Time
 	OnSecondary    func(error)
 	OnDiagnostic   func(Diagnostic)
+	onTrackerPump  func()
 
 	// OnStrike observes a completed, hash-invalid candidate. It is called once
 	// per invalid candidate, after the endpoint strike count is incremented.
@@ -989,6 +996,9 @@ func (d *MetadataDiscovery) Run(ctx context.Context) (result MetadataResult, pri
 		run.Wait()
 		resolver.close()
 		updateQueue.clear()
+		if config.onTrackerPump != nil {
+			config.onTrackerPump()
+		}
 		finalErr := run.Finalize(context.Background(), false)
 		run = nil
 		if finalErr != nil && config.OnSecondary != nil {
@@ -1007,6 +1017,7 @@ func (d *MetadataDiscovery) Run(ctx context.Context) (result MetadataResult, pri
 		return MetadataResult{}, err
 	}
 	resolver = newTrackerPeerResolver(phaseCtx, config.Resolver, updateQueue, config.OnDiagnostic)
+	resolver.onPump = config.onTrackerPump
 
 	strikes := make(map[peer.Endpoint]uint8)
 	for {

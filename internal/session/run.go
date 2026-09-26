@@ -17,6 +17,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/gus-ceraso/Leech/internal/limits"
 	"github.com/gus-ceraso/Leech/internal/peer"
 	"github.com/gus-ceraso/Leech/internal/storage"
 	"github.com/gus-ceraso/Leech/internal/torrent"
@@ -453,6 +454,7 @@ type coordinator struct {
 	strikes           map[peer.Endpoint]int
 	trackerDiagMu     sync.Mutex
 	trackerFailed     map[string]bool
+	pendingWarnings   []trackerWarningEvent
 	overflow          atomic.Bool
 }
 
@@ -532,6 +534,7 @@ func (c *coordinator) enqueueUpdate(update tracker.Update) {
 	}
 	if err := c.updateQueue.enqueue(update); err != nil {
 		c.overflow.Store(true)
+		c.updateQueue.signal()
 	}
 }
 
@@ -553,6 +556,8 @@ func (c *coordinator) observeTracker(update tracker.Update) {
 			event.Detail += ", response failed"
 			if finalEvent {
 				event.Detail += ", final event"
+			} else if errors.Is(update.Err, context.Canceled) {
+				event.Detail += ", canceled"
 			} else if update.Disabled {
 				event.Detail += ", disabled"
 			} else {
@@ -562,19 +567,7 @@ func (c *coordinator) observeTracker(update tracker.Update) {
 		}
 		c.diagnostic(event)
 	}
-	if finalEvent {
-		return
-	}
-	if update.Err == nil {
-		c.trackerDiagMu.Lock()
-		wasFailed := c.trackerFailed[update.Tracker]
-		if wasFailed {
-			delete(c.trackerFailed, update.Tracker)
-		}
-		c.trackerDiagMu.Unlock()
-		if wasFailed && c.config.OnWarning != nil {
-			c.config.OnWarning("tracker " + endpoint.Scheme + "://" + endpoint.Host + " recovered")
-		}
+	if finalEvent || !update.Attempted || c.config.OnWarning == nil || errors.Is(update.Err, context.Canceled) {
 		return
 	}
 	c.trackerDiagMu.Lock()
@@ -582,23 +575,92 @@ func (c *coordinator) observeTracker(update tracker.Update) {
 		c.trackerFailed = make(map[string]bool)
 	}
 	wasFailed := c.trackerFailed[update.Tracker]
-	c.trackerFailed[update.Tracker] = true
+	if update.Err == nil {
+		if wasFailed {
+			delete(c.trackerFailed, update.Tracker)
+			c.queueTrackerWarningLocked(update.Tracker, false, false)
+		}
+	} else if !wasFailed {
+		c.trackerFailed[update.Tracker] = true
+		c.queueTrackerWarningLocked(update.Tracker, true, update.Disabled)
+	}
 	c.trackerDiagMu.Unlock()
-	if wasFailed {
+}
+
+type trackerWarningEvent struct {
+	tracker  string
+	failure  bool
+	disabled bool
+}
+
+func (c *coordinator) queueTrackerWarningLocked(trackerURL string, failure, disabled bool) {
+	count, last := 0, -1
+	for i := range c.pendingWarnings {
+		if c.pendingWarnings[i].tracker == trackerURL {
+			count++
+			last = i
+		}
+	}
+	if last >= 0 && c.pendingWarnings[last].failure == failure {
+		if failure {
+			c.pendingWarnings[last].disabled = disabled
+		}
 		return
 	}
-	detail := "tracker failure"
-	if update.Disabled {
-		detail += "; disabled"
-	} else {
-		detail += "; retrying"
+	if count >= 3 {
+		c.pendingWarnings[last] = trackerWarningEvent{tracker: trackerURL, failure: failure, disabled: disabled}
+		return
 	}
-	if update.Err != nil {
-		detail += ": " + trackerFailureDetail(update.Err)
+	const maxPendingWarnings = 3 * limits.Trackers
+	if len(c.pendingWarnings) < maxPendingWarnings {
+		c.pendingWarnings = append(c.pendingWarnings, trackerWarningEvent{tracker: trackerURL, failure: failure, disabled: disabled})
 	}
-	if c.config.OnWarning != nil {
-		c.config.OnWarning("tracker " + endpoint.Scheme + "://" + endpoint.Host + " " + detail)
+}
+
+func (c *coordinator) drainTrackerWarnings() {
+	if c == nil || c.config.OnWarning == nil {
+		return
 	}
+	for {
+		c.trackerDiagMu.Lock()
+		if len(c.pendingWarnings) == 0 {
+			c.trackerDiagMu.Unlock()
+			return
+		}
+		event := c.pendingWarnings[0]
+		copy(c.pendingWarnings, c.pendingWarnings[1:])
+		c.pendingWarnings[len(c.pendingWarnings)-1] = trackerWarningEvent{}
+		c.pendingWarnings = c.pendingWarnings[:len(c.pendingWarnings)-1]
+		c.trackerDiagMu.Unlock()
+		endpoint := diagnosticTrackerEndpoint(event.tracker)
+		detail := "recovered"
+		if event.failure {
+			detail = "failure; retrying"
+			if event.disabled {
+				detail = "failure; disabled"
+			}
+		}
+		c.config.OnWarning(boundedTrackerWarning(endpoint, detail))
+	}
+}
+
+func boundedTrackerWarning(endpoint DiagnosticEndpoint, detail string) string {
+	const maxBytes = 4096
+	prefix, schemeSep, suffix := "tracker ", "://", " "+detail
+	remaining := maxBytes - len(prefix) - len(schemeSep) - len(suffix)
+	if remaining < 0 {
+		remaining = 0
+	}
+	scheme := endpoint.Scheme
+	if len(scheme) > remaining {
+		scheme = scheme[:remaining]
+	}
+	remaining -= len(scheme)
+	host := endpoint.Host
+	if len(host) > remaining {
+		host = host[:remaining]
+	}
+	return prefix + scheme + schemeSep + host + suffix
 }
 
 func trackerFailureDetail(err error) string {
@@ -683,7 +745,7 @@ func (c *coordinator) discover(ctx context.Context, source torrent.Source) (torr
 		TrackerClock: c.config.TrackerClock, Resolver: c.config.Resolver,
 		TCPDial: c.tcpDial(), UTPDial: c.utpDial(), Clock: c.config.RaceClock,
 		UTPHeadStart: c.config.UTPHeadStart, Backoff: c.backoff,
-		LocalHandshake: local, OnSecondary: c.config.OnSecondary, OnDiagnostic: c.config.OnDiagnostic, OnStrike: func(endpoint peer.Endpoint, count uint8) {
+		LocalHandshake: local, OnSecondary: c.config.OnSecondary, OnDiagnostic: c.config.OnDiagnostic, onTrackerPump: c.drainTrackerWarnings, OnStrike: func(endpoint peer.Endpoint, count uint8) {
 			strikes[endpoint] = int(count)
 		},
 	})
@@ -765,12 +827,14 @@ func (c *coordinator) startTransferPhase(ctx context.Context, source torrent.Sou
 		return err
 	}
 	admission := newTrackerPeerResolver(runCtx, c.config.Resolver, c.updateQueue, c.config.OnDiagnostic)
+	admission.onPump = c.drainTrackerWarnings
 	defer c.updateQueue.clear()
 	quiesceAdmission := func() {
 		cancel()
 		trackerRun.Wait()
 		admission.close()
 		c.updateQueue.clear()
+		c.drainTrackerWarnings()
 	}
 	var liveMu sync.Mutex
 	live := make(map[net.Conn]*peer.LivePeer)
