@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"net/netip"
 	"net/url"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -104,6 +105,32 @@ func TestHTTPAnnounceLimitsRedirects(t *testing.T) {
 	defer mu.Unlock()
 	if requests != 10 {
 		t.Fatalf("redirect loop sent %d requests, want 10", requests)
+	}
+}
+
+func TestHTTPSanitizeQueryPreservesUnrelatedRawTokens(t *testing.T) {
+	raw := "u=%2F%2f&u=+&%69nfo_hash=old&&i%70=bad&x=%ZZ&&"
+	got := sanitizeHTTPURL(&url.URL{RawQuery: raw}, testRequest()).RawQuery
+	if !strings.HasPrefix(got, "u=%2F%2f&u=+&&x=%ZZ&&&info_hash=") {
+		t.Fatalf("unrelated raw query tokens changed: %q", got)
+	}
+	if countQueryKey(got, "info_hash") != 1 || countQueryKey(got, "ip") != 0 {
+		t.Fatalf("owned query keys survived: %q", got)
+	}
+}
+
+func TestHTTPSanitizeDelimiterHeavyQueryMemoryBound(t *testing.T) {
+	raw := strings.Repeat("&", 1<<20)
+	runtime.GC()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	got := sanitizeHTTPURL(&url.URL{RawQuery: raw}, testRequest())
+	runtime.ReadMemStats(&after)
+	if !strings.HasPrefix(got.RawQuery, raw+"&info_hash=") {
+		t.Fatal("delimiter-heavy query was not preserved")
+	}
+	if allocated := after.TotalAlloc - before.TotalAlloc; allocated > 4<<20 {
+		t.Fatalf("sanitizing 1 MiB of delimiters allocated %d bytes, want at most 4 MiB", allocated)
 	}
 }
 
@@ -369,6 +396,45 @@ func TestHTTPAnnounceBEP31RetryClasses(t *testing.T) {
 	var httpErr *HTTPError
 	if !errors.As(err, &httpErr) || httpErr.Class != HTTPFailureDefinitive || httpErr.StatusCode != http.StatusNotFound {
 		t.Fatalf("404 error = %+v", httpErr)
+	}
+}
+
+func TestHTTPAnnounce404BodyErrorsAreDefinitive(t *testing.T) {
+	cases := []struct {
+		name     string
+		body     func(http.ResponseWriter)
+		wantCode HTTPErrorCode
+	}{
+		{
+			name: "oversized",
+			body: func(w http.ResponseWriter) {
+				w.WriteHeader(http.StatusNotFound)
+				_, _ = io.WriteString(w, strings.Repeat("x", limits.HTTPResponseBytes+1))
+			},
+			wantCode: HTTPErrorBodyLimit,
+		},
+		{
+			name: "read error",
+			body: func(w http.ResponseWriter) {
+				w.Header().Set("Content-Length", "4")
+				w.WriteHeader(http.StatusNotFound)
+				_, _ = io.WriteString(w, "x")
+			},
+			wantCode: HTTPErrorResponse,
+		},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				test.body(w)
+			}))
+			defer server.Close()
+			result, err := NewHTTPClient(HTTPConfig{}).Announce(context.Background(), server.URL, testRequest())
+			var httpErr *HTTPError
+			if !errors.As(err, &httpErr) || httpErr.Code != test.wantCode || httpErr.Class != HTTPFailureDefinitive || httpErr.StatusCode != http.StatusNotFound || !httpErr.Transmitted || !result.Transmitted {
+				t.Fatalf("result=%+v error=%+v, want definitive 404 %s", result, httpErr, test.wantCode)
+			}
+		})
 	}
 }
 

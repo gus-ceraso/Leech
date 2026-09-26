@@ -215,7 +215,11 @@ func (c *HTTPClient) Announce(ctx context.Context, trackerURL string, announce A
 	defer response.Body.Close()
 	body, readErr := readHTTPBody(response.Body)
 	if readErr != nil {
-		return result, &HTTPError{Code: bodyErrorCode(readErr), Class: HTTPFailureTransient, StatusCode: response.StatusCode, Transmitted: result.Transmitted, Err: readErr}
+		class := HTTPFailureTransient
+		if response.StatusCode >= 400 && response.StatusCode < 500 {
+			class = HTTPFailureDefinitive
+		}
+		return result, &HTTPError{Code: bodyErrorCode(readErr), Class: class, StatusCode: response.StatusCode, Transmitted: result.Transmitted, Err: readErr}
 	}
 
 	parsed, parseErr := parseHTTPAnnounceResponse(body)
@@ -257,36 +261,68 @@ func parseHTTPURL(raw string) (*url.URL, error) {
 // unchanged. This function is reused for every redirect target.
 func sanitizeHTTPURL(input *url.URL, announce AnnounceRequest) *url.URL {
 	u := *input
-	parts := make([]string, 0, strings.Count(input.RawQuery, "&")+11)
-	if input.RawQuery != "" {
-		for _, part := range strings.Split(input.RawQuery, "&") {
-			key := part
-			if index := strings.IndexByte(key, '='); index >= 0 {
-				key = key[:index]
-			}
-			decoded, err := url.QueryUnescape(key)
-			if err == nil && isOwnedHTTPParameter(decoded) {
-				continue
-			}
-			parts = append(parts, part)
+	var query strings.Builder
+	query.Grow(len(input.RawQuery) + 512)
+	first := true
+	for start := 0; input.RawQuery != "" && start <= len(input.RawQuery); {
+		end := strings.IndexByte(input.RawQuery[start:], '&')
+		if end < 0 {
+			end = len(input.RawQuery)
+		} else {
+			end += start
 		}
+		part := input.RawQuery[start:end]
+		key := part
+		if end := strings.IndexByte(key, '='); end >= 0 {
+			key = key[:end]
+		}
+		if !isOwnedRawHTTPParameter(key) {
+			if !first {
+				query.WriteByte('&')
+			}
+			query.WriteString(part)
+			first = false
+		}
+		if end == len(input.RawQuery) {
+			break
+		}
+		start = end + 1
 	}
-	parts = append(parts,
-		"info_hash="+escapeBinary(announce.InfoHash[:]),
-		"peer_id="+escapeBinary(announce.PeerID[:]),
-		"port="+strconv.FormatUint(uint64(announce.Port), 10),
-		"uploaded="+strconv.FormatInt(announce.Uploaded, 10),
-		"downloaded="+strconv.FormatInt(announce.Downloaded, 10),
-		"left="+strconv.FormatInt(announce.Left, 10),
+	fields := [...]string{
+		"info_hash=" + escapeBinary(announce.InfoHash[:]),
+		"peer_id=" + escapeBinary(announce.PeerID[:]),
+		"port=" + strconv.FormatUint(uint64(announce.Port), 10),
+		"uploaded=" + strconv.FormatInt(announce.Uploaded, 10),
+		"downloaded=" + strconv.FormatInt(announce.Downloaded, 10),
+		"left=" + strconv.FormatInt(announce.Left, 10),
 		"compact=1",
-		"key="+strconv.FormatUint(uint64(announce.Key), 10),
-		"numwant="+strconv.FormatInt(int64(announce.NumWant), 10),
-	)
-	if announce.Event != EventNone {
-		parts = append(parts, "event="+eventName(announce.Event))
+		"key=" + strconv.FormatUint(uint64(announce.Key), 10),
+		"numwant=" + strconv.FormatInt(int64(announce.NumWant), 10),
 	}
-	u.RawQuery = strings.Join(parts, "&")
+	for _, field := range fields {
+		if !first {
+			query.WriteByte('&')
+		}
+		query.WriteString(field)
+		first = false
+	}
+	if announce.Event != EventNone {
+		query.WriteString("&event=")
+		query.WriteString(eventName(announce.Event))
+	}
+	u.RawQuery = query.String()
 	return &u
+}
+
+func isOwnedRawHTTPParameter(key string) bool {
+	if len(key) > 3*len("downloaded") {
+		return false
+	}
+	if strings.IndexByte(key, '%') < 0 {
+		return isOwnedHTTPParameter(key)
+	}
+	decoded, err := url.QueryUnescape(key)
+	return err == nil && isOwnedHTTPParameter(decoded)
 }
 
 func isOwnedHTTPParameter(key string) bool {
