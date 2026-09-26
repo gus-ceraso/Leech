@@ -131,13 +131,17 @@ type DiagnosticEndpoint struct {
 	Host   string
 }
 
-// Diagnostic is a fixed-field observation. Text fields retained by a CLI
-// observer are bounded to 4096 aggregate bytes per record; queues are bounded
-// independently by the observer. Counts and durations remain typed values.
+// Diagnostic is a fixed-field observation. Peer is a resolved numeric endpoint
+// (netip.Addr and uint16 port); it is zero when not peer-specific or when the
+// address has a zone.
+// Text fields retained by a CLI observer are bounded to 4096 aggregate bytes
+// per record; queues are bounded independently by the observer. Counts and
+// durations remain typed values.
 type Diagnostic struct {
 	Kind     DiagnosticKind
 	Phase    string
 	Endpoint DiagnosticEndpoint
+	Peer     peer.Endpoint
 	Count    uint64
 	Duration time.Duration
 	Detail   string

@@ -2,9 +2,11 @@ package cli
 
 import (
 	"bytes"
+	"net/netip"
 	"strings"
 	"testing"
 
+	"github.com/gus-ceraso/Leech/internal/peer"
 	"github.com/gus-ceraso/Leech/internal/session"
 )
 
@@ -67,6 +69,45 @@ func TestDiagnosticQueueBoundsRedactsAndDrops(t *testing.T) {
 		if len(strings.TrimPrefix(line, "debug: ")) > DefaultDiagnosticBytes {
 			t.Fatalf("rendered diagnostic exceeded %d bytes: %d", DefaultDiagnosticBytes, len(line))
 		}
+	}
+}
+
+func TestDiagnosticQueueRetainsAndRendersTypedPeerEndpoint(t *testing.T) {
+	queue := newDiagnosticQueue()
+	endpoint := peer.Endpoint{Addr: netip.MustParseAddr("2001:db8::1"), Port: 51413}
+	queue.enqueue(session.Diagnostic{Kind: session.DiagnosticPhaseTransition, Phase: "transfer", Peer: endpoint})
+	retained := <-queue.records
+	if retained.Peer != endpoint {
+		t.Fatalf("queued peer endpoint = %+v, want %+v", retained.Peer, endpoint)
+	}
+
+	var output bytes.Buffer
+	reporter := NewReporter(LogDebug, &output)
+	renderDiagnostic(reporter, retained)
+	if got, want := output.String(), "debug: session phase=transfer peer=[2001:db8::1]:51413\n"; got != want {
+		t.Fatalf("rendered peer endpoint = %q, want %q", got, want)
+	}
+
+	output.Reset()
+	renderDiagnostic(reporter, session.Diagnostic{Kind: session.DiagnosticPhaseTransition, Phase: "metadata"})
+	if strings.Contains(output.String(), "peer=") {
+		t.Fatalf("absent peer endpoint was rendered: %q", output.String())
+	}
+	output.Reset()
+	zoned := session.Diagnostic{Kind: session.DiagnosticPhaseTransition, Phase: "transfer", Peer: peer.Endpoint{Addr: netip.MustParseAddr("fe80::1%eth0"), Port: 51413}}
+	queue.enqueue(zoned)
+	retained = <-queue.records
+	if retained.Peer != (peer.Endpoint{}) {
+		t.Fatalf("queue retained zoned peer endpoint: %+v", retained.Peer)
+	}
+	renderDiagnostic(reporter, retained)
+	if strings.Contains(output.String(), "peer=") || strings.Contains(output.String(), "eth0") {
+		t.Fatalf("zoned peer endpoint was rendered: %q", output.String())
+	}
+	queue.enqueue(session.Diagnostic{Kind: session.DiagnosticPhaseTransition, Phase: "transfer", Peer: peer.Endpoint{Port: 51413}})
+	retained = <-queue.records
+	if retained.Peer != (peer.Endpoint{}) || formatDiagnosticPeer(retained.Peer) != "" {
+		t.Fatalf("queue retained invalid peer endpoint: %+v", retained.Peer)
 	}
 }
 

@@ -41,13 +41,18 @@ piece/request state, and `transfer.go` coordinates peer I/O and finalization.
   other errors terminate transfer. Advance the candidate cursor only for examined
   candidates, preserving it across tracker notifications.
 - `RunConfig.OnDiagnostic` is optional and separate from progress, warnings, and
-  secondary failures. Its value is `Diagnostic{Kind, Phase, Endpoint{Scheme,
-  Host}, Count uint64, Duration time.Duration, Detail}`; kinds are constants,
-  with `DiagnosticPhaseTransition` currently emitted at `coordinator.phase`.
-  Producers must return promptly and retain no more than 4096 aggregate text
-  bytes per record. Tracker endpoints contain scheme/host only; never put URLs,
-  errors, payload, or magnet sources in diagnostics. The CLI owns a 128-record
-  nonblocking queue and drops debug records on pressure.
+  secondary failures. Its exact value shape is
+  `Diagnostic{Kind DiagnosticKind, Phase string, Endpoint DiagnosticEndpoint,
+  Peer peer.Endpoint, Count uint64, Duration time.Duration, Detail string}`;
+  `DiagnosticEndpoint` is `{Scheme, Host string}` and peer endpoint is the fixed
+  `netip.Addr` plus `uint16` port (`peer.Endpoint`), zero when not applicable
+  or when the address has a zone.
+  Kinds are constants, with `DiagnosticPhaseTransition` currently emitted at
+  `coordinator.phase`. CLI-retained Phase/Detail/tracker text totals at most 4096
+  bytes per record; a numeric peer renders to at most 47 bytes. CLI queue holds
+  128 records. Producers must return promptly. Tracker endpoints contain
+  scheme/host only; never put URLs, errors, payload, or magnet sources in
+  diagnostics. The CLI drops debug records on pressure.
 - The coordinator alone mutates rarity, request ownership, provenance, strikes,
   and completion. Give the finalizer immutable coverage snapshots. Worker
   callbacks and command enqueueing must not stall coordination indefinitely.

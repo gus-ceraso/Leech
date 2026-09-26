@@ -3,11 +3,14 @@ package cli
 import (
 	"fmt"
 	"math"
+	"net"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
 
+	"github.com/gus-ceraso/Leech/internal/peer"
 	"github.com/gus-ceraso/Leech/internal/session"
 )
 
@@ -36,6 +39,9 @@ func (q *diagnosticQueue) enqueue(record session.Diagnostic) {
 	}
 	record.Phase = bounded(record.Phase)
 	record.Detail = bounded(record.Detail)
+	if !record.Peer.Addr.IsValid() || record.Peer.Port == 0 || record.Peer.Addr.Zone() != "" {
+		record.Peer = peer.Endpoint{}
+	}
 	if record.Endpoint.Scheme != "" || record.Endpoint.Host != "" {
 		raw := (&url.URL{Scheme: record.Endpoint.Scheme, Host: record.Endpoint.Host}).String()
 		tracker := RedactTrackerURL(raw)
@@ -66,6 +72,9 @@ func renderDiagnostic(reporter *Reporter, diagnostic session.Diagnostic) {
 	if diagnostic.Endpoint.Host != "" {
 		fields = append(fields, "tracker="+diagnostic.Endpoint.Scheme+"://"+diagnostic.Endpoint.Host)
 	}
+	if endpoint := formatDiagnosticPeer(diagnostic.Peer); endpoint != "" {
+		fields = append(fields, "peer="+endpoint)
+	}
 	if diagnostic.Count != 0 {
 		fields = append(fields, fmt.Sprintf("count=%d", diagnostic.Count))
 	}
@@ -80,4 +89,13 @@ func renderDiagnostic(reporter *Reporter, diagnostic session.Diagnostic) {
 		message += " " + strings.Join(fields, " ")
 	}
 	_ = reporter.Debug("%s", message)
+}
+
+// formatDiagnosticPeer accepts only normalized numeric addresses without zones.
+// Its output is at most 47 ASCII bytes: bracketed IPv6 plus a 16-bit port.
+func formatDiagnosticPeer(endpoint peer.Endpoint) string {
+	if !endpoint.Addr.IsValid() || endpoint.Addr.Zone() != "" || endpoint.Port == 0 {
+		return ""
+	}
+	return net.JoinHostPort(endpoint.Addr.String(), strconv.Itoa(int(endpoint.Port)))
 }
