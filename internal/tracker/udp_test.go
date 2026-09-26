@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -725,48 +726,131 @@ func TestUDPRotatingEndpointsRetainBoundedSessions(t *testing.T) {
 }
 
 func TestUDPTransactionLockWaiterKeepsSessionFromEviction(t *testing.T) {
-	client := NewUDPClient(Config{})
-	endpoint := netip.MustParseAddrPort("192.0.2.1:1")
+	endpoint := netip.MustParseAddrPort("127.0.0.1:1")
+	var conn *fixtureConn
+	conn = newFixtureConn(func(packet []byte) {
+		switch binary.BigEndian.Uint32(packet[8:12]) {
+		case 0:
+			conn.push(connectResponse(packet, 1))
+		case 1:
+			conn.push(announceResponse(packet))
+		}
+	})
+	resolved := make(chan struct{}, 2)
+	client := NewUDPClient(Config{
+		Resolver: fixtureResolverFunc(func(context.Context, string) ([]net.IPAddr, error) {
+			resolved <- struct{}{}
+			return []net.IPAddr{{IP: net.ParseIP("127.0.0.1")}}, nil
+		}),
+		Dialer: fixtureDialer{conn: conn},
+		Clock:  newFixtureClock(),
+	})
+	defer client.Close()
+	trackerURL := "udp://tracker.test:1"
+	if _, err := client.Announce(context.Background(), trackerURL, testRequest()); err != nil {
+		t.Fatal(err)
+	}
+	<-resolved
 	key := sessionKey(&udpSession{endpoint: endpoint})
-	active, err := client.acquireSession(context.Background(), key, endpoint)
-	if err != nil {
-		t.Fatal(err)
+	client.mu.Lock()
+	active := client.sessions[key]
+	client.mu.Unlock()
+	if active == nil {
+		t.Fatal("successful announce did not retain its session")
 	}
-	waiter, err := client.acquireSession(context.Background(), key, endpoint)
-	if err != nil {
-		t.Fatal(err)
+
+	// Hold the real transaction lock while another production Announce call
+	// acquires a session reference and blocks on that lock.
+	active.mu.Lock()
+	waiterCtx, cancelWaiter := context.WithCancel(context.Background())
+	defer cancelWaiter()
+	waiterDone := make(chan error, 1)
+	go func() {
+		_, err := client.Announce(waiterCtx, trackerURL, testRequest())
+		waiterDone <- err
+	}()
+	select {
+	case <-resolved:
+	case <-time.After(time.Second):
+		active.mu.Unlock()
+		cancelWaiter()
+		<-waiterDone
+		t.Fatal("waiting announce did not resolve")
 	}
+	deadline := time.NewTimer(time.Second)
+	defer deadline.Stop()
+	for {
+		client.mu.Lock()
+		users := active.users
+		client.mu.Unlock()
+		if users == 1 {
+			break
+		}
+		select {
+		case <-deadline.C:
+			active.mu.Unlock()
+			cancelWaiter()
+			err := <-waiterDone
+			if err != nil {
+				t.Fatalf("announce returned before reserving the held transaction lock: %v", err)
+			}
+			t.Fatal("announce did not reserve the session before waiting for its transaction lock")
+		default:
+			runtime.Gosched()
+		}
+	}
+
+	// Fill every remaining slot; exactly one unrelated session is then made
+	// evictable to apply endpoint pressure while the announce waits on active.mu.
 	var retained []*udpSession
-	for i := 0; i < udpSessionCapacity-2; i++ {
+	for i := 0; i < udpSessionCapacity-1; i++ {
 		addr := netip.AddrPortFrom(netip.AddrFrom4([4]byte{10, byte(i), 0, 1}), 1)
 		s, err := client.acquireSession(context.Background(), sessionKey(&udpSession{endpoint: addr}), addr)
 		if err != nil {
+			active.mu.Unlock()
+			cancelWaiter()
+			<-waiterDone
 			t.Fatal(err)
 		}
 		retained = append(retained, s)
 	}
-	spareEndpoint := netip.MustParseAddrPort("192.0.2.254:1")
-	spare, err := client.acquireSession(context.Background(), sessionKey(&udpSession{endpoint: spareEndpoint}), spareEndpoint)
-	if err != nil {
-		t.Fatal(err)
-	}
-	client.releaseSession(active)
-	client.releaseSession(spare)
-
+	client.releaseSession(retained[len(retained)-1])
 	target := netip.MustParseAddrPort("198.51.100.1:1")
-	got, err := client.acquireSession(context.Background(), sessionKey(&udpSession{endpoint: target}), target)
+	pressure, err := client.acquireSession(context.Background(), sessionKey(&udpSession{endpoint: target}), target)
 	if err != nil {
+		active.mu.Unlock()
+		cancelWaiter()
+		<-waiterDone
 		t.Fatal(err)
 	}
-	if client.sessions[key] != waiter || waiter.users != 1 {
-		t.Fatal("session with a transaction-lock waiter was evicted")
+	client.mu.Lock()
+	stillRetained := client.sessions[key] == active && active.users == 1
+	client.mu.Unlock()
+	select {
+	case <-conn.closed:
+		stillRetained = false
+	default:
 	}
-	client.releaseSession(waiter)
-	client.releaseSession(got)
-	for _, s := range retained {
+
+	active.mu.Unlock()
+	var waiterErr error
+	select {
+	case waiterErr = <-waiterDone:
+	case <-time.After(time.Second):
+		_ = client.Close()
+		<-waiterDone
+		t.Fatal("waiting announce did not complete after lock release")
+	}
+	if waiterErr != nil {
+		t.Fatalf("waiting announce: %v", waiterErr)
+	}
+	if !stillRetained {
+		t.Fatal("active session or socket was retired while its transaction-lock waiter owned it")
+	}
+	client.releaseSession(pressure)
+	for _, s := range retained[:len(retained)-1] {
 		client.releaseSession(s)
 	}
-	_ = client.Close()
 }
 
 func TestUDPRetiringEndpointWaitsForSocketClose(t *testing.T) {
@@ -935,32 +1019,78 @@ func TestUDPCloseRacingSocketEviction(t *testing.T) {
 }
 
 func TestUDPFailedAnnounceReleasesCapacityForReuse(t *testing.T) {
-	var attempts atomic.Int32
 	client := NewUDPClient(Config{
 		Resolver: fixtureResolver{ips: []net.IPAddr{{IP: net.ParseIP("127.0.0.1")}}},
 		Dialer: fixtureDialFunc(func(context.Context, string, string) (net.Conn, error) {
-			if attempts.Add(1) == 1 {
-				return nil, errors.New("injected dial failure")
-			}
-			return newFixtureConn(nil), nil
+			return nil, errors.New("injected dial failure")
 		}),
 		Clock: newFixtureClock(),
 	})
+	defer client.Close()
 	if _, err := client.Announce(context.Background(), "udp://tracker.test:1", testRequest()); err == nil {
 		t.Fatal("announce unexpectedly succeeded after injected dial failure")
 	}
-	for i := 0; i < udpSessionCapacity; i++ {
+	failedEndpoint := netip.MustParseAddrPort("127.0.0.1:1")
+	failedKey := sessionKey(&udpSession{endpoint: failedEndpoint})
+	client.mu.Lock()
+	failed := client.sessions[failedKey]
+	users := 0
+	if failed != nil {
+		users = failed.users
+	}
+	client.mu.Unlock()
+	if failed == nil || users != 0 {
+		t.Fatalf("failed announce session = %p, users = %d; want retained and unused", failed, users)
+	}
+
+	// Keep every other cache entry busy. Capacity can be recovered only if the
+	// failed announce released its own reservation and that exact entry retires.
+	busy := make([]*udpSession, 0, udpSessionCapacity-1)
+	for i := 0; i < udpSessionCapacity-1; i++ {
 		endpoint := netip.AddrPortFrom(netip.AddrFrom4([4]byte{10, byte(i), 0, 1}), 1)
 		s, err := client.acquireSession(context.Background(), sessionKey(&udpSession{endpoint: endpoint}), endpoint)
 		if err != nil {
-			t.Fatalf("acquire after failed announce at %d: %v", i, err)
+			t.Fatalf("fill capacity after failed announce at %d: %v", i, err)
 		}
+		busy = append(busy, s)
+	}
+	target := netip.MustParseAddrPort("192.0.2.90:1")
+	ctx := newSignaledContext()
+	type acquired struct {
+		s   *udpSession
+		err error
+	}
+	result := make(chan acquired, 1)
+	go func() {
+		s, err := client.acquireSession(ctx, sessionKey(&udpSession{endpoint: target}), target)
+		result <- acquired{s, err}
+	}()
+	var got *udpSession
+	select {
+	case value := <-result:
+		if value.err != nil {
+			t.Fatalf("capacity recovery: %v", value.err)
+		}
+		got = value.s
+	case <-ctx.entered:
+		ctx.cancel()
+		<-result
+		t.Fatal("failed announce reservation remained busy while every other session was in use")
+	case <-time.After(time.Second):
+		ctx.cancel()
+		<-result
+		t.Fatal("capacity recovery did not finish")
+	}
+	client.mu.Lock()
+	stillMapped := client.sessions[failedKey] == failed
+	client.mu.Unlock()
+	if stillMapped {
+		t.Fatal("failed announce session was not the entry retired to recover capacity")
+	}
+	client.releaseSession(got)
+	for _, s := range busy {
 		client.releaseSession(s)
 	}
-	if len(client.sessions) != udpSessionCapacity {
-		t.Fatalf("cache size after failure recovery = %d", len(client.sessions))
-	}
-	_ = client.Close()
 }
 
 func TestUDPBusySessionCapacityWaitIsCancelableAndCloseWakes(t *testing.T) {
