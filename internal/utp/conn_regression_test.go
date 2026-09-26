@@ -5,8 +5,11 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"net"
 	"os"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
 )
@@ -189,9 +192,9 @@ func TestConnReadDeadlineChangesWhileBlocked(t *testing.T) {
 	for _, mode := range []string{"shortened", "extended", "cleared"} {
 		t.Run(mode, func(t *testing.T) {
 			f := newWriteFixture(t)
-			initial := time.Now().Add(3 * time.Second)
-			if mode != "shortened" {
-				initial = time.Now().Add(120 * time.Millisecond)
+			initial := time.Now().Add(300 * time.Millisecond)
+			if mode == "shortened" {
+				initial = time.Now().Add(3 * time.Second)
 			}
 			if err := f.conn.SetReadDeadline(initial); err != nil {
 				t.Fatal(err)
@@ -202,23 +205,29 @@ func TestConnReadDeadlineChangesWhileBlocked(t *testing.T) {
 				data []byte
 			}
 			result := make(chan readResult, 1)
+			readID := make(chan uint64, 1)
 			want := []byte("read after deadline change")
 			go func() {
+				var stack [64]byte
+				nstack := runtime.Stack(stack[:], false)
+				var id uint64
+				if _, err := fmt.Sscanf(string(stack[:nstack]), "goroutine %d ", &id); err != nil {
+					panic(err)
+				}
+				readID <- id
 				buf := make([]byte, len(want))
 				n, err := f.conn.Read(buf)
 				result <- readResult{n: n, err: err, data: buf}
 			}()
-			var next time.Time
-			switch mode {
-			case "shortened":
-				next = time.Now().Add(80 * time.Millisecond)
-			case "extended":
-				next = initial.Add(time.Second)
-			}
-			if err := f.conn.SetReadDeadline(next); err != nil {
-				t.Fatal(err)
-			}
+			id := <-readID
+			waitForReadStack(t, id, true)
+
 			if mode == "shortened" {
+				next := time.Now().Add(80 * time.Millisecond)
+				if err := f.conn.SetReadDeadline(next); err != nil {
+					t.Fatal(err)
+				}
+				waitUntil(t, next)
 				select {
 				case got := <-result:
 					if got.n != 0 || !errors.Is(got.err, os.ErrDeadlineExceeded) {
@@ -229,12 +238,29 @@ func TestConnReadDeadlineChangesWhileBlocked(t *testing.T) {
 				}
 				return
 			}
-			// Wait past the old deadline; a stale timer must not win over the
-			// replacement deadline. The subsequent DATA wakes this same Read.
-			wait := time.Until(initial.Add(80 * time.Millisecond))
-			if wait > 0 {
-				time.Sleep(wait)
+
+			// Hold mu across the original timer firing. Once the stack barrier
+			// shows Read has returned from waitForWake and is blocked reacquiring
+			// mu, apply the same protected state change as SetReadDeadline. This
+			// forces the expired-timer path to recheck the replacement deadline.
+			f.conn.mu.Lock()
+			locked := true
+			defer func() {
+				if locked {
+					f.conn.mu.Unlock()
+				}
+			}()
+			waitUntil(t, initial)
+			waitForReadStack(t, id, false)
+			if mode == "extended" {
+				f.conn.readDeadline = initial.Add(time.Second)
+			} else {
+				f.conn.readDeadline = time.Time{}
 			}
+			signal(&f.conn.readWake)
+			f.conn.mu.Unlock()
+			locked = false
+
 			select {
 			case got := <-result:
 				t.Fatalf("Read returned at old deadline: %d, %v", got.n, got.err)
@@ -250,6 +276,51 @@ func TestConnReadDeadlineChangesWhileBlocked(t *testing.T) {
 				t.Fatal("Read did not wake for DATA")
 			}
 		})
+	}
+}
+
+func waitUntil(t *testing.T, deadline time.Time) {
+	t.Helper()
+	wait := time.Until(deadline)
+	if wait <= 0 {
+		return
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	<-timer.C
+}
+
+// waitForReadStack synchronizes on the read goroutine's actual wait state,
+// rather than assuming it entered Read because its caller was started.
+func waitForReadStack(t *testing.T, id uint64, waiting bool) {
+	t.Helper()
+	timeout := time.NewTimer(3 * time.Second)
+	defer timeout.Stop()
+	marker := fmt.Sprintf("goroutine %d ", id)
+	buf := make([]byte, 1<<16)
+	for {
+		n := runtime.Stack(buf, true)
+		all := string(buf[:n])
+		start := strings.Index(all, marker)
+		if start >= 0 {
+			end := strings.Index(all[start+len(marker):], "\ngoroutine ")
+			stack := all[start:]
+			if end >= 0 {
+				stack = all[start : start+len(marker)+end]
+			}
+			headerEnd := strings.IndexByte(stack, '\n')
+			inWait := strings.Contains(stack, "waitForWake") && headerEnd >= 0 && strings.Contains(stack[:headerEnd], "[select]")
+			inReadLock := strings.Contains(stack, "Conn).Read") && strings.Contains(stack, "sync.(*Mutex).Lock")
+			if waiting && inWait || !waiting && inReadLock && !strings.Contains(stack, "waitForWake") {
+				return
+			}
+		}
+		select {
+		case <-timeout.C:
+			t.Fatalf("read goroutine %d did not reach expected wait state (waiting=%t):\n%s", id, waiting, all)
+		default:
+			runtime.Gosched()
+		}
 	}
 }
 
