@@ -111,6 +111,7 @@ func (a fixtureAddr) String() string  { return string(a) }
 type fixtureTimer struct {
 	mu      sync.Mutex
 	ch      chan time.Time
+	delay   time.Duration
 	stopped bool
 	fired   bool
 }
@@ -136,8 +137,8 @@ func newFixtureClock() *fixtureClock {
 }
 
 func (c *fixtureClock) Now() time.Time { c.mu.Lock(); defer c.mu.Unlock(); return c.now }
-func (c *fixtureClock) NewTimer(time.Duration) Timer {
-	t := &fixtureTimer{ch: make(chan time.Time, 1)}
+func (c *fixtureClock) NewTimer(delay time.Duration) Timer {
+	t := &fixtureTimer{ch: make(chan time.Time, 1), delay: delay}
 	c.mu.Lock()
 	c.timers = append(c.timers, t)
 	c.mu.Unlock()
@@ -162,6 +163,27 @@ func (c *fixtureClock) nextActive(t *testing.T) *fixtureTimer {
 		case <-c.changed:
 		case <-time.After(time.Second):
 			t.Fatal("timed out waiting for an active timer")
+		}
+	}
+}
+func (c *fixtureClock) nextActiveDelay(t *testing.T, delay time.Duration) *fixtureTimer {
+	t.Helper()
+	for {
+		c.mu.Lock()
+		for _, timer := range c.timers {
+			timer.mu.Lock()
+			active := !timer.stopped && !timer.fired && timer.delay == delay
+			timer.mu.Unlock()
+			if active {
+				c.mu.Unlock()
+				return timer
+			}
+		}
+		c.mu.Unlock()
+		select {
+		case <-c.changed:
+		case <-time.After(time.Second):
+			t.Fatalf("timed out waiting for an active %v timer", delay)
 		}
 	}
 }
@@ -229,6 +251,14 @@ func announceResponse(packet []byte, peers ...netip.AddrPort) []byte {
 	return result
 }
 
+func announceResponse6(packet []byte, peer netip.AddrPort) []byte {
+	response := append(announceResponse(packet), make([]byte, 18)...)
+	addr := peer.Addr().As16()
+	copy(response[20:36], addr[:])
+	binary.BigEndian.PutUint16(response[36:38], peer.Port())
+	return response
+}
+
 func TestUDPAnnounceWireAndURLData(t *testing.T) {
 	var announce []byte
 	var conn *fixtureConn
@@ -293,11 +323,7 @@ func TestUDPAnnounceFamiliesTransmitIndependently(t *testing.T) {
 			v6.push(connectResponse(packet, 2))
 		case 1:
 			v6Announced <- packet
-			response := append(announceResponse(packet), make([]byte, 18)...)
-			peer := netip.MustParseAddr("2001:db8::2").As16()
-			copy(response[20:36], peer[:])
-			binary.BigEndian.PutUint16(response[36:38], 6881)
-			v6.push(response)
+			v6.push(announceResponse6(packet, netip.MustParseAddrPort("[2001:db8::2]:6881")))
 		}
 	})
 	client := NewUDPClient(Config{
@@ -341,17 +367,12 @@ func TestUDPAnnounceFamiliesTransmitIndependently(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("IPv6 announce was blocked by the silent IPv4 transaction")
 	}
-	select {
-	case <-done:
-		t.Fatal("announce returned before the IPv4 transaction finished")
-	default:
-	}
 	if want := string(append([]byte{2, 8}, []byte("/dir?a=b")...)); string(first[98:]) != want || string(second[98:]) != want {
 		t.Fatalf("family URL data differs: IPv4=%x IPv6=%x", first[98:], second[98:])
 	}
-	bad := announceResponse(first)
-	binary.BigEndian.PutUint32(bad[4:8], binary.BigEndian.Uint32(first[12:16])+1)
-	v4.push(bad)
+	if string(first[16:]) != string(second[16:]) {
+		t.Fatal("families announced different torrent identity or counters")
+	}
 	select {
 	case got := <-done:
 		if got.err != nil {
@@ -363,12 +384,76 @@ func TestUDPAnnounceFamiliesTransmitIndependently(t *testing.T) {
 		if len(got.result.Families) != 2 || !got.result.Families[0].Endpoint.Addr().Is4() || !got.result.Families[1].Endpoint.Addr().Is6() || !got.result.Families[0].Transmitted || !got.result.Families[1].Transmitted || got.result.Families[1].Err != nil {
 			t.Fatalf("family order or accounting: %+v", got.result.Families)
 		}
-		var trackerErr *Error
-		if !errors.As(got.result.Families[0].Err, &trackerErr) || trackerErr.Code != ErrorTransaction {
-			t.Fatalf("IPv4 failure = %v, want transaction mismatch", got.result.Families[0].Err)
+		if !errors.Is(got.result.Families[0].Err, context.Canceled) || v4.activeReads.Load() != 0 {
+			t.Fatalf("silent IPv4 transaction was not canceled and joined: %+v", got.result.Families[0])
 		}
 	case <-time.After(time.Second):
-		t.Fatal("announce did not join both families")
+		t.Fatal("IPv4 retry schedule held the usable IPv6 response")
+	}
+}
+
+func TestUDPAnnounceGraceBoundsStalledFamilyConnect(t *testing.T) {
+	clock := newFixtureClock()
+	v4Started := make(chan struct{})
+	var v4, v6 *fixtureConn
+	v4 = newFixtureConn(func(packet []byte) {
+		if binary.BigEndian.Uint32(packet[8:12]) == 0 {
+			close(v4Started)
+		}
+	})
+	v6 = newFixtureConn(func(packet []byte) {
+		switch binary.BigEndian.Uint32(packet[8:12]) {
+		case 0:
+			<-v4Started
+			v6.push(connectResponse(packet, 2))
+		case 1:
+			v6.push(announceResponse6(packet, netip.MustParseAddrPort("[2001:db8::3]:6882")))
+		}
+	})
+	client := NewUDPClient(Config{
+		Resolver: fixtureResolver{ips: []net.IPAddr{{IP: net.ParseIP("127.0.0.1")}, {IP: net.ParseIP("::1")}}},
+		Dialer: fixtureDialFunc(func(_ context.Context, network, _ string) (net.Conn, error) {
+			switch network {
+			case "udp4":
+				return v4, nil
+			case "udp6":
+				return v6, nil
+			}
+			return nil, errors.New("unexpected address family")
+		}),
+		Clock:  clock,
+		Random: bytesReader{0, 0, 0, 1},
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	type announceOutcome struct {
+		result AnnounceResult
+		err    error
+	}
+	done := make(chan announceOutcome, 1)
+	go func() {
+		result, err := client.Announce(ctx, "udp://tracker.test:1", testRequest())
+		done <- announceOutcome{result, err}
+	}()
+	clock.fire(clock.nextActiveDelay(t, familyAnnounceGrace))
+	select {
+	case got := <-done:
+		if got.err != nil || !got.result.Transmitted || got.result.Interval != time.Minute || len(got.result.Peers) != 1 || got.result.Peers[0].String() != "[2001:db8::3]:6882" {
+			t.Fatalf("usable response after grace: result=%+v err=%v", got.result, got.err)
+		}
+		if len(got.result.Families) != 2 || got.result.Families[0].Transmitted || !got.result.Families[1].Transmitted || !errors.Is(got.result.Families[0].Err, context.Canceled) {
+			t.Fatalf("family accounting after grace: %+v", got.result.Families)
+		}
+		if v4.writeCount() != 1 || v4.activeReads.Load() != 0 {
+			t.Fatal("stalled connect kept retrying or its reader was not joined")
+		}
+		select {
+		case <-v4.closed:
+		default:
+			t.Fatal("stalled connect socket remains open")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("stalled connect held the usable IPv6 response past the grace")
 	}
 }
 

@@ -22,6 +22,7 @@ import (
 const (
 	protocolID            uint64 = 0x41727101980
 	connectionLife               = time.Minute
+	familyAnnounceGrace          = 2 * time.Second
 	maxTransactionRetries        = 8
 	minAnnouncePort              = 49152
 )
@@ -244,9 +245,9 @@ func (c *UDPClient) Close() error {
 	return first
 }
 
-// Announce resolves a UDP tracker URL once per address family and announces
-// to one address in each family. A valid response from either family is a
-// successful result; every family attempt remains visible in Families.
+// Announce starts one transaction per resolved address family. After a valid
+// response, it lets the other family transmit briefly before canceling any
+// unfinished transaction. Every family attempt remains visible in Families.
 func (c *UDPClient) Announce(ctx context.Context, trackerURL string, req AnnounceRequest) (AnnounceResult, error) {
 	var result AnnounceResult
 	if c.isClosed() {
@@ -276,20 +277,78 @@ func (c *UDPClient) Announce(ctx context.Context, trackerURL string, req Announc
 	if err := ctx.Err(); err != nil {
 		return result, &Error{Code: ErrorCanceled, Operation: "announce", Err: err}
 	}
+	familyCtx, cancelFamilies := context.WithCancel(ctx)
+	defer cancelFamilies()
 	result.Families = make([]FamilyResult, len(addresses))
+	type familyProgress struct {
+		index int
+		done  bool
+	}
+	progress := make(chan familyProgress, 2*len(addresses))
 	var workers sync.WaitGroup
 	for i, endpoint := range addresses {
 		workers.Add(1)
 		go func() {
 			defer workers.Done()
-			response, transmitted, familyErr := c.announceFamily(ctx, endpoint, req, urlData)
+			response, transmitted, familyErr := c.announceFamily(familyCtx, endpoint, req, urlData, func() {
+				progress <- familyProgress{index: i}
+			})
 			result.Families[i] = FamilyResult{
 				Endpoint: endpoint, Interval: response.Interval,
 				Leechers: response.Leechers, Seeders: response.Seeders,
 				Peers: response.Peers, Transmitted: transmitted, Err: familyErr,
 			}
+			progress <- familyProgress{index: i, done: true}
 		}()
 	}
+	sent := make([]bool, len(addresses))
+	finished := make([]bool, len(addresses))
+	remaining, successful := len(addresses), -1
+	var grace Timer
+waitFamilies:
+	for remaining > 0 {
+		if successful >= 0 {
+			ready := true
+			for i := range addresses {
+				if i != successful && !sent[i] && !finished[i] {
+					ready = false
+				}
+			}
+			if ready {
+				break
+			}
+			if grace == nil {
+				// Give a slow family time to send this event, then return
+				// the usable response without waiting for its retry schedule.
+				grace = c.clock.NewTimer(familyAnnounceGrace)
+			}
+		}
+		var graceC <-chan time.Time
+		if grace != nil {
+			graceC = grace.Chan()
+		}
+		select {
+		case event := <-progress:
+			if !event.done {
+				sent[event.index] = true
+				continue
+			}
+			finished[event.index] = true
+			remaining--
+			family := result.Families[event.index]
+			if successful < 0 && family.Err == nil && family.Interval > 0 {
+				successful = event.index
+			}
+		case <-graceC:
+			break waitFamilies
+		case <-ctx.Done():
+			break waitFamilies
+		}
+	}
+	if grace != nil {
+		grace.Stop()
+	}
+	cancelFamilies()
 	workers.Wait()
 
 	var firstErr error
@@ -355,7 +414,7 @@ func (c *UDPClient) resolve(ctx context.Context, host string, port uint16) ([]ne
 	return result, nil
 }
 
-func (c *UDPClient) announceFamily(ctx context.Context, endpoint netip.AddrPort, req AnnounceRequest, urlData string) (udpAnnounceResponse, bool, error) {
+func (c *UDPClient) announceFamily(ctx context.Context, endpoint netip.AddrPort, req AnnounceRequest, urlData string, onTransmit func()) (udpAnnounceResponse, bool, error) {
 	network := "udp6"
 	if endpoint.Addr().Is4() {
 		network = "udp4"
@@ -411,7 +470,7 @@ func (c *UDPClient) announceFamily(ctx context.Context, endpoint netip.AddrPort,
 			return nil, nil, &Error{Code: ErrorDial, Operation: "announce", Err: errors.New("tracker socket closed")}
 		}
 		return conn, packet, nil
-	})
+	}, onTransmit)
 	if err != nil {
 		if transmitted && (errors.Is(err, ErrTimeout) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
 			c.invalidateLocked(s)
@@ -521,14 +580,14 @@ func (c *UDPClient) isClosed() bool {
 // through 15*2^8 seconds. A complete Write marks the transaction transmitted
 // before any response parsing occurs.
 func (c *UDPClient) exchange(ctx context.Context, conn net.Conn, packet []byte, tx uint32, action uint32, operation string) ([]byte, bool, error) {
-	return c.exchangeWithRefresh(ctx, conn, packet, tx, action, operation, nil, nil)
+	return c.exchangeWithRefresh(ctx, conn, packet, tx, action, operation, nil, nil, nil)
 }
 
 // exchangeWithRefresh keeps the announce transaction's retry counter while
 // allowing an expired connection ID to be refreshed at a retransmission.
 // refresh runs only after the current reader has been joined, so the exchange
 // never has competing readers on the old and replacement sockets.
-func (c *UDPClient) exchangeWithRefresh(ctx context.Context, conn net.Conn, packet []byte, tx uint32, action uint32, operation string, needsRefresh func() bool, refresh func() (net.Conn, []byte, error)) ([]byte, bool, error) {
+func (c *UDPClient) exchangeWithRefresh(ctx context.Context, conn net.Conn, packet []byte, tx uint32, action uint32, operation string, needsRefresh func() bool, refresh func() (net.Conn, []byte, error), onTransmit func()) ([]byte, bool, error) {
 	if len(packet) > limits.DatagramBytes {
 		return nil, false, &Error{Code: ErrorWrite, Operation: operation, Err: errors.New("UDP datagram exceeds limit")}
 	}
@@ -538,8 +597,11 @@ func (c *UDPClient) exchangeWithRefresh(ctx context.Context, conn net.Conn, pack
 	transmitted := false
 	write := func() error {
 		n, err := conn.Write(packet)
-		if n == len(packet) {
+		if n == len(packet) && !transmitted {
 			transmitted = true
+			if onTransmit != nil {
+				onTransmit()
+			}
 		}
 		if err != nil {
 			return err
