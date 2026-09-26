@@ -28,6 +28,18 @@ var (
 	ErrNoProgressTimeout = errors.New("no verified file pieces before timeout")
 )
 
+type timeoutTimer interface {
+	channel() <-chan time.Time
+	Stop() bool
+	Reset(time.Duration) bool
+}
+
+type systemTimeoutTimer struct{ timer *time.Timer }
+
+func (t systemTimeoutTimer) channel() <-chan time.Time  { return t.timer.C }
+func (t systemTimeoutTimer) Stop() bool                 { return t.timer.Stop() }
+func (t systemTimeoutTimer) Reset(d time.Duration) bool { return t.timer.Reset(d) }
+
 // RunConfig contains command-independent session options and test seams.  A
 // zero dependency uses the production standard-library implementation.  The
 // source is normally filled by torrent.ParseSource; RunSource is a convenient
@@ -72,9 +84,10 @@ type RunConfig struct {
 	OnProgress    func(RunProgress)
 	OnStatus      func(RunProgress)
 	// Now controls transfer and payload-rate timestamps for deterministic callers.
-	Now         func() time.Time
-	OnWarning   func(string)
-	OnSecondary func(error)
+	Now             func() time.Time
+	newTimeoutTimer func(time.Duration) timeoutTimer
+	OnWarning       func(string)
+	OnSecondary     func(error)
 }
 
 // RunResult describes the validated session result.  Metainfo and Selection
@@ -726,7 +739,13 @@ func (c *coordinator) startTransferPhase(ctx context.Context, source torrent.Sou
 	var timeoutFired atomic.Bool
 	if c.config.Timeout > 0 {
 		var timerMu sync.Mutex
-		timer := time.NewTimer(c.config.Timeout)
+		newTimer := c.config.newTimeoutTimer
+		if newTimer == nil {
+			newTimer = func(duration time.Duration) timeoutTimer {
+				return systemTimeoutTimer{timer: time.NewTimer(duration)}
+			}
+		}
+		timer := newTimer(c.config.Timeout)
 		timeoutDone := make(chan struct{})
 		timeoutCtx, timeoutCancel := context.WithCancel(runCtx)
 		transferCtx = timeoutCtx
@@ -736,7 +755,7 @@ func (c *coordinator) startTransferPhase(ctx context.Context, source torrent.Sou
 			timerMu.Lock()
 			if !timer.Stop() {
 				select {
-				case <-timer.C:
+				case <-timer.channel():
 				default:
 				}
 			}
@@ -744,7 +763,7 @@ func (c *coordinator) startTransferPhase(ctx context.Context, source torrent.Sou
 		}
 		go func() {
 			select {
-			case <-timer.C:
+			case <-timer.channel():
 				timeoutFired.Store(true)
 				timeoutCancel()
 			case <-timeoutDone:
@@ -756,7 +775,7 @@ func (c *coordinator) startTransferPhase(ctx context.Context, source torrent.Sou
 			timerMu.Lock()
 			if !timer.Stop() {
 				select {
-				case <-timer.C:
+				case <-timer.channel():
 				default:
 				}
 			}

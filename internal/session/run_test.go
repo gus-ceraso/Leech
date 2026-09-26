@@ -1,6 +1,7 @@
 package session
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha1"
 	"encoding/binary"
@@ -290,6 +291,353 @@ func TestRunNoProgressTimeoutRemainsPrimaryShutdownError(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("tracker final-event failure was not reported as secondary")
+	}
+}
+
+func TestRunNoProgressDeadlineOnlyRenewsForVerifiedPiece(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		commitPiece bool
+	}{
+		{name: "status connection and payload do not renew"},
+		{name: "verified piece renews", commitPiece: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pieceLength := 32 << 10
+			data := bytes.Repeat([]byte{'x'}, 64<<10)
+			if tc.commitPiece {
+				pieceLength = 4
+				data = []byte("goodnext")
+			}
+			path, trackerFixture, requested, payloadSent, deliver, peerDone := runTimeoutPeerFixture(t, data, pieceLength, tc.commitPiece)
+			clock := &manualRunClock{changed: make(chan struct{}, 1)}
+			timeout := 10 * time.Second
+			progress := make(chan RunProgress, 2)
+			statuses := make(chan RunProgress, 2)
+			dialStarted := make(chan struct{}, 1)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			runDone := make(chan error, 1)
+			runJoined, peerJoined := false, false
+			defer func() {
+				cancel()
+				if !runJoined {
+					select {
+					case <-runDone:
+					case <-time.After(3 * time.Second):
+						t.Error("Run goroutine did not join")
+					}
+				}
+				if !peerJoined {
+					select {
+					case <-peerDone:
+					case <-time.After(3 * time.Second):
+						t.Error("peer fixture did not join")
+					}
+				}
+			}()
+			go func() {
+				_, err := Run(ctx, RunConfig{
+					Source: torrent.Source{Kind: torrent.SourcePath, Path: path}, OutputDir: t.TempDir(),
+					HTTP: trackerFixture, TCPDial: func(ctx context.Context, network, address string) (net.Conn, error) {
+						select {
+						case dialStarted <- struct{}{}:
+						default:
+						}
+						return (&net.Dialer{}).DialContext(ctx, network, address)
+					},
+					UTPDial: func(ctx context.Context, _, _ string) (net.Conn, error) { <-ctx.Done(); return nil, ctx.Err() },
+					Timeout: timeout, Now: clock.Now, newTimeoutTimer: clock.NewTimer,
+					OnProgress: func(p RunProgress) { progress <- p },
+					OnStatus:   func(p RunProgress) { statuses <- p },
+				})
+				runDone <- err
+			}()
+			timer := clock.timerReady(t)
+			waitTestSignal(t, dialStarted, "peer dial")
+			select {
+			case <-requested:
+			case err := <-runDone:
+				runJoined = true
+				t.Fatalf("Run ended before peer request: %v", err)
+			case <-time.After(3 * time.Second):
+				select {
+				case peerErr := <-peerDone:
+					t.Fatalf("peer fixture ended before request: %v; tracker=%+v", peerErr, trackerFixture.snapshot())
+				default:
+					t.Fatalf("timed out waiting for peer request; tracker=%+v", trackerFixture.snapshot())
+				}
+			}
+			if !tc.commitPiece && timer.Resets() != 0 {
+				t.Fatalf("peer admission reset timeout %d times", timer.Resets())
+			}
+			if tc.commitPiece {
+				clock.Advance(timeout - time.Nanosecond)
+				close(deliver)
+				committed := waitTestValue(t, progress, "verified-piece callback")
+				if committed.VerifiedSelectedBytes != 4 {
+					t.Fatalf("verified progress = %+v, want first 4-byte piece", committed)
+				}
+				if timer.Resets() != 1 {
+					t.Fatalf("timeout resets = %d, want one reset for committed piece", timer.Resets())
+				}
+				clock.Advance(2 * time.Nanosecond) // Past the original deadline, before the renewed deadline.
+				select {
+				case err := <-runDone:
+					runJoined = true
+					t.Fatalf("Run completed before renewed deadline: %v", err)
+				default:
+				}
+				clock.Advance(timeout)
+			} else {
+				waitTestSignal(t, payloadSent, "partial payload")
+				if timer.Resets() != 0 {
+					t.Fatalf("payload receipt reset timeout %d times", timer.Resets())
+				}
+				status := waitTestValue(t, statuses, "live status tick")
+				if status.ActivePeers != 1 || status.VerifiedSelectedBytes != 0 || status.RecentRateBytesPerSec == 0 {
+					t.Fatalf("partial-transfer status = %+v", status)
+				}
+				if timer.Resets() != 0 {
+					t.Fatalf("status, connection, or payload reset timeout %d times", timer.Resets())
+				}
+				clock.Advance(timeout)
+			}
+			select {
+			case err := <-runDone:
+				runJoined = true
+				if !errors.Is(err, ErrNoProgressTimeout) {
+					t.Fatalf("Run error = %v, want no-progress timeout", err)
+				}
+			case <-time.After(3 * time.Second):
+				cancel()
+				t.Fatal("Run did not observe the controlled no-progress deadline")
+			}
+			cancel()
+			select {
+			case err := <-peerDone:
+				peerJoined = true
+				if err != nil && !errors.Is(err, net.ErrClosed) && !errors.Is(err, io.EOF) {
+					t.Errorf("peer fixture: %v", err)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("peer fixture did not join")
+			}
+		})
+	}
+}
+
+func runTimeoutPeerFixture(t *testing.T, data []byte, pieceLength int, commitFirst bool) (string, *metadataFixtureTracker, <-chan struct{}, <-chan struct{}, chan struct{}, <-chan error) {
+	t.Helper()
+	pieces := make([]byte, 0, len(data)/pieceLength*sha1.Size)
+	for begin := 0; begin < len(data); begin += pieceLength {
+		hash := sha1.Sum(data[begin : begin+pieceLength])
+		pieces = append(pieces, hash[:]...)
+	}
+	info := bencode.Value{Type: bencode.Dictionary, Dict: []bencode.Entry{
+		{Key: []byte("length"), Value: bencode.Value{Type: bencode.Integer, Int: int64(len(data))}},
+		{Key: []byte("name"), Value: bencode.Value{Type: bencode.Bytes, Bytes: []byte("payload")}},
+		{Key: []byte("piece length"), Value: bencode.Value{Type: bencode.Integer, Int: int64(pieceLength)}},
+		{Key: []byte("pieces"), Value: bencode.Value{Type: bencode.Bytes, Bytes: pieces}},
+	}}
+	encoded, err := bencode.Encode(bencode.Value{Type: bencode.Dictionary, Dict: []bencode.Entry{{Key: []byte("info"), Value: info}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	torrentPath := filepath.Join(root, "payload.torrent")
+	if err := os.WriteFile(torrentPath, encoded, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	meta, err := torrent.LoadMetainfo(torrentPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	fixture := &metadataFixtureTracker{port: uint16(listener.Addr().(*net.TCPAddr).Port)}
+	requested, payloadSent, deliver := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	peerDone := make(chan error, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			peerDone <- err
+			return
+		}
+		defer conn.Close()
+		_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+		var infoHash [20]byte
+		copy(infoHash[:], meta.InfoHash[:])
+		if _, err := peer.ReadHandshake(conn, &infoHash, nil); err != nil {
+			peerDone <- err
+			return
+		}
+		if err := peer.WriteHandshake(conn, infoHash, [20]byte{0x71}, [8]byte{}); err != nil {
+			peerDone <- err
+			return
+		}
+		if err := writeFixtureFrame(conn, peer.BitfieldID, []byte{0xc0}); err != nil {
+			peerDone <- err
+			return
+		}
+		if err := writeFixtureFrame(conn, peer.UnchokeID, nil); err != nil {
+			peerDone <- err
+			return
+		}
+		firstPiece := uint32(^uint32(0))
+		responded := false
+		for {
+			message, err := peer.ReadMessage(conn)
+			if err != nil {
+				peerDone <- err
+				return
+			}
+			if message.KeepAlive || message.ID == peer.InterestedID {
+				continue
+			}
+			if message.ID != peer.RequestID || len(message.Payload) != 12 {
+				peerDone <- fmt.Errorf("peer request message = %#v", message)
+				return
+			}
+			index := binary.BigEndian.Uint32(message.Payload[:4])
+			begin := binary.BigEndian.Uint32(message.Payload[4:8])
+			length := binary.BigEndian.Uint32(message.Payload[8:])
+			if firstPiece == ^uint32(0) {
+				firstPiece = index
+				close(requested)
+			}
+			if responded || (commitFirst && index != firstPiece) {
+				continue
+			}
+			if !commitFirst {
+				responded = true
+			} else {
+				<-deliver
+				responded = true
+			}
+			start := int(index)*pieceLength + int(begin)
+			end := start + int(length)
+			if end > len(data) {
+				peerDone <- fmt.Errorf("requested range [%d,%d) outside %d bytes", start, end, len(data))
+				return
+			}
+			payload := make([]byte, 8+int(length))
+			binary.BigEndian.PutUint32(payload[:4], index)
+			binary.BigEndian.PutUint32(payload[4:8], begin)
+			copy(payload[8:], data[start:end])
+			if err := writeFixtureFrame(conn, peer.PieceID, payload); err != nil {
+				peerDone <- err
+				return
+			}
+			if !commitFirst {
+				close(payloadSent)
+			}
+		}
+	}()
+	return torrentPath, fixture, requested, payloadSent, deliver, peerDone
+}
+
+type manualRunClock struct {
+	mu      sync.Mutex
+	now     time.Duration
+	timer   *manualRunTimer
+	changed chan struct{}
+}
+
+func (c *manualRunClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return time.Unix(0, int64(c.now))
+}
+
+func (c *manualRunClock) NewTimer(duration time.Duration) timeoutTimer {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	timer := &manualRunTimer{clock: c, deadline: c.now + duration, active: true, ticks: make(chan time.Time, 1)}
+	c.timer = timer
+	select {
+	case c.changed <- struct{}{}:
+	default:
+	}
+	return timer
+}
+
+func (c *manualRunClock) Advance(duration time.Duration) {
+	c.mu.Lock()
+	c.now += duration
+	if timer := c.timer; timer != nil && timer.active && c.now >= timer.deadline {
+		timer.active = false
+		timer.ticks <- time.Unix(0, int64(c.now))
+	}
+	c.mu.Unlock()
+}
+
+func (c *manualRunClock) timerReady(t *testing.T) *manualRunTimer {
+	t.Helper()
+	select {
+	case <-c.changed:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout timer was not created")
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.timer
+}
+
+type manualRunTimer struct {
+	clock    *manualRunClock
+	deadline time.Duration
+	active   bool
+	resets   int
+	ticks    chan time.Time
+}
+
+func (t *manualRunTimer) channel() <-chan time.Time { return t.ticks }
+
+func (t *manualRunTimer) Stop() bool {
+	t.clock.mu.Lock()
+	defer t.clock.mu.Unlock()
+	wasActive := t.active
+	t.active = false
+	return wasActive
+}
+
+func (t *manualRunTimer) Reset(duration time.Duration) bool {
+	t.clock.mu.Lock()
+	defer t.clock.mu.Unlock()
+	wasActive := t.active
+	t.active = true
+	t.deadline = t.clock.now + duration
+	t.resets++
+	return wasActive
+}
+
+func (t *manualRunTimer) Resets() int {
+	t.clock.mu.Lock()
+	defer t.clock.mu.Unlock()
+	return t.resets
+}
+
+func waitTestSignal(t *testing.T, signal <-chan struct{}, description string) {
+	t.Helper()
+	select {
+	case <-signal:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("timed out waiting for %s", description)
+	}
+}
+
+func waitTestValue(t *testing.T, values <-chan RunProgress, description string) RunProgress {
+	t.Helper()
+	select {
+	case value := <-values:
+		return value
+	case <-time.After(3 * time.Second):
+		t.Fatalf("timed out waiting for %s", description)
+		return RunProgress{}
 	}
 }
 
