@@ -48,8 +48,9 @@ piece/request state, and `transfer.go` coordinates peer I/O and finalization.
   `DiagnosticEndpoint` is `{Scheme, Host string}` and peer endpoint is the fixed
   `netip.Addr` plus `uint16` port (`peer.Endpoint`), zero when not applicable
   or when the address has a zone.
-  Kinds are constants, with `DiagnosticPhaseTransition` currently emitted at
-  `coordinator.phase`. CLI-retained Phase/Detail/tracker text totals at most 4096
+  Kinds are constants; phase, tracker, metadata, peer-selection, lifecycle,
+  transfer, and transport-race observations are emitted by their owning state
+  transitions. CLI-retained Phase/Detail/tracker text totals at most 4096
   bytes per record; a numeric peer renders to at most 47 bytes. CLI queue holds
   128 records. Producers must return promptly. Tracker endpoints contain
   scheme/host only; never put URLs, errors, payload, or magnet sources in
@@ -62,7 +63,12 @@ piece/request state, and `transfer.go` coordinates peer I/O and finalization.
   failures remain secondary and never claim a retry. Tracker callbacks only
   enqueue bounded warning state and debug observations; they run after protocol
   transactions and outside coordinator/protocol locks. The CLI drops debug
-  records on pressure.
+  records on pressure. Transfer emits `DiagnosticTransfer` transitions from the
+  coordinator at choke, availability, Allowed Fast, useful-block, tombstone,
+  scheduling, and finalizer state effects. Initial empty availability is observed
+  at admission; unchanged availability is silent. Keep event details summarized,
+  with no per-block logging. `DiagnosticTransportRace` records handshake winner,
+  failure, and peer-ID collision without retaining raw errors.
 - The coordinator alone mutates rarity, request ownership, provenance, strikes,
   and completion. Give the finalizer immutable coverage snapshots. Worker
   callbacks and command enqueueing must not stall coordination indefinitely.

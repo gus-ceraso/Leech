@@ -129,6 +129,12 @@ func (s *PeerState) PieceCount() uint32 {
 	}
 	return s.pieceCount
 }
+func (s *PeerState) AvailabilityCount() uint32 {
+	if s == nil {
+		return 0
+	}
+	return s.availabilityCount
+}
 func (s *PeerState) RequestableCount() uint32 {
 	if s == nil {
 		return 0

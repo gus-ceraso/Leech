@@ -98,6 +98,8 @@ type TransferConfig struct {
 	// OnStatus is called by the transfer coordinator on its existing one-second
 	// replacement tick with the count of admitted, live peers.
 	OnStatus func(int)
+	// OnDiagnostic receives bounded coordinator observations and must return promptly.
+	OnDiagnostic func(Diagnostic)
 	// OnPayloadReceived is called synchronously for every well-framed Piece
 	// body, before its terminal is accepted by PeerState or the scheduler. The
 	// count is the file payload length, excluding the piece index and offset.
@@ -127,25 +129,31 @@ type Transfer struct {
 	onPieceVerified        func(PieceVerified)
 	onPayloadReceived      func(int64) error
 	onStatus               func(int)
+	onDiagnostic           func(Diagnostic)
 	onEndpointBlacklisted  func(peer.Endpoint)
 	beforePeerShutdown     func() error
 	shutdownCallbackCalled bool
 	now                    func() time.Time
 	initialReleased        bool
+	endgameReported        bool
 }
 
 type transferPeer struct {
-	input      ConnectedPeer
-	worker     *peer.ConnectionWorker
-	state      *peer.PeerState
-	extensions *peer.ExtensionState
-	active     map[peer.Block]time.Time
-	tombstoned map[peer.Block]struct{}
-	done       bool
-	removed    bool
-	deferDrive bool
-	lastUseful time.Time
-	released   bool
+	input           ConnectedPeer
+	worker          *peer.ConnectionWorker
+	state           *peer.PeerState
+	extensions      *peer.ExtensionState
+	active          map[peer.Block]time.Time
+	tombstoned      map[peer.Block]struct{}
+	done            bool
+	removed         bool
+	deferDrive      bool
+	lastUseful      time.Time
+	chokedSince     time.Time
+	firstUseful     bool
+	allowedFastUsed bool
+	lastBlocked     string
+	released        bool
 }
 
 func (p *transferPeer) sendCommand(ctx context.Context, message peer.Message) error {
@@ -262,6 +270,7 @@ func NewTransfer(config TransferConfig) (*Transfer, error) {
 		onPieceVerified:       config.OnPieceVerified,
 		onPayloadReceived:     config.OnPayloadReceived,
 		onStatus:              config.OnStatus,
+		onDiagnostic:          config.OnDiagnostic,
 		onEndpointBlacklisted: config.OnEndpointBlacklisted,
 		beforePeerShutdown:    config.BeforePeerShutdown,
 		now:                   config.Now,
@@ -434,6 +443,9 @@ func (t *Transfer) Run(ctx context.Context) error {
 	// reads. Every worker joins before the private staging workspace is gone.
 	for _, p := range peers {
 		if p != nil {
+			if !p.done && p.state.Choked() {
+				t.observeDuration(p, "peer disconnected while choked", t.clock().Sub(p.chokedSince))
+			}
 			_ = p.worker.Close()
 			t.release(p)
 			if !p.removed {
@@ -569,11 +581,13 @@ func (t *Transfer) startPeer(ctx context.Context, input ConnectedPeer) (*transfe
 	})
 	worker.Start(ctx)
 	now := t.clock()
-	return &transferPeer{
+	p := &transferPeer{
 		input: input, worker: worker, state: state, extensions: extensions,
 		active: make(map[peer.Block]time.Time), tombstoned: make(map[peer.Block]struct{}),
-		lastUseful: now,
-	}, nil
+		lastUseful: now, chokedSince: now,
+	}
+	t.observe(p, "availability empty")
+	return p, nil
 }
 
 func (t *Transfer) drive(ctx context.Context, peers *[]*transferPeer) error {
@@ -594,8 +608,18 @@ func (t *Transfer) drive(ctx context.Context, peers *[]*transferPeer) error {
 			continue
 		}
 		if p.state.RequestableCount() == 0 || !t.scheduler.hasRequestCapacity(t.scheduler.peers[p.input.ID]) {
+			reason := "no advertised wanted pieces"
+			if p.state.ReqQ() == 0 {
+				reason = "zero reqq"
+			} else if p.state.Choked() && p.state.RequestableCount() == 0 {
+				reason = "remote choking"
+			} else if !t.scheduler.hasRequestCapacity(t.scheduler.peers[p.input.ID]) {
+				reason = "request pipeline full"
+			}
+			t.blocked(p, reason)
 			continue
 		}
+		p.lastBlocked = ""
 		// Admission is separate from assignment.  A stage must exist before
 		// any request can be sent, and a failed admission is fatal storage
 		// failure rather than a peer-local retry.
@@ -605,6 +629,7 @@ func (t *Transfer) drive(ctx context.Context, peers *[]*transferPeer) error {
 				return err
 			}
 			if !ok {
+				t.blocked(p, "staging pressure or no assignable piece")
 				reclaimed, err := t.reclaimUnusableStages(*peers, p)
 				if err != nil {
 					return err
@@ -632,6 +657,7 @@ func (t *Transfer) drive(ctx context.Context, peers *[]*transferPeer) error {
 				_ = stage.Abort()
 				return fmt.Errorf("%w: duplicate staged piece %d", ErrTransferConfig, offer.PieceIndex)
 			}
+			t.observe(p, fmt.Sprintf("piece %d assigned", offer.PieceIndex))
 		}
 		requests, err := t.scheduler.nextRequestsExcluding(p.input.ID, p.state.ReqQ(), p.tombstoned)
 		if err != nil {
@@ -653,6 +679,10 @@ func (t *Transfer) drive(ctx context.Context, peers *[]*transferPeer) error {
 				continue
 			}
 			p.active[request.Block] = t.clock()
+			if p.state.Choked() && p.state.AllowedFast(request.Block.Index) && !p.allowedFastUsed {
+				p.allowedFastUsed = true
+				t.observe(p, fmt.Sprintf("Allowed Fast enabled request piece=%d", request.Block.Index))
+			}
 			message := peer.Message{ID: peer.RequestID, Payload: blockPayload(request.Block)}
 			if err := p.sendCommand(ctx, message); err != nil {
 				if ctx.Err() != nil {
@@ -670,6 +700,13 @@ func (t *Transfer) drive(ctx context.Context, peers *[]*transferPeer) error {
 				delete(p.active, request.Block)
 				return err
 			}
+		}
+		if len(requests) > 0 {
+			t.observeCount(p, "requests assigned", uint64(len(requests)), fmt.Sprintf("outstanding=%d", len(p.active)))
+		}
+		if t.scheduler.Endgame() && !t.endgameReported {
+			t.endgameReported = true
+			t.observe(p, "endgame entered")
 		}
 	}
 	return nil
@@ -901,6 +938,47 @@ func (t *Transfer) expireRequests(ctx context.Context, peers []*transferPeer) er
 	return nil
 }
 
+func (t *Transfer) observe(p *transferPeer, detail string) {
+	t.observeCount(p, detail, 0, "")
+}
+
+func (t *Transfer) observeCount(p *transferPeer, detail string, count uint64, extra string) {
+	if t == nil || t.onDiagnostic == nil {
+		return
+	}
+	if extra != "" {
+		detail += " " + extra
+	}
+	event := Diagnostic{Kind: DiagnosticTransfer, Phase: "transfer", Detail: detail, Count: count}
+	if p != nil {
+		event.Peer = p.input.Endpoint
+	}
+	t.onDiagnostic(event)
+}
+
+func (t *Transfer) observeDuration(p *transferPeer, detail string, duration time.Duration) {
+	if t == nil || t.onDiagnostic == nil {
+		return
+	}
+	event := Diagnostic{Kind: DiagnosticTransfer, Phase: "transfer", Detail: detail, Duration: duration}
+	if p != nil {
+		event.Peer = p.input.Endpoint
+	}
+	t.onDiagnostic(event)
+}
+
+func (t *Transfer) observeSession(detail string, count uint64) {
+	t.observeCount(nil, detail, count, "")
+}
+
+func (t *Transfer) blocked(p *transferPeer, reason string) {
+	if p.lastBlocked == reason {
+		return
+	}
+	p.lastBlocked = reason
+	t.observe(p, "assignment blocked: "+reason)
+}
+
 func (t *Transfer) clock() time.Time {
 	if t != nil && t.now != nil {
 		return t.now()
@@ -987,6 +1065,8 @@ func (t *Transfer) handleEventWithPeers(ctx context.Context, peers []*transferPe
 			return err
 		}
 	}
+	wasChoked := p.state.Choked()
+	wasEmpty := p.state.AvailabilityCount() == 0
 	effect, err := p.state.ApplyMessage(event.Message)
 	if err != nil {
 		if errors.Is(err, peer.ErrTombstoneLimit) {
@@ -1001,6 +1081,18 @@ func (t *Transfer) handleEventWithPeers(ctx context.Context, peers []*transferPe
 			return t.disconnectPeer(p, err)
 		}
 		return err
+	}
+	if event.Message.ID == peer.AllowedFastID {
+		index := binary.BigEndian.Uint32(event.Message.Payload)
+		t.observe(p, fmt.Sprintf("Allowed Fast received piece=%d", index))
+	}
+	if event.Message.ID == peer.ChokeID && !wasChoked {
+		p.chokedSince = t.clock()
+		t.observe(p, "peer choked")
+	}
+	if event.Message.ID == peer.UnchokeID && wasChoked {
+		duration := t.clock().Sub(p.chokedSince)
+		t.observeDuration(p, "peer unchoked", duration)
 	}
 	if event.Message.ID == peer.ChokeID && !p.state.Fast() {
 		// BEP 3 choke releases ordinary outstanding requests in PeerState,
@@ -1027,6 +1119,14 @@ func (t *Transfer) handleEventWithPeers(ctx context.Context, peers []*transferPe
 	}
 	if err := t.applyAvailabilityChanges(p.input.ID, effect); err != nil {
 		return err
+	}
+	empty := p.state.AvailabilityCount() == 0
+	if wasEmpty != empty {
+		if empty {
+			t.observe(p, "availability became empty")
+		} else {
+			t.observe(p, "availability became nonempty")
+		}
 	}
 	if effect.InterestChanged {
 		id := peer.NotInterestedID
@@ -1065,6 +1165,10 @@ func (t *Transfer) handleEventWithPeers(ctx context.Context, peers []*transferPe
 				return err
 			}
 			p.lastUseful = t.clock()
+			if !p.firstUseful {
+				p.firstUseful = true
+				t.observe(p, "first useful block accepted and staged")
+			}
 			if err := t.cancelRedundant(ctx, peers, result.Canceled); err != nil {
 				return err
 			}
@@ -1083,9 +1187,10 @@ func (t *Transfer) handleEventWithPeers(ctx context.Context, peers []*transferPe
 				return err
 			}
 		case peer.TerminalLatePiece, peer.TerminalLateReject:
-			// The request table consumed the bounded tombstone.  The payload
+			// The request table consumed the bounded tombstone. The payload
 			// cannot be attributed to a current scheduler assignment.
 			delete(p.tombstoned, block)
+			t.observe(p, "exact tombstone consumed")
 		}
 	}
 	return nil
@@ -1188,10 +1293,24 @@ func (t *Transfer) finalizePiece(ctx context.Context, index, activePeers int) er
 			for _, endpoint := range verification.Blacklisted {
 				t.notifyBlacklisted(endpoint)
 			}
-			return errors.Join(verifyErr, t.stager.Fatal())
+			t.observeSession(fmt.Sprintf("piece %d hash mismatch; retry scheduled", index), uint64(len(verification.Strikes)))
+			if fatal := t.stager.Fatal(); fatal != nil {
+				t.observeSession("fatal staging failure during hash retry", 0)
+				return errors.Join(verifyErr, fatal)
+			}
+			return verifyErr
+		}
+		if errors.Is(err, storage.ErrStagingFatal) {
+			t.observeSession("fatal staging failure", 0)
+		} else {
+			t.observeSession("piece finalization failed", 0)
 		}
 	}
-	return t.settleFinalizedPiece(index, snapshot.Piece, finalized, err, activePeers)
+	result := t.settleFinalizedPiece(index, snapshot.Piece, finalized, err, activePeers)
+	if result == nil {
+		t.observeSession(fmt.Sprintf("piece %d completed", index), 1)
+	}
+	return result
 }
 
 func (t *Transfer) settleFinalizedPiece(index int, piece torrent.Piece, finalized storage.FinalizeResult, finalizeErr error, activePeers int) error {
@@ -1209,6 +1328,10 @@ func (t *Transfer) settleFinalizedPiece(index int, piece torrent.Piece, finalize
 func (t *Transfer) disconnectPeer(p *transferPeer, cause error) error {
 	if p.done {
 		return nil
+	}
+	if p.state.Choked() {
+		duration := t.clock().Sub(p.chokedSince)
+		t.observeDuration(p, "peer disconnected while choked", duration)
 	}
 	p.done = true
 	_ = p.worker.Close()

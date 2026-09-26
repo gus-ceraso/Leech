@@ -96,6 +96,10 @@ func renderDiagnostic(reporter *Reporter, diagnostic session.Diagnostic) {
 		message = "peer selection phase=" + diagnostic.Phase
 	case session.DiagnosticLifecycle:
 		message = "session lifecycle"
+	case session.DiagnosticTransfer:
+		message = "transfer"
+	case session.DiagnosticTransportRace:
+		message = "transport race"
 	default:
 		return
 	}

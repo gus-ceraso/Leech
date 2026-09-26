@@ -17,6 +17,8 @@ BEPs [3](../../beps/bep_0003.rst), [6](../../beps/bep_0006.rst),
   Keep incoming requests independent of storage. Fast `Have None` and request
   rejection are control behavior, not permission to expose payload access.
 - Availability and Allowed Fast are separate sets; choked requests require both.
+  `AvailabilityCount` exposes the coordinator-owned ordinary set size for
+  transition observations; it does not conflate Allowed Fast with availability.
   `Have None` clears only availability. During file transfer, preserve initial
   availability-message ordering and use one validator for every spare bit in an
   initial bitfield. Metadata discovery follows the exception in

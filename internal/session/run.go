@@ -128,6 +128,8 @@ const (
 	DiagnosticMetadataRefusal
 	DiagnosticPeerSelection
 	DiagnosticLifecycle
+	DiagnosticTransfer
+	DiagnosticTransportRace
 )
 
 // DiagnosticEndpoint contains only tracker scheme and host. Producers must not
@@ -866,6 +868,11 @@ func (c *coordinator) startTransferPhase(ctx context.Context, source torrent.Sou
 				admitted, dialErr := manager.Dial(dialCtx, candidate)
 				dialCancel()
 				if dialErr != nil {
+					detail := "failed"
+					if errors.Is(dialErr, peer.ErrPeerIDCollision) {
+						detail = "peer ID collision; older connection retained"
+					}
+					c.diagnostic(Diagnostic{Kind: DiagnosticTransportRace, Phase: "transfer", Peer: candidate.Endpoint, Detail: detail})
 					c.diagnostic(Diagnostic{Kind: DiagnosticPeerSelection, Phase: "transfer", Peer: candidate.Endpoint, Detail: "candidate dial failed"})
 					var budgetErr *peer.EndpointBudgetError
 					if errors.As(dialErr, &budgetErr) {
@@ -873,6 +880,7 @@ func (c *coordinator) startTransferPhase(ctx context.Context, source torrent.Sou
 					}
 					continue
 				}
+				c.diagnostic(Diagnostic{Kind: DiagnosticTransportRace, Phase: "transfer", Peer: admitted.Endpoint, Detail: "winner=" + admitted.Transport.String()})
 				c.diagnostic(Diagnostic{Kind: DiagnosticPeerSelection, Phase: "transfer", Peer: admitted.Endpoint, Detail: "candidate connected"})
 				liveMu.Lock()
 				live[admitted.Conn] = admitted
@@ -955,6 +963,7 @@ func (c *coordinator) startTransferPhase(ctx context.Context, source torrent.Sou
 		ResumeComplete:        resume.VerifiedPieces,
 		Now:                   now,
 		OnStatus:              onStatus,
+		OnDiagnostic:          c.config.OnDiagnostic,
 		OnPieceVerified: func(piece PieceVerified) {
 			if piece.SelectedBytes > 0 {
 				c.verifiedOutput.Store(true)

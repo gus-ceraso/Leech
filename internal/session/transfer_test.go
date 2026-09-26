@@ -25,7 +25,7 @@ import (
 	"github.com/gus-ceraso/Leech/internal/torrent"
 )
 
-func TestTransferLocalTCPSingleFile(t *testing.T) {
+func TestTransferDiagnosticsObserveAvailabilityAndFirstUsefulBlock(t *testing.T) {
 	data := []byte("leech")
 	var hash [20]byte
 	hash = sha1.Sum(data)
@@ -67,13 +67,21 @@ func TestTransferLocalTCPSingleFile(t *testing.T) {
 			remoteDone <- err
 			return
 		}
-		if err := peer.WriteHandshake(conn, infoHash, remoteID, [8]byte{}); err != nil {
+		reserved := [8]byte{7: peer.FastExtensionBit}
+		if err := peer.WriteHandshake(conn, infoHash, remoteID, reserved); err != nil {
 			remoteDone <- err
 			return
 		}
 		if err := writeFixtureFrame(conn, peer.BitfieldID, []byte{0x80}); err != nil {
 			remoteDone <- err
 			return
+		}
+		index := make([]byte, 4)
+		for _, message := range []peer.Message{{ID: peer.HaveID, Payload: index}, {ID: peer.HaveNoneID}, {ID: peer.HaveID, Payload: index}} {
+			if err := writeFixtureFrame(conn, message.ID, message.Payload); err != nil {
+				remoteDone <- err
+				return
+			}
 		}
 		if err := writeFixtureFrame(conn, peer.UnchokeID, nil); err != nil {
 			remoteDone <- err
@@ -85,7 +93,7 @@ func TestTransferLocalTCPSingleFile(t *testing.T) {
 				remoteDone <- err
 				return
 			}
-			if message.KeepAlive || message.ID == peer.InterestedID {
+			if message.KeepAlive || message.ID == peer.InterestedID || message.ID == peer.NotInterestedID || message.ID == peer.HaveNoneID {
 				continue
 			}
 			if message.ID != peer.RequestID {
@@ -109,7 +117,7 @@ func TestTransferLocalTCPSingleFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	local := peer.Handshake{InfoHash: infoHash, PeerID: [20]byte{4, 5, 6}}
+	local := peer.Handshake{InfoHash: infoHash, PeerID: [20]byte{4, 5, 6}, Reserved: [8]byte{7: peer.FastExtensionBit}}
 	if err := peer.WriteHandshake(conn, local.InfoHash, local.PeerID, local.Reserved); err != nil {
 		t.Fatal(err)
 	}
@@ -118,6 +126,7 @@ func TestTransferLocalTCPSingleFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	var callbackOrder []string
+	var observations []Diagnostic
 	var transfer *Transfer
 	transfer, err = NewTransfer(TransferConfig{
 		Selection:       selection,
@@ -139,6 +148,7 @@ func TestTransferLocalTCPSingleFile(t *testing.T) {
 			return nil
 		},
 		OnPieceVerified: func(PieceVerified) { callbackOrder = append(callbackOrder, "verified") },
+		OnDiagnostic:    func(event Diagnostic) { observations = append(observations, event) },
 		BeforePeerShutdown: func() error {
 			if stager.Workspace() == "" {
 				return fmt.Errorf("shutdown callback ran after staging cleanup")
@@ -168,6 +178,31 @@ func TestTransferLocalTCPSingleFile(t *testing.T) {
 	}
 	if want := []string{"payload", "verified", "shutdown"}; !reflect.DeepEqual(callbackOrder, want) {
 		t.Fatalf("callback order = %v, want %v", callbackOrder, want)
+	}
+	var sawEmpty, sawAvailable, sawRequest, sawUseful, sawComplete bool
+	emptyTransitions, availableTransitions := 0, 0
+	for _, event := range observations {
+		switch event.Detail {
+		case "availability empty":
+			sawEmpty = true
+			emptyTransitions++
+		case "availability became empty":
+			emptyTransitions++
+		case "availability became nonempty":
+			sawAvailable = true
+			availableTransitions++
+		default:
+			if strings.HasPrefix(event.Detail, "requests assigned ") {
+				sawRequest = true
+			}
+		case "first useful block accepted and staged":
+			sawUseful = true
+		case "piece 0 completed":
+			sawComplete = true
+		}
+	}
+	if !sawEmpty || !sawAvailable || !sawRequest || !sawUseful || !sawComplete || emptyTransitions != 2 || availableTransitions != 2 {
+		t.Fatalf("transfer observations empty=%t available=%t request=%t useful=%t complete=%t transitions=%d/%d: %+v", sawEmpty, sawAvailable, sawRequest, sawUseful, sawComplete, emptyTransitions, availableTransitions, observations)
 	}
 }
 
@@ -918,7 +953,8 @@ func TestFinalizePieceCorruptStageCloseFailurePropagatesFatal(t *testing.T) {
 	if _, err := scheduler.AcceptBlock("contributor", requests[0].Block); err != nil {
 		t.Fatal(err)
 	}
-	transfer := &Transfer{scheduler: scheduler, stager: stager, output: plan, stages: map[int]*storage.PieceStage{0: stage}}
+	var observations []Diagnostic
+	transfer := &Transfer{scheduler: scheduler, stager: stager, output: plan, stages: map[int]*storage.PieceStage{0: stage}, onDiagnostic: func(event Diagnostic) { observations = append(observations, event) }}
 	if err := transfer.finalizePiece(context.Background(), 0, 0); !errors.Is(err, closeErr) || !errors.Is(err, storage.ErrStagingFatal) {
 		t.Fatalf("finalizePiece error = %v, want injected close error and ErrStagingFatal", err)
 	}
@@ -930,6 +966,9 @@ func TestFinalizePieceCorruptStageCloseFailurePropagatesFatal(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(root, "fixture")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("corrupt output exists or stat failed: %v", err)
+	}
+	if len(observations) != 2 || observations[0].Detail != "piece 0 hash mismatch; retry scheduled" || observations[1].Detail != "fatal staging failure during hash retry" {
+		t.Fatalf("hash/fatal diagnostics = %+v", observations)
 	}
 	_ = stager.Cleanup(nil)
 }
@@ -1689,12 +1728,21 @@ func TestTransferFastAllowedPieceCanProgressWhileChoked(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	clock := time.Unix(100, 0)
+	var observations []Diagnostic
 	transfer, err := NewTransfer(TransferConfig{
 		Selection: selection, Output: plan,
 		Stager:         storage.NewStager(storage.StagerConfig{CacheRoot: filepath.Join(t.TempDir(), "cache"), MaxPieces: 1, MaxBytes: int64(len(data))}),
 		LocalHandshake: local,
 		Peers:          []ConnectedPeer{{ID: "fast-peer", Conn: conn, Handshake: remote}},
 		PieceCount:     1, PieceLength: uint32(len(data)), LastPieceLength: uint32(len(data)),
+		Now: func() time.Time { return clock },
+		OnDiagnostic: func(event Diagnostic) {
+			observations = append(observations, event)
+			if event.Detail == "Allowed Fast received piece=0" {
+				clock = clock.Add(3 * time.Second)
+			}
+		},
 	})
 	if err != nil {
 		conn.Close()
@@ -1711,6 +1759,16 @@ func TestTransferFastAllowedPieceCanProgressWhileChoked(t *testing.T) {
 	got, err := os.ReadFile(filepath.Join(root, "fixture"))
 	if err != nil || string(got) != string(data) {
 		t.Fatalf("output = %q, %v", got, err)
+	}
+	var allowed, used, useful, chokeDuration bool
+	for _, event := range observations {
+		allowed = allowed || event.Detail == "Allowed Fast received piece=0"
+		used = used || event.Detail == "Allowed Fast enabled request piece=0"
+		useful = useful || event.Detail == "first useful block accepted and staged"
+		chokeDuration = chokeDuration || event.Detail == "peer disconnected while choked" && event.Duration >= 3*time.Second
+	}
+	if !allowed || !used || !useful || !chokeDuration {
+		t.Fatalf("Fast/choke observations allowed=%t used=%t useful=%t duration=%t: %+v", allowed, used, useful, chokeDuration, observations)
 	}
 }
 
@@ -2102,6 +2160,8 @@ func TestTransferExpiresStalledBlocksAndUsesLaterPeer(t *testing.T) {
 
 func TestTransferTimeoutPreservesFastLateTerminalWithoutStrike(t *testing.T) {
 	transfer, p, remote, messages, block, setNow, base := newTransferWithOutstandingTestRequest(t, true)
+	var observations []Diagnostic
+	transfer.onDiagnostic = func(event Diagnostic) { observations = append(observations, event) }
 	defer func() {
 		_ = p.worker.Close()
 		_ = transfer.scheduler.RemovePeer(p.input.ID)
@@ -2150,6 +2210,15 @@ func TestTransferTimeoutPreservesFastLateTerminalWithoutStrike(t *testing.T) {
 	}
 	if transfer.scheduler.StrikeCount(p.input.Endpoint) != 0 {
 		t.Fatalf("timeout or late terminal caused a strike: %d", transfer.scheduler.StrikeCount(p.input.Endpoint))
+	}
+	lateCount := 0
+	for _, event := range observations {
+		if event.Detail == "exact tombstone consumed" {
+			lateCount++
+		}
+	}
+	if lateCount != 1 || transfer.Progress().Verified != 0 {
+		t.Fatalf("late terminal observation count=%d verified=%d observations=%+v", lateCount, transfer.Progress().Verified, observations)
 	}
 }
 
