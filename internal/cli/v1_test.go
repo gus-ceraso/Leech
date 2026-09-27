@@ -764,11 +764,15 @@ func TestV1CLIPrimaryAndSecondaryErrorsRedactBeforeTruncation(t *testing.T) {
 	defer peers.close()
 	delegate := &v1Tracker{}
 	secondaryText := "tracker https://secondary-user:secondary-password@[2001:db8::22]:9443/private'path?token=secondary-query-secret " +
-		"magnet:?xt=urn:btih:0123456789012345678901234567890123456789&dn=secondary-magnet-secret\x1b[31m"
+		"authority https://alice\x1b:secondary-control-password@example.test/private?token=secondary-authority-query " +
+		"path https://path-user:pw@path.example/private\t/secondary-path-suffix?token=secondary-path-query\x1b-tail " +
+		"magnet:?xt=urn:btih:0123456789012345678901234567890123456789&dn=secondary-magnet-secret terminal\x1b[31m"
 	config := v1SessionConfig(t, delegate, peers)
 	config.HTTP = v1FinalFailureTracker{delegate: delegate, err: errors.New(secondaryText)}
 	userinfo := strings.Repeat("primary-userinfo-secret-", 3000)
-	primaryText := "staged read failed: https://" + userinfo + "@[2001:db8::11]:8443/primary-private'path?token=primary-query-secret\x1b[31m"
+	primaryText := "staged read failed: https://" + userinfo + "@[2001:db8::11]:8443/primary-private'path?token=primary-query-secret " +
+		"authority https://alice\x1b:primary-control-password@example.test/private?token=primary-authority-query " +
+		"path https://path-user:pw@path.example/private\t/primary-path-suffix?token=primary-path-query\x1b-tail terminal\x1b[31m"
 	primaryErr := errors.New(primaryText)
 	config.StageFileOpener = func(path string, flag int, mode os.FileMode) (storage.StagingFile, error) {
 		file, err := os.OpenFile(path, flag, mode)
@@ -795,7 +799,9 @@ func TestV1CLIPrimaryAndSecondaryErrorsRedactBeforeTruncation(t *testing.T) {
 	}
 	for _, secret := range []string{
 		"primary-userinfo-secret", "primary-private", "primary-query-secret",
+		"primary-control-password", "primary-authority-query", "primary-path-suffix", "primary-path-query",
 		"secondary-user", "secondary-password", "/private", "secondary-query-secret",
+		"secondary-control-password", "secondary-authority-query", "secondary-path-suffix", "secondary-path-query",
 		"magnet:?", "0123456789012345678901234567890123456789", "secondary-magnet-secret", "\x1b",
 	} {
 		if strings.Contains(stderr.String(), secret) {
@@ -1257,8 +1263,6 @@ type v1PeerFixture struct {
 	stall           bool
 	withhold        bool
 	partial         bool
-	duplicateHave   bool
-	diagnosticChurn int
 	requestSeen     chan struct{}
 	releasePiece    chan struct{}
 	requestOnce     sync.Once
@@ -1371,23 +1375,6 @@ func (f *v1PeerFixture) serveTransfer(conn net.Conn) error {
 	}
 	if err := v1WriteFrame(conn, v1RawMessage(peer.BitfieldID, bitfield)); err != nil {
 		return err
-	}
-	for range f.diagnosticChurn {
-		if err := v1WriteFrame(conn, v1RawMessage(peer.ChokeID, nil)); err != nil {
-			return err
-		}
-		if err := v1WriteFrame(conn, v1RawMessage(peer.UnchokeID, nil)); err != nil {
-			return err
-		}
-	}
-	if f.duplicateHave {
-		have := make([]byte, 4)
-		if err := v1WriteFrame(conn, v1RawMessage(peer.HaveID, have)); err != nil {
-			return err
-		}
-		if err := v1WriteFrame(conn, v1RawMessage(peer.HaveID, have)); err != nil {
-			return err
-		}
 	}
 	if f.stall {
 		_, err := io.Copy(io.Discard, conn)

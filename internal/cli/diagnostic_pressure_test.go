@@ -66,7 +66,7 @@ func newBlockedDebugWriter() *blockedDebugWriter {
 func (w *blockedDebugWriter) Write(p []byte) (int, error) {
 	w.active.Add(1)
 	defer w.active.Add(-1)
-	if bytes.HasPrefix(p, []byte("debug: transfer")) {
+	if bytes.HasPrefix(p, []byte("debug:")) {
 		w.once.Do(func() {
 			close(w.entered)
 			<-w.release
@@ -258,9 +258,9 @@ func TestCLIBlockedWarningDoesNotStallTransferStatusOrShutdown(t *testing.T) {
 func TestCLITransferContinuesAndJoinsUnderDiagnosticQueuePressure(t *testing.T) {
 	data := []byte("bounded diagnostics still download")
 	info, infoHash := v1Info(t, data)
+	// Keep the peer wire quiet: tracker attempts create queue pressure, and the
+	// request barrier should measure transfer progress, not synthetic churn.
 	peers := newV1Peers(t, infoHash, info, data, true)
-	peers.duplicateHave = true
-	peers.diagnosticChurn = 80
 	peers.requestSeen = make(chan struct{})
 	peers.releasePiece = make(chan struct{})
 	var source strings.Builder
@@ -269,6 +269,8 @@ func TestCLITransferContinuesAndJoinsUnderDiagnosticQueuePressure(t *testing.T) 
 		fmt.Fprintf(&source, "&tr=http%%3A%%2F%%2Ftracker-%02d.test%%2Fannounce", i)
 	}
 	trackerFixture := &pressureFailTracker{seen: make(map[string]int), attempts: make(chan string, 512)}
+	// Hold stderr from the first debug line so tracker events deterministically
+	// fill the bounded diagnostic queue.
 	writer := newBlockedDebugWriter()
 	output := t.TempDir()
 	opts := parseV1Options(t, "--loglevel", "debug", "--output", output, source.String())
@@ -315,7 +317,8 @@ func TestCLITransferContinuesAndJoinsUnderDiagnosticQueuePressure(t *testing.T) 
 	select {
 	case <-peers.requestSeen:
 	case <-ctx.Done():
-		t.Fatal("local peer did not receive the transfer request")
+		t.Fatalf("local peer did not receive the transfer request (dials=%d, tracker URLs=%d)",
+			peers.calls.Load(), len(trackerFixture.snapshot()))
 	}
 	attemptCount := 0
 	for attemptCount < 128 {

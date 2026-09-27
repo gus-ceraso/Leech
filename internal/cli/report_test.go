@@ -191,6 +191,16 @@ func TestSanitizeDiagnosticRedactsCompleteTrackerURLs(t *testing.T) {
 			want: "announce https://tracker.example failed",
 		},
 		{
+			name: "control in authority",
+			raw:  "announce https://alice\x1b:password@example.test/private?token=authority-secret failed",
+			want: "announce https://example.test failed",
+		},
+		{
+			name: "controls in path and query",
+			raw:  "announce https://tracker.example/private\tpath?token=query-secret\x1b-tail failed",
+			want: "announce https://tracker.example failed",
+		},
+		{
 			name: "IPv6 host without port",
 			raw:  "announce https://[2001:db8::1]/private failed",
 			want: "announce https://[2001:db8::1] failed",

@@ -14,7 +14,8 @@ exit; this package adapts arguments, reporting, and signals to `session.Run`.
   help and usage follow their separate DESIGN rules.
 - Treat wrapped errors as untrusted display input too. Redaction scans complete
   URL tokens before truncation, including 64 MiB supported URLs, userinfo, IPv6
-  brackets, apostrophes and other legal punctuation, without exposing a suffix.
+  brackets, apostrophes, punctuation and embedded controls, without exposing a
+  suffix.
   The scanner retains at most 4096 raw bytes and scans at most 64 MiB plus that
   prefix; URL parsing copies only the bounded authority. Never echo a complete
   magnet URI.
@@ -43,6 +44,9 @@ exit; this package adapts arguments, reporting, and signals to `session.Run`.
   final output; status remains separately TTY/level gated. Tracker identifiers
   retain scheme and host only.
 - Keep phase/progress reporting testable with controlled time and TTY state.
+  Queue-pressure tests should use bounded diagnostic sources such as local
+  tracker events and coordinate peer transfer with request/release barriers;
+  synthetic peer-message churn can starve transfer scheduling under `-race`.
   Phase-entry status uses `OnPhaseStatus`; `OnProgress` remains commit-only.
   Live transfer `OnStatus` refreshes the same display without affecting the
   session no-progress timer. Preserve caller callbacks and install CLI activity

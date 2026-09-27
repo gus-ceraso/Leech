@@ -496,7 +496,9 @@ func sensitiveTokenEnd(value string, start, limit int) (int, bool) {
 		if size == 0 {
 			size = 1
 		}
-		if unicode.IsSpace(r) || unicode.IsControl(r) {
+		// Controls can be embedded in malformed URLs. Treat only non-control
+		// whitespace as a token boundary so their suffixes remain redacted.
+		if unicode.IsSpace(r) && !unicode.IsControl(r) {
 			return i, true
 		}
 		if i-start >= limit {
