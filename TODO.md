@@ -1,6 +1,6 @@
 # Approved implementation tasks
 
-The six changes below are approved and unimplemented. The IDs retain the audit's
+The six changes below are approved and implemented. The IDs retain the audit's
 finding numbers. [DESIGN.md](DESIGN.md) is the behavior contract; this document
 defines implementation scope, ownership, and acceptance checks. Source pointers
 describe commit `bd7417f`; locate functions by name after earlier tasks merge.
@@ -106,7 +106,7 @@ with the orchestrator before editing; it is not an invitation to expand behavior
 
 ## F6 — Propagate fatal cache errors during corrupt-piece handling
 
-- [ ] Implemented, independently reviewed, integrated, and verified.
+- [x] Implemented, independently reviewed, integrated, and verified.
 
 **Contract:** [§13.1](DESIGN.md#131-cache-staging), [§18](DESIGN.md#18-failure-semantics).
 Read [session guidance](internal/session/AGENTS.md) and
@@ -115,7 +115,7 @@ Read [session guidance](internal/session/AGENTS.md) and
 **Own:** `internal/session/transfer.go`, focused session tests, and necessary
 session guidance. Read storage code; its existing error contract is sufficient.
 
-**Current defect:** `Stager.Finalize` joins a hash mismatch with a failed staged
+**Original defect:** `Stager.Finalize` joins a hash mismatch with a failed staged
 file close/removal and records `Stager.Fatal()`. `Transfer.finalizePiece` sees
 `ErrPieceHashMismatch`, applies corruption accounting, and returns only the
 scheduler result. A local test with expected bytes `good`, staged bytes `evil`,
@@ -151,7 +151,7 @@ and an injected close failure returned nil despite a recorded fatal error.
 
 ## F9 — Report cleanup failures alongside a no-progress timeout
 
-- [ ] Implemented, independently reviewed, integrated, and verified.
+- [x] Implemented, independently reviewed, integrated, and verified.
 
 **Depends on:** F6. **Contract:** [§4.10](DESIGN.md#410-exit-status-and-signals),
 [§13.1](DESIGN.md#131-cache-staging). Read session, storage, and
@@ -160,7 +160,7 @@ and an injected close failure returned nil despite a recorded fatal error.
 **Own:** `internal/session/run.go`, focused session/CLI tests, and necessary
 session guidance. Do not change storage's primary-error-aware cleanup API.
 
-**Current defect:** `startTransferPhase` replaces the entire joined transfer error
+**Original defect:** `startTransferPhase` replaces the entire joined transfer error
 with `ErrNoProgressTimeout`. A local session with a 300 ms timeout and an injected
 staged-file close failure reported only the timeout; `OnSecondary` saw nothing.
 
@@ -201,7 +201,7 @@ staged-file close failure reported only the timeout; `OnSecondary` saw nothing.
 
 ## F4 — Refresh interactive activity independently of piece commits
 
-- [ ] Implemented, independently reviewed, integrated, and verified.
+- [x] Implemented, independently reviewed, integrated, and verified.
 
 **Depends on:** F9. **Contract:** [§4.8](DESIGN.md#48-no-progress-timeout),
 [§4.9](DESIGN.md#49-output-and-terminal-behavior). Read session and CLI guidance.
@@ -210,7 +210,7 @@ staged-file close failure reported only the timeout; `OnSecondary` saw nothing.
 `internal/cli/run.go`, focused tests, and corresponding guidance. Change
 `internal/cli/report.go` only if existing rendering cannot consume the new data.
 
-**Current defect:** `OnProgress` supplies peer count and recent rate only after
+**Original defect:** `OnProgress` supplies peer count and recent rate only after
 a piece commits. The CLI timer retries that snapshot without refreshing it.
 A connected, choked peer still displayed `peers=0`; a nonzero rate cannot decay
 during a stall without another commit.
@@ -256,7 +256,7 @@ during a stall without another commit.
 
 ## F7 — Bound UDP tracker endpoint retention
 
-- [ ] Implemented, independently reviewed, integrated, and verified.
+- [x] Implemented, independently reviewed, integrated, and verified.
 
 **Contract:** [§10.3](DESIGN.md#103-udp), [§16](DESIGN.md#16-supported-bounds),
 [§17](DESIGN.md#17-security-and-trust-boundaries). Read
@@ -265,7 +265,7 @@ during a stall without another commit.
 **Own:** `internal/tracker/udp.go`, focused tracker tests, and tracker guidance.
 Do not change tracker URL validation, peer admission, session callbacks, or uTP.
 
-**Current defect:** `UDPClient.sessions` retains every historical resolved
+**Original defect:** `UDPClient.sessions` retains every historical resolved
 endpoint. A local probe using one tracker and 128 successive addresses retained
 128 entries and open simulated sockets despite expired connection IDs. All were
 released only by `UDPClient.Close`; OS descriptor exhaustion was not tested.
@@ -312,7 +312,7 @@ released only by `UDPClient.Close`; OS descriptor exhaustion was not tested.
 
 ## F8 — Honor expired uTP read deadlines with buffered data
 
-- [ ] Implemented, independently reviewed, integrated, and verified.
+- [x] Implemented, independently reviewed, integrated, and verified.
 
 **Contract:** [§14](DESIGN.md#14-utp), [Go `net.Conn`](https://pkg.go.dev/net#Conn).
 Read [uTP guidance](internal/utp/AGENTS.md).
@@ -320,7 +320,7 @@ Read [uTP guidance](internal/utp/AGENTS.md).
 **Own:** `internal/utp/conn.go`, focused uTP tests, and uTP guidance. Do not change
 packet formats, receive ordering, congestion control, peer logic, or write policy.
 
-**Current defect:** `Conn.Read` consumes `ReceiveState` bytes before checking its
+**Original defect:** `Conn.Read` consumes `ReceiveState` bytes before checking its
 deadline. The loopback reproduction acknowledged a one-byte DATA packet, set a
 deadline in the past, and then read `x` with no error.
 
@@ -354,7 +354,7 @@ deadline in the past, and then read `x` with no error.
 
 ## F1 — Implement bounded diagnostics and the required session observations
 
-- [ ] All four subtasks implemented, independently reviewed, integrated, and verified.
+- [x] All four subtasks implemented, independently reviewed, integrated, and verified.
 
 **Depends on:** F4, F6, F7, F8, and F9 integrated. **Contract:**
 [§4.5](DESIGN.md#45-logging), [§4.9](DESIGN.md#49-output-and-terminal-behavior),
@@ -362,7 +362,7 @@ deadline in the past, and then read `x` with no error.
 Read CLI, session, tracker, and [peer guidance](internal/peer/AGENTS.md).
 Read storage guidance if an observation requires touching storage.
 
-**Current defect:** `Reporter.Debug` exists but has no production callers.
+**Original defect:** `Reporter.Debug` exists but had no production callers.
 Session callbacks lack a debug channel; `trackerPeerResolver.pump` discards
 tracker status events. A failing local tracker produced only phase lines and a
 timeout. Several §19.4 observations are also missing. Merely logging that timeout
@@ -370,7 +370,7 @@ or adding synthetic reporter tests does not satisfy this task.
 
 ### F1a — Establish the narrow observation and rendering path
 
-- [ ] Reviewed checkpoint.
+- [x] Reviewed checkpoint.
 
 Own session diagnostic definitions/wiring and CLI reporting integration. Before
 dispatching producer work, the orchestrator must record the exact callback/event
@@ -406,7 +406,7 @@ shape and its byte/count bounds in the owning code comments or guidance.
 
 ### F1b — Tracker, metadata, and lifecycle diagnostics
 
-- [ ] Reviewed checkpoint after F1a.
+- [x] Reviewed checkpoint after F1a.
 
 Own the necessary producers in `internal/session/run.go`,
 `internal/session/metadata.go`, and `internal/tracker`, plus their tests.
@@ -427,7 +427,7 @@ Own the necessary producers in `internal/session/run.go`,
 
 ### F1c — Peer, scheduling, and verification observations
 
-- [ ] Reviewed checkpoint after F1b.
+- [x] Reviewed checkpoint after F1b.
 
 Own producers in `internal/session/transfer.go`, peer/dial integration, and their
 tests. Small result fields in `internal/peer` are allowed when the session cannot
@@ -465,7 +465,7 @@ The completed F1 implementation must expose all these observations to local test
 
 ### F1d — Session and CLI acceptance checks
 
-- [ ] Reviewed checkpoint after F1c.
+- [x] Reviewed checkpoint after F1c.
 
 Own focused integration tests and only the corrections needed by those tests.
 
@@ -534,13 +534,13 @@ acceptance checks pass. Passing historical tests alone is insufficient.
 
 Final integration checks:
 
-- [ ] All six tasks and all F1 observations have reviewed implementations and tests.
-- [ ] The three kept decisions and no-upload rules remain unchanged.
-- [ ] Applicable nested guidance matches the implemented ownership and behavior;
+- [x] All six tasks and all F1 observations have reviewed implementations and tests.
+- [x] The three kept decisions and no-upload rules remain unchanged.
+- [x] Applicable nested guidance matches the implemented ownership and behavior;
       root guidance's context map remains accurate.
-- [ ] Run `bash -ic 'make check'` on the combined tree: tests, race tests, vet,
+- [x] Run `bash -ic 'make check'` on the combined tree: tests, race tests, vet,
       and the pure-Go production build. Resolve failures within their owning task.
-- [ ] Verify the diff contains no unrelated edits, temporary audit artifacts,
+- [x] Verify the diff contains no unrelated edits, temporary audit artifacts,
       new external dependencies, live-network fixtures, or new user-facing controls.
 
 Stop when these checks pass. Further conformance audits, protocol features, and
