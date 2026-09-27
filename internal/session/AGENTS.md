@@ -167,6 +167,10 @@ retention capacity.
 - Coalesce contiguous data across file boundaries, stopping at padding and the
   block limit. Keep pending positions, active block lookup, and remaining-work
   counters consistent when requests settle, peers leave, or pieces reset.
+- A per-peer event-drain limit is a fairness budget, not an abuse threshold.
+  Valid requested Piece replies can refill the bounded queue during staging.
+  Yield with remaining events rather than disconnecting a productive peer;
+  defer its new assignments until queued extension updates have been applied.
 - Apply queued extension handshakes before assigning more blocks, including
   repeated `reqq` changes and zero capacity. Keep endgame winner/cancel handling
   consistent with peer terminal-response and tombstone obligations.

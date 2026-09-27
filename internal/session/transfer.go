@@ -494,14 +494,9 @@ func (t *Transfer) drainQueuedPeerEvents(ctx context.Context, peers []*transferP
 		}
 		pending := p.worker.PendingEvent()
 		queued := len(p.worker.Events())
-		if processed == peerEventDrainLimit && queued != 0 {
-			cause := fmt.Errorf("peer event backlog exceeded %d messages", peerEventDrainLimit)
-			_ = t.disconnectPeer(p, cause)
-			if countLive(peers) == 0 && !canAcquire {
-				return cause
-			}
-			continue
-		}
+		// A full drain pass can contain valid requested pieces, not just
+		// control-message spam. Yield to other peers without disconnecting;
+		// queued extension updates still defer this peer's next assignments.
 		p.deferDrive = pending || queued != 0
 	}
 	return nil
