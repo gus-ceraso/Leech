@@ -372,7 +372,7 @@ func TestReviewPressureKeepsPartialStageWhenEmptyStageSuffices(t *testing.T) {
 	}
 	sawPressure := false
 	for _, event := range observations {
-		sawPressure = sawPressure || event.Detail == "assignment blocked: staging pressure or no assignable piece"
+		sawPressure = sawPressure || event.Detail == "piece 1 reclaimed for staging pressure"
 	}
 	if !sawPressure {
 		t.Fatalf("missing coordinator staging-pressure diagnostic: %+v", observations)

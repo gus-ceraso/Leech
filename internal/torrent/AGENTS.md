@@ -5,8 +5,15 @@ Read [DESIGN §§7–9](../../DESIGN.md#7-input-and-metadata) and BEPs
 [52](../../beps/bep_0052.rst), and [53](../../beps/bep_0053.rst).
 
 - Source parsing/normalization has no output/cache mutations. Keep hostname
-  resolution separate. Reuse tracker normalization for metainfo and magnets,
-  preserving mandatory default-tracker inclusion and flattened unique URLs.
+  resolution separate. Reuse tracker normalization for metainfo and magnets:
+  skip unusable URL values (including invalid UTF-8), but reject malformed
+  metainfo tracker structure and excess unique usable URLs. Preserve mandatory
+  default-tracker inclusion and flattened unique URLs. `TrackerSkips` retains
+  only invalid-URL and unsupported-scheme counts; valid duplicates do not count.
+  Count at original magnet/metainfo normalization, not again when building a
+  tracker set. Metainfo tracker extraction validates structure and passes raw
+  entries to `normalizeInfo` for one normalization/counting pass. Never retain
+  discarded URL text for logging.
 - Metainfo tables are immutable after validation. `File.Index` retains original
   list positions, including padding and symlinks; ranges are half-open in the
   concatenated v1 byte space. File identity and output-path presence are separate,

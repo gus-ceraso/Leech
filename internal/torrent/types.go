@@ -35,13 +35,14 @@ type Piece struct {
 // Metainfo is normalized, validated v1 metadata. Callers treat its tables as
 // immutable after construction.
 type Metainfo struct {
-	InfoHash    InfoHash
-	Name        string
-	MultiFile   bool
-	PieceLength int64
-	TotalLength int64
-	Files       []File
-	Pieces      []Piece
-	Trackers    []string
-	Private     bool
+	InfoHash        InfoHash
+	Name            string
+	MultiFile       bool
+	PieceLength     int64
+	TotalLength     int64
+	Files           []File
+	Pieces          []Piece
+	Trackers        []string
+	SkippedTrackers TrackerSkips
+	Private         bool
 }

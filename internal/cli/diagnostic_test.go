@@ -6,6 +6,7 @@ import (
 	"net/netip"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gus-ceraso/Leech/internal/peer"
 	"github.com/gus-ceraso/Leech/internal/session"
@@ -67,7 +68,7 @@ func TestDiagnosticQueueBoundsRedactsAndDrops(t *testing.T) {
 		t.Fatalf("IPv6 tracker host was not retained safely: %q", got)
 	}
 	for _, line := range strings.Split(strings.TrimSpace(got), "\n") {
-		if len(strings.TrimPrefix(line, "debug: ")) > DefaultDiagnosticBytes {
+		if len(strings.TrimPrefix(withoutLogTimes(line), "debug: ")) > DefaultDiagnosticBytes {
 			t.Fatalf("rendered diagnostic exceeded %d bytes: %d", DefaultDiagnosticBytes, len(line))
 		}
 	}
@@ -75,9 +76,9 @@ func TestDiagnosticQueueBoundsRedactsAndDrops(t *testing.T) {
 
 func TestReportQueueAndSecondaryRetentionAreBounded(t *testing.T) {
 	queue := newReportQueue()
-	queue.enqueuePrepared(reportWarning, SanitizeDiagnostic("warning https://user:password@example.test/private?token=secret"+strings.Repeat("x", DefaultDiagnosticBytes*2)))
+	queue.enqueuePrepared(reportWarning, SanitizeDiagnostic("warning https://user:password@example.test/private?token=secret"+strings.Repeat("x", DefaultDiagnosticBytes*2)), time.Now())
 	for i := 0; i < reportQueueCapacity+2; i++ {
-		queue.enqueuePrepared(reportPhase, strings.Repeat("p", DefaultDiagnosticBytes))
+		queue.enqueuePrepared(reportPhase, strings.Repeat("p", DefaultDiagnosticBytes), time.Now())
 	}
 	if got := len(queue.records); got != reportQueueCapacity {
 		t.Fatalf("queued report records = %d, want %d", got, reportQueueCapacity)
@@ -103,7 +104,8 @@ func TestReportQueueAndSecondaryRetentionAreBounded(t *testing.T) {
 	if len(retained) != secondaryFailureLimit {
 		t.Fatalf("retained secondary failures = %d, want %d", len(retained), secondaryFailureLimit)
 	}
-	for _, message := range retained {
+	for _, record := range retained {
+		message := record.text
 		if len(message) > DefaultDiagnosticBytes || strings.Contains(message, "password") || strings.Contains(message, "/path") || strings.Contains(message, "token=secret") {
 			t.Fatalf("secondary failure retention was not bounded/redacted: %q", message)
 		}
@@ -122,7 +124,7 @@ func TestDiagnosticQueueRetainsAndRendersTypedPeerEndpoint(t *testing.T) {
 	var output bytes.Buffer
 	reporter := NewReporter(LogDebug, &output)
 	renderDiagnostic(reporter, retained)
-	if got, want := output.String(), "debug: session phase=transfer peer=[2001:db8::1]:51413\n"; got != want {
+	if got, want := withoutLogTimes(output.String()), "debug: session phase=transfer peer=[2001:db8::1]:51413\n"; got != want {
 		t.Fatalf("rendered peer endpoint = %q, want %q", got, want)
 	}
 

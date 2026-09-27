@@ -376,6 +376,16 @@ func (r *PhaseRun) Done() <-chan struct{} {
 	return r.finalDone
 }
 
+// FinalAnnounceError marks best-effort final-event failures. The wrapped causes
+// remain available to callbacks, but these failures never determine exit status.
+type FinalAnnounceError struct {
+	Failures int
+	Err      error
+}
+
+func (e *FinalAnnounceError) Error() string { return e.Err.Error() }
+func (e *FinalAnnounceError) Unwrap() error { return e.Err }
+
 // Finalize cancels and joins all normal announce loops, then sends at most one
 // completed and one stopped event per eligible tracker. Final errors are
 // returned for diagnostics and must not replace the session's primary result.
@@ -446,6 +456,9 @@ func (r *PhaseRun) Finalize(ctx context.Context, fullCompletion bool) error {
 		errs = append(errs, result.errs...)
 	}
 	err := errors.Join(errs...)
+	if err != nil {
+		err = &FinalAnnounceError{Failures: len(errs), Err: err}
+	}
 	r.mu.Lock()
 	r.finalErr = err
 	r.mu.Unlock()

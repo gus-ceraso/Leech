@@ -56,14 +56,13 @@ func runWithReporter(ctx context.Context, opts Options, stdout io.Writer, depend
 	dependencies.Resume = opts.Resume
 	dependencies.Streaming = opts.Stream
 	dependencies.Timeout = opts.Timeout
-	statusEnabled := reporter.statusEnabled()
+	statusEnabled := reporter.enabled(LogInfo)
 	diagnostics := newDiagnosticQueue()
 	reports := newReportQueue()
 	secondaries := &secondaryFailures{}
 	var statusMu sync.Mutex
 	var activeStatus Status
 	active, pending, statusQueued := false, false, false
-	statusAt := time.Time{}
 	statusGeneration, statusVersion := uint64(0), uint64(0)
 	setStatus := func(snapshot Status, phaseEntry bool) {
 		if !statusEnabled {
@@ -74,7 +73,7 @@ func runWithReporter(ctx context.Context, opts Options, stdout io.Writer, depend
 		activeStatus = snapshot
 		active = true
 		pending = true
-		statusAt = reporter.currentTime()
+		statusAt := reporter.currentTime()
 		statusVersion++
 		if phaseEntry {
 			reports.enqueuePhaseStatus(snapshot, statusAt, statusVersion)
@@ -95,7 +94,7 @@ func runWithReporter(ctx context.Context, opts Options, stdout io.Writer, depend
 		statusMu.Unlock()
 	}
 	renderStatusSnapshot := func(snapshot Status, version uint64, at time.Time) {
-		shown, err := reporter.renderStatusAt(snapshot, at)
+		shown, err := reporter.renderProgressAt(snapshot, at)
 		statusMu.Lock()
 		if version == statusVersion {
 			pending = !shown && err == nil
@@ -124,9 +123,9 @@ func runWithReporter(ctx context.Context, opts Options, stdout io.Writer, depend
 		handleReport := func(event reportEvent) {
 			switch event.kind {
 			case reportPhase:
-				_ = reporter.Phase(event.text)
+				_ = reporter.logAt(event.at, LogInfo, "phase: %s", QuoteName(event.text))
 			case reportWarning:
-				_ = reporter.Warning("%s", event.text)
+				_ = reporter.logAt(event.at, LogWarning, "%s", event.text)
 				markStatusPending()
 				renderPendingStatus()
 			case reportStatus:
@@ -138,11 +137,9 @@ func runWithReporter(ctx context.Context, opts Options, stdout io.Writer, depend
 				statusQueued = false
 				statusMu.Unlock()
 				renderStatusSnapshot(event.status, event.version, event.at)
-				statusMu.Lock()
-				if event.version != statusVersion && active && pending && !statusQueued {
-					statusQueued = reports.enqueueStatus(statusGeneration, activeStatus, statusAt, statusVersion)
-				}
-				statusMu.Unlock()
+				// Newer snapshots remain pending for the ticker or final flush.
+				// The consumer must not send into a queue its finished producers
+				// can close while it is rendering a prior snapshot.
 			case reportPhaseStatus:
 				renderStatusSnapshot(event.status, event.version, event.at)
 			}
@@ -218,7 +215,7 @@ func runWithReporter(ctx context.Context, opts Options, stdout io.Writer, depend
 		statusQueued = false
 		statusGeneration++
 		statusVersion++
-		reports.enqueuePrepared(reportPhase, phase)
+		reports.enqueuePrepared(reportPhase, phase, reporter.currentTime())
 		statusMu.Unlock()
 	}
 	dependencies.OnPhaseStatus = func(phase string, progress session.RunProgress) {
@@ -247,7 +244,9 @@ func runWithReporter(ctx context.Context, opts Options, stdout io.Writer, depend
 		if oldDiagnostic != nil {
 			oldDiagnostic(diagnostic)
 		}
-		diagnostics.enqueue(diagnostic)
+		if reporter.enabled(LogDebug) {
+			diagnostics.enqueue(diagnostic)
+		}
 	}
 	dependencies.OnWarning = func(message string) {
 		if oldWarning != nil {
@@ -255,7 +254,7 @@ func runWithReporter(ctx context.Context, opts Options, stdout io.Writer, depend
 		}
 		message = SanitizeDiagnostic(message)
 		statusMu.Lock()
-		reports.enqueuePrepared(reportWarning, message)
+		reports.enqueuePrepared(reportWarning, message, reporter.currentTime())
 		statusMu.Unlock()
 	}
 	dependencies.OnSecondary = func(shutdownErr error) {
@@ -266,8 +265,9 @@ func runWithReporter(ctx context.Context, opts Options, stdout io.Writer, depend
 	}
 	result, err := session.Run(ctx, dependencies)
 	stopReporter()
+	reportRunSummary(reporter, result.Summary, !opts.ListFiles)
 	for _, secondary := range secondaries.snapshot() {
-		_ = reporter.secondaryFailureText(secondary)
+		_ = reporter.secondaryFailure(secondary)
 	}
 	if err != nil {
 		_ = reporter.PrimaryFailure(err, result.HasVerifiedOutput)

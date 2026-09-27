@@ -109,12 +109,27 @@ func TestParseMagnetRejectsV2ConflictAndMalformedFields(t *testing.T) {
 		"magnet:?xt=urn%3Abtih%3A" + testHashHex + "&so=100000",
 		"magnet:?xt=urn%3Abtih%3A" + testHashHex + "&x.pe=127.0.0.1",
 		"magnet:?xt=urn%3Abtih%3A" + testHashHex + "&x.pe=0.0.0.0%3A1",
-		"magnet:?xt=urn%3Abtih%3A" + testHashHex + "&tr=ftp%3A%2F%2Fexample.test%2Fannounce",
 	}
 	for _, raw := range cases {
 		if _, err := ParseMagnet(raw); err == nil {
 			t.Errorf("ParseMagnet(%q) unexpectedly succeeded", raw)
 		}
+	}
+}
+
+func TestParseMagnetSkipsUnusableTrackers(t *testing.T) {
+	magnet, err := ParseMagnet("magnet:?xt=urn:btih:" + testHashHex +
+		"&tr=wss%3A%2F%2Ftracker.example%2Fannounce&tr=ftp%3A%2F%2Ftracker.example%2Fannounce" +
+		"&tr=&tr=udp%3A%2F%2Ftracker.example%3A6969%2Fannounce")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{DefaultTracker, "udp://tracker.example:6969/announce"}
+	if !reflect.DeepEqual(magnet.Trackers, want) {
+		t.Fatalf("trackers = %#v, want %#v", magnet.Trackers, want)
+	}
+	if magnet.SkippedTrackers != (TrackerSkips{InvalidURL: 1, UnsupportedScheme: 2}) {
+		t.Fatalf("skipped URLs = %+v", magnet.SkippedTrackers)
 	}
 }
 
@@ -137,6 +152,9 @@ func TestMagnetTrackerDuplicatesCollapseBeforeLimit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if magnet.SkippedTrackers.Total() != 0 {
+		t.Fatalf("valid duplicates counted as skipped URLs: %+v", magnet.SkippedTrackers)
+	}
 	if len(magnet.Trackers) != 2 || magnet.Trackers[1] != "http://tracker.example/announce" {
 		t.Fatalf("trackers = %#v", magnet.Trackers)
 	}
@@ -150,9 +168,9 @@ func TestMagnetTrackerDuplicatesCollapseBeforeLimit(t *testing.T) {
 	}
 }
 
-func TestTrackerErrorsDoNotExposeURL(t *testing.T) {
+func TestTrackerURLErrorsDoNotExposeURL(t *testing.T) {
 	raw := "http://user:secret@example.test:bad/announce?token=secret-query"
-	_, err := NormalizeTrackers([]string{raw})
+	_, err := normalizeTrackerURL(raw)
 	if err == nil {
 		t.Fatal("expected malformed tracker URL")
 	}

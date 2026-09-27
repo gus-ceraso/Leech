@@ -96,6 +96,9 @@ func TestRaceEndpointUTPWinsAndUsesExactEndpoint(t *testing.T) {
 	if result.Transport != TransportUTP || result.Conn == nil || result.Endpoint != ep || result.Handshake.PeerID != remote.PeerID {
 		t.Fatalf("race result = %+v", result)
 	}
+	if result.Race.UTP.Outcome != AttemptSucceeded || result.Race.UTP.Stage != AttemptComplete || result.Race.TCP.Outcome != AttemptNotStarted || result.Race.Winner != TransportUTP {
+		t.Fatalf("race observations = %+v", result.Race)
+	}
 	_ = result.Conn.Close()
 	select {
 	case <-tcpCalled:
@@ -136,6 +139,9 @@ func TestRaceEndpointTCPWinsAndCancelsLoser(t *testing.T) {
 	}
 	if result.Transport != TransportTCP {
 		t.Fatalf("transport winner = %v, want TCP", result.Transport)
+	}
+	if result.Race.TCP.Outcome != AttemptSucceeded || result.Race.UTP.Outcome != AttemptCanceled || (result.Race.UTP.Stage != AttemptReadHandshake && result.Race.UTP.Stage != AttemptWriteHandshake) || result.Race.Winner != TransportTCP || result.Race.Duration <= 0 {
+		t.Fatalf("TCP win lost the canceled uTP handshake: %+v", result.Race)
 	}
 	_ = result.Conn.Close()
 	select {
@@ -234,6 +240,9 @@ func TestRaceEndpointReportsBothFailuresWithoutStrike(t *testing.T) {
 	if result.Conn != nil {
 		t.Fatal("failed race returned connection")
 	}
+	if result.Race.TCP.Outcome != AttemptFailed || result.Race.UTP.Outcome != AttemptFailed || result.Race.TCP.Stage != AttemptDial || result.Race.UTP.Stage != AttemptDial {
+		t.Fatalf("failed race lost attempt observations: %+v", result.Race)
+	}
 	var raceErr *RaceError
 	if !errors.As(err, &raceErr) || len(raceErr.Attempts) != 2 || calls.Load() != 2 {
 		t.Fatalf("race error=%v calls=%d", err, calls.Load())
@@ -282,6 +291,9 @@ func TestRaceEndpointStartsTCPAfterHeadStartWhenUTPFailsEarly(t *testing.T) {
 	}
 	if out.result.Transport != TransportTCP || out.result.Handshake.PeerID != remote.PeerID {
 		t.Fatalf("race result = %+v, want valid TCP handshake", out.result)
+	}
+	if out.result.Race.UTP.Outcome != AttemptFailed || out.result.Race.UTP.Stage != AttemptDial || out.result.Race.TCP.Outcome != AttemptSucceeded {
+		t.Fatalf("early uTP failure mislabeled as cancellation: %+v", out.result.Race)
 	}
 	_ = out.result.Conn.Close()
 }

@@ -58,7 +58,14 @@ BEPs [3](../../beps/bep_0003.rst), [6](../../beps/bep_0006.rst),
   started; endpoint-budget, backoff, and slot-wait failures remain pre-race.
   `DialWithResult` preserves the validated winner fields if peer-ID registry
   admission rejects a collision; the result connection is already closed in that
-  case. See the [uTP dial-context lifetime rule](../utp/AGENTS.md).
+  case. `HandshakeResult.Race` survives failure and includes both joined attempts,
+  even a failed or successful loser drained after the winner. Outcomes, stages,
+  and failure reasons are closed numeric enums; never retain raw errors in these
+  observations. Cancellation-induced closed-stream errors follow the attempt
+  context; independent refusal, EOF, and protocol errors remain failures.
+  Deadlines count as failures, not cancellations. Unknown errors are `io-error`.
+  `RetryAfter` records ordinary endpoint backoff, not a losing transport's delay.
+  See the [uTP dial-context lifetime rule](../utp/AGENTS.md).
 - Distinguish severe peer-origin violations from ordinary disconnects, stalls,
   and compatibility failures; keep bounded well-framed unknown messages ignorable.
 

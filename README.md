@@ -59,21 +59,33 @@ or see the [CLI contract](DESIGN.md#4-command-line-interface).
   It starts at file transfer, not during metadata discovery or resume hashing.
   Without it, retrying has no time limit.
 - **Output:** `--list-files` uses standard output. Diagnostics go to standard
-  error; `--loglevel info` enables progress and completion messages.
+  error with UTC timestamps. `--loglevel info` enables progress, a final summary,
+  and completion messages. Redirected transfer progress appears at most every
+  30 seconds; terminal status refreshes at most once per second.
+- **Diagnostics:** `--loglevel debug` adds state changes, batched request/late-reply
+  counts, and per-transport race outcomes with safe failure categories. Final
+  totals distinguish TCP/uTP wins, failures, and cancellations. Skipped tracker
+  URLs are counted by reason without printing them. Final tracker-announcement
+  failures are explicitly nonfatal warnings and do not change a successful exit.
+  Summary payload rates include discarded bytes; `useful-connections` counts
+  connections that staged data, with reconnects counted separately.
 
 ## Limits
 
 Leech discovers peers through HTTP(S) and UDP trackers and magnet `x.pe` entries.
 It always adds [`http://tracker.opentrackr.org:1337/announce`](http://tracker.opentrackr.org:1337/announce)
-and races outgoing uTP and TCP connections over IPv4 and IPv6.
+and skips unusable tracker URLs, including WebSocket URLs. It races outgoing
+uTP and TCP connections over IPv4 and IPv6.
 
 There is no DHT, PEX, local peer discovery, web-seed support, inbound peer
 listener, upload, BitTorrent v2, or hybrid-torrent support. Leech ignores
 `private=1` and treats those torrents as public, including use of the default
 tracker. Peers that require reciprocation may refuse to serve it.
 
-Validation uses local deterministic tracker and peer fixtures. Interoperability
-has not been tested against live trackers or existing BitTorrent clients. See
-the design's [supported bounds](DESIGN.md#16-supported-bounds) and
+Automated validation uses local deterministic tracker and peer fixtures. Live
+Big Buck Bunny downloads have completed with HTTP/UDP tracker discovery and TCP
+peers. A known uTP setup sequencing defect drops the first incoming data packet
+with libutp-style sequence numbering; live uTP transfers remain unverified.
+See the design's [supported bounds](DESIGN.md#16-supported-bounds) and
 [trust boundaries](DESIGN.md#17-security-and-trust-boundaries) for the complete
 limits and accepted risks.

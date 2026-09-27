@@ -3,12 +3,14 @@ package torrent
 import (
 	"encoding/base32"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net"
 	"net/url"
 	"strconv"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/gus-ceraso/Leech/internal/limits"
 )
@@ -38,12 +40,26 @@ type Source struct {
 // Magnet contains the useful, bounded values from a v1 magnet URI. Trackers
 // always includes DefaultTracker, and Selection keeps BEP 53 ranges compact.
 type Magnet struct {
-	InfoHash    InfoHash
-	DisplayName string
-	Trackers    []string
-	Peers       []PeerAddress
-	Selection   []IndexRange
+	InfoHash        InfoHash
+	DisplayName     string
+	Trackers        []string
+	Peers           []PeerAddress
+	Selection       []IndexRange
+	SkippedTrackers TrackerSkips
 }
+
+// TrackerSkips counts discarded URL entries, not valid duplicates or unused
+// announce values.
+// InvalidURL includes empty, malformed, overlong, and invalid-UTF-8 entries.
+// No discarded URL text is retained.
+type TrackerSkips struct {
+	InvalidURL        uint64
+	UnsupportedScheme uint64
+}
+
+func (s TrackerSkips) Total() uint64 { return s.InvalidURL + s.UnsupportedScheme }
+
+var errTrackerScheme = errors.New("unsupported tracker URL scheme")
 
 // PeerAddress is a syntactically valid magnet x.pe endpoint. Host may be a
 // DNS name or an IP literal; resolution is deliberately a later boundary.
@@ -229,13 +245,7 @@ func ParseMagnet(raw string) (Magnet, error) {
 		magnet.DisplayName = names[0]
 	}
 
-	trackers := values["tr"]
-	for _, tracker := range trackers {
-		if tracker == "" {
-			return Magnet{}, fmt.Errorf("magnet contains an empty tracker")
-		}
-	}
-	magnet.Trackers, err = TrackersWithDefault(trackers)
+	magnet.Trackers, err = trackersWithDefault(values["tr"], &magnet.SkippedTrackers)
 	if err != nil {
 		return Magnet{}, err
 	}
@@ -384,29 +394,44 @@ func parseIndex(raw string) (int, error) {
 	return int(value), nil
 }
 
-// TrackersWithDefault validates, deduplicates, and prepends the mandatory
-// default tracker. It preserves the first occurrence of each URL.
+// TrackersWithDefault prepends the mandatory default tracker, skips unusable
+// URLs, and preserves the first occurrence of each usable URL.
 func TrackersWithDefault(trackers []string) ([]string, error) {
+	return trackersWithDefault(trackers, nil)
+}
+
+func trackersWithDefault(trackers []string, skipped *TrackerSkips) ([]string, error) {
 	all := make([]string, 0, len(trackers)+1)
 	all = append(all, DefaultTracker)
 	all = append(all, trackers...)
-	return NormalizeTrackers(all)
+	return normalizeTrackers(all, skipped)
 }
 
-// NormalizeTrackers validates and deduplicates tracker URLs while preserving
-// order. It does not add the default tracker; use TrackersWithDefault when
-// building a source's complete tracker set.
+// NormalizeTrackers skips unusable URLs and deduplicates the rest in order.
+// It rejects more than the supported number of unique usable URLs. It does
+// not add the default tracker; use TrackersWithDefault for complete sets.
 func NormalizeTrackers(trackers []string) ([]string, error) {
+	return normalizeTrackers(trackers, nil)
+}
+
+func normalizeTrackers(trackers []string, skipped *TrackerSkips) ([]string, error) {
 	capacity := len(trackers)
 	if capacity > limits.Trackers {
 		capacity = limits.Trackers
 	}
 	result := make([]string, 0, capacity)
-	seen := make(map[string]struct{}, len(trackers))
+	seen := make(map[string]struct{}, capacity)
 	for _, tracker := range trackers {
 		normalized, err := normalizeTrackerURL(tracker)
 		if err != nil {
-			return nil, err
+			if skipped != nil {
+				if errors.Is(err, errTrackerScheme) {
+					skipped.UnsupportedScheme++
+				} else {
+					skipped.InvalidURL++
+				}
+			}
+			continue
 		}
 		if _, exists := seen[normalized]; exists {
 			continue
@@ -434,8 +459,8 @@ func MergeTrackers(groups ...[]string) ([]string, error) {
 func DeduplicateTrackers(trackers []string) ([]string, error) { return NormalizeTrackers(trackers) }
 
 func normalizeTrackerURL(raw string) (string, error) {
-	if raw == "" || len(raw) > limits.MetainfoBytes {
-		return "", fmt.Errorf("tracker URL is empty or too large")
+	if raw == "" || len(raw) > limits.MetainfoBytes || !utf8.ValidString(raw) {
+		return "", fmt.Errorf("tracker URL is empty, too large, or not valid UTF-8")
 	}
 	u, err := url.Parse(raw)
 	if err != nil || u.Scheme == "" || u.Host == "" || u.Opaque != "" || u.Fragment != "" {
@@ -445,7 +470,7 @@ func normalizeTrackerURL(raw string) (string, error) {
 	switch u.Scheme {
 	case "http", "https", "udp":
 	default:
-		return "", fmt.Errorf("unsupported tracker URL scheme %q", u.Scheme)
+		return "", errTrackerScheme
 	}
 	if u.Hostname() == "" || strings.ContainsAny(u.Hostname(), "\x00\r\n") {
 		return "", fmt.Errorf("malformed tracker URL")

@@ -61,7 +61,7 @@ func newBlockedDebugWriter() *blockedDebugWriter {
 func (w *blockedDebugWriter) Write(p []byte) (int, error) {
 	w.active.Add(1)
 	defer w.active.Add(-1)
-	if bytes.HasPrefix(p, []byte("debug:")) {
+	if strings.HasPrefix(withoutLogTimes(string(p)), "debug:") {
 		w.once.Do(func() {
 			close(w.entered)
 			<-w.release
@@ -99,7 +99,7 @@ func newBlockedWarningWriter() *blockedWarningWriter {
 func (w *blockedWarningWriter) Write(p []byte) (int, error) {
 	w.active.Add(1)
 	defer w.active.Add(-1)
-	if bytes.HasPrefix(p, []byte("warning: tracker")) {
+	if strings.HasPrefix(withoutLogTimes(string(p)), "warning: tracker") {
 		w.once.Do(func() {
 			close(w.entered)
 			<-w.release
@@ -405,6 +405,7 @@ func TestCLITransferContinuesAndJoinsUnderDiagnosticQueuePressure(t *testing.T) 
 	}
 	var dropped uint64
 	for _, line := range strings.Split(outputText, "\n") {
+		line = withoutLogTimes(line)
 		if strings.HasPrefix(line, "debug: diagnostics: dropped ") {
 			if _, err := fmt.Sscanf(line, "debug: diagnostics: dropped %d", &dropped); err != nil || dropped == 0 {
 				t.Fatalf("invalid dropped-record summary %q: %d, %v", line, dropped, err)

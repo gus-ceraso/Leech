@@ -42,15 +42,19 @@ piece/request state, and `transfer.go` coordinates peer I/O and finalization.
   candidates, preserving it across tracker notifications.
 - `RunConfig.OnDiagnostic` is optional and separate from progress, warnings, and
   secondary failures. Its exact value shape is
-  `Diagnostic{Kind DiagnosticKind, Phase string, Endpoint DiagnosticEndpoint,
-  Peer peer.Endpoint, Count, IPv4Count, IPv6Count uint64,
-  Duration time.Duration, Detail string}`;
+  `Diagnostic{At time.Time, Kind DiagnosticKind, Phase string,
+  Endpoint DiagnosticEndpoint, Peer peer.Endpoint,
+  Count, IPv4Count, IPv6Count uint64, Duration, RetryAfter time.Duration,
+  Race peer.RaceObservation, Detail string}`;
   `DiagnosticEndpoint` is `{Scheme, Host string}` and peer endpoint is the fixed
   `netip.Addr` plus `uint16` port (`peer.Endpoint`), zero when not applicable
   or when the address has a zone.
   Kinds are constants; phase, tracker, metadata, peer-selection, lifecycle,
-  transfer, and transport-race observations are emitted by their owning state
-  transitions. CLI-retained Phase/Detail/tracker text totals at most 4096
+  transfer, transport-race, and skipped-tracker observations are emitted by their
+  owning state transitions. `coordinator.diagnostic` stamps capture time and
+  updates bounded race totals before invoking optional observers; route both
+  metadata and transfer races through it even without a CLI observer.
+  CLI-retained Phase/Detail/tracker text totals at most 4096
   bytes per record; a numeric peer renders to at most 47 bytes. CLI queue holds
   128 records. Producers must return promptly. Tracker endpoints contain
   scheme/host only; never put URLs, errors, payload, or magnet sources in
@@ -66,13 +70,20 @@ piece/request state, and `transfer.go` coordinates peer I/O and finalization.
   records on pressure. Transfer emits `DiagnosticTransfer` transitions from the
   coordinator at choke, availability, Allowed Fast, useful-block, tombstone,
   scheduling, and finalizer state effects. Initial empty availability is observed
-  at admission; unchanged availability is silent. Request assignments and newly
-  received Allowed Fast grants accumulate in saturating per-peer counters and are
-  emitted at most once per peer per existing replacement tick (also flushed on
-  retirement or shutdown); duplicate grants do not increment them. Keep event
-  details summarized, with no per-block logging. `DiagnosticTransportRace`
-  records the actual handshake winner or a failed race, including metadata phase,
-  without retaining raw errors. `RaceWithResult` distinguishes a started race
+  at admission; unchanged availability is silent. Request assignments, newly
+  received Allowed Fast grants, and exact consumed tombstones accumulate in
+  saturating per-peer counters, emitted at most once per existing replacement
+  tick and flushed on retirement/shutdown. Duplicate grants do not increment
+  them; late payload never becomes useful progress. Keep details summarized,
+  with no per-block logging. Assignment blockers describe further requests after
+  existing stages have been used. Never clear `lastBlocked` on entry to a drive
+  pass or equate failed piece reservation with blocked block assignment. Reuse
+  cached reservation eligibility to distinguish staged-count/byte limits from
+  no assignable work; reclamation reports the actual discarded stage.
+  `DiagnosticTransportRace` retains the winner and both joined attempt outcomes,
+  stages, bounded reason enums, and durations. Ordinary failed races include
+  endpoint backoff delay, replacing repeated backoff-scan and redundant generic
+  dial-failure lines. `RaceWithResult` distinguishes a started race
   from errors during admission, budget checks, or slot waits. `DialWithResult`
   carries the winner through collision rejection while its closed connection
   remains unowned by session.
@@ -89,7 +100,16 @@ piece/request state, and `transfer.go` coordinates peer I/O and finalization.
   replacement tick; it supplies admitted live-peer counts. The session owner
   composes verified bytes and its five-second payload-rate window there. Keep
   `OnProgress` commit-only: status observations never reset the no-progress
-  timer. Callbacks must return promptly.
+  timer. Callbacks must return promptly. CLI installs status observation at
+  info/debug even on redirected stderr, with sparse permanent progress instead
+  of a replaceable status line.
+- `RunResult.Summary` is a final snapshot on success or failure, not a metrics
+  store. Reuse scheduler verified bytes and tracker payload accounting. Count a
+  useful connection once at its first accepted/staged block (not unique endpoints
+  or necessarily verified contributors). Only race-total updates need a mutex;
+  copy the final summary after all producers join. Session elapsed time includes
+  final announcements; transfer elapsed time stops after joined transfer cleanup,
+  before final events. See DESIGN §4.9 for rate and counter meanings.
 - Retire disconnected peers after a drive pass, once their workers have joined
   and no event index or iteration is in use. Clear removed slice references;
   keep endpoint penalties separately.
@@ -104,7 +124,7 @@ not replace them with direct calls to `observe` or `Reporter.Debug`.
 | Ordinary choke duration; Allowed Fast grant versus useful request/data; a grant without ordinary availability cannot trigger a request | `TestTransferFastAllowedPieceCanProgressWhileChoked`; `TestPeerStateAvailabilityAndAllowedFastAreIndependent` |
 | Empty availability, transitions, and duplicate suppression | `TestTransferDiagnosticsObserveAvailabilityAndFirstUsefulBlock` |
 | First useful block; late and callback-rejected payload are not useful | `TestTransferDiagnosticsObserveAvailabilityAndFirstUsefulBlock`; `TestTransferPayloadCallbackCountsLatePiece`; `TestTransferPayloadCallbackErrorStopsBeforeAcceptance` |
-| Exact late Piece and Reject tombstones consumed once without strike/progress | `TestTransferTimeoutPreservesFastLateTerminalWithoutStrike`; `TestTransferTimeoutPreservesFastLateRejectWithoutStrike` |
+| Exact late Piece and Reject tombstones counted once and flushed without strike/progress | `TestTransferTimeoutPreservesFastLateTerminalWithoutStrike`; `TestTransferTimeoutPreservesFastLateRejectWithoutStrike` |
 | Peer-ID collision keeps older live peer, preserves endpoint penalties, and reports the real winner in a local session | `TestAdmissionAdvancesExaminedCandidates/live-ID-collision` |
 | Actual winning and failed transport race, metadata phase included | `TestV1MagnetAndBareHashRunMetadataThenTransferThroughCLI`; `TestMetadataDiscoveryReportsFailedTransportRace` |
 | Metadata refusal | `TestMetadataDiscoveryObservesMetadataReject` |
@@ -113,13 +133,14 @@ not replace them with direct calls to `observe` or `Reporter.Debug`.
 | Clean corruption reports retry; simultaneous corruption/storage failure reports fatal, not retry, and preserves strikes/cleanup | `TestTransferCorruptPieceRetriesWithoutOutput`; `TestFinalizePieceCorruptStageCloseFailurePropagatesFatal`; `TestTransferFatalCorruptStageCloseFailureShutsDownImmediately` |
 | Fatal cache-start, piece-admission, and block-write failures report one bounded diagnostic | `TestTransferFatalStagingStartDiagnostic`; `TestTransferFatalStagingFailureDiagnosticAtStorageBoundary` |
 | Incoming transfer requests reject only where Fast/metadata is usable, never upload payload, and do not read cache or output during rejection | `TestTransferRejectsIncomingPayloadRequestWithoutUploading`; `TestTransferIgnoresIncomingNonFastPayloadRequest`; `TestMetadataFetcherIgnoresIncomingCorePayloadRequest`; `TestMetadataDiscoveryRejectsIncomingMetadataRequest` |
-| Piece assignment/completion debug from CLI; actual coordinator endgame, choke, zero-reqq, and staging-pressure reasons | `TestV1MagnetAndBareHashRunMetadataThenTransferThroughCLI`; `TestTransferEndgameDuplicateWinnerDoesNotDoubleCommit`; `TestTransferDriveReportsChokeAndZeroReqQBlocks`; `TestReviewPressureKeepsPartialStageWhenEmptyStageSuffices` |
+| Piece assignment/completion debug from CLI; actual coordinator endgame, choke, zero-reqq, and staging-pressure reasons | `TestV1MagnetAndBareHashRunMetadataThenTransferThroughCLI`; `TestTransferEndgameDuplicateWinnerDoesNotDoubleCommit`; `TestTransferDriveReportsChokeAndZeroReqQBlocks`; `TestReviewPressureKeepsPartialStageWhenEmptyStageSuffices`; `TestAssignmentDiagnosticsCoalesceStablePostDriveReasons` |
 | Local tracker warning/debug redaction and CLI level filtering | `TestRunWithSessionReportsRedactedProductionTrackerFailure`; `TestRunWithSessionEmitsProductionDebugPhaseDiagnostic`; `TestDiagnosticQueueBoundsRedactsAndDrops` |
 | Repeated tracker failures and duplicate peer messages under full debug queue; transfer completes, drop count is reported, reporter joins | `TestCLITransferContinuesAndJoinsUnderDiagnosticQueuePressure`; `TestDiagnosticQueueBoundsRedactsAndDrops` |
 
-The CLI acceptance checks additionally cover all four log levels, noninteractive
-status suppression, stdout separation, diagnostic drain before final output, real
-peer/scheduling/lifecycle debug output, and a local completed transfer under
+The CLI acceptance checks additionally cover all four log levels, timestamped
+output, sparse redirected progress, stdout separation, diagnostic drain before
+final output, nonfatal final-tracker warnings, peer/scheduling/lifecycle debug
+output, and a local completed transfer under
 repeated tracker failures and peer-message pressure in
 `internal/cli/diagnostic_pressure_test.go`. The pressure test observes queue drops
 and reporter join; `TestDiagnosticQueueBoundsRedactsAndDrops` asserts the fixed

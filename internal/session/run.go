@@ -108,6 +108,7 @@ type RunResult struct {
 	// HasVerifiedOutput reports selected payload retained in final output,
 	// including pieces verified during resume.
 	HasVerifiedOutput bool
+	Summary           RunSummary
 }
 
 // RunProgress is the immutable snapshot used by commit and live-status callbacks.
@@ -130,6 +131,7 @@ const (
 	DiagnosticLifecycle
 	DiagnosticTransfer
 	DiagnosticTransportRace
+	DiagnosticTrackerSkip
 )
 
 // DiagnosticEndpoint contains only tracker scheme and host. Producers must not
@@ -146,15 +148,18 @@ type DiagnosticEndpoint struct {
 // per record; queues are bounded independently by the observer. Counts and
 // durations remain typed values.
 type Diagnostic struct {
-	Kind      DiagnosticKind
-	Phase     string
-	Endpoint  DiagnosticEndpoint
-	Peer      peer.Endpoint
-	Count     uint64
-	IPv4Count uint64
-	IPv6Count uint64
-	Duration  time.Duration
-	Detail    string
+	At         time.Time
+	Race       peer.RaceObservation
+	RetryAfter time.Duration
+	Kind       DiagnosticKind
+	Phase      string
+	Endpoint   DiagnosticEndpoint
+	Peer       peer.Endpoint
+	Count      uint64
+	IPv4Count  uint64
+	IPv6Count  uint64
+	Duration   time.Duration
+	Detail     string
 }
 
 // RunSource parses raw source syntax and runs one session.
@@ -172,8 +177,16 @@ func RunSource(ctx context.Context, raw string, config RunConfig) (RunResult, er
 // discovery before selection and resume validation, and it returns only after
 // every owned network and storage worker has stopped.
 func Run(ctx context.Context, config RunConfig) (result RunResult, err error) {
+	startedAt := time.Now()
+	var run *coordinator
 	var verifiedOutput atomic.Bool
-	defer func() { result.HasVerifiedOutput = verifiedOutput.Load() }()
+	defer func() {
+		result.HasVerifiedOutput = verifiedOutput.Load()
+		if run != nil {
+			result.Summary = run.runSummary()
+		}
+		result.Summary.Elapsed = time.Since(startedAt)
+	}()
 
 	if ctx == nil {
 		ctx = context.Background()
@@ -219,7 +232,10 @@ func Run(ctx context.Context, config RunConfig) (result RunResult, err error) {
 	if backoff == nil {
 		backoff = peer.NewEndpointBackoff()
 	}
-	run := &coordinator{config: config, identity: identity, backoff: backoff, verifiedOutput: &verifiedOutput}
+	run = &coordinator{config: config, identity: identity, backoff: backoff, verifiedOutput: &verifiedOutput}
+	if source.Magnet != nil {
+		run.reportTrackerSkips(source.Magnet.SkippedTrackers, len(source.Trackers))
+	}
 	run.updateQueue = newTrackerPeerUpdateQueue()
 	run.ownSet = config.TrackerSet == nil
 	defer func() {
@@ -255,6 +271,7 @@ func Run(ctx context.Context, config RunConfig) (result RunResult, err error) {
 		if err != nil {
 			return RunResult{}, err
 		}
+		run.reportTrackerSkips(meta.SkippedTrackers, len(meta.Trackers))
 		if config.TrackerSet == nil && !config.ListFiles {
 			// A local .torrent is validated completely before any network owner is
 			// constructed.  This preserves offline validation and lets the
@@ -307,6 +324,7 @@ func Run(ctx context.Context, config RunConfig) (result RunResult, err error) {
 	if err != nil {
 		return RunResult{}, err
 	}
+	run.summary.SelectedBytes = runSelectedBytes(selection)
 	run.phase("selection")
 	plan, err := storage.Validate(config.OutputDir, meta, selection.SelectedIndices())
 	if err != nil {
@@ -319,6 +337,9 @@ func Run(ctx context.Context, config RunConfig) (result RunResult, err error) {
 	if config.Resume {
 		run.activePhase("resume", RunProgress{SelectedBytes: runSelectedBytes(selection)})
 		resumeResult, err = storage.ScanResume(ctx, selection, plan)
+		for _, span := range resumeResult.VerifiedRanges {
+			run.summary.VerifiedSelectedBytes += span.Range.End - span.Range.Begin
+		}
 		if len(resumeResult.VerifiedPieces) > 0 {
 			verifiedOutput.Store(true)
 		}
@@ -441,6 +462,9 @@ type coordinator struct {
 	config         RunConfig
 	identity       tracker.Identity
 	verifiedOutput *atomic.Bool
+	summary        RunSummary
+	raceSummaryMu  sync.Mutex
+	phaseStarted   time.Time
 
 	set         *tracker.TrackerSet
 	ownSet      bool
@@ -464,6 +488,7 @@ func (c *coordinator) phase(name string) {
 	if c == nil {
 		return
 	}
+	c.phaseStarted = time.Now()
 	c.diagnostic(Diagnostic{Kind: DiagnosticPhaseTransition, Phase: name})
 	if c.config.OnPhase != nil {
 		c.config.OnPhase(name)
@@ -475,12 +500,30 @@ func (c *coordinator) phaseExit(name string, err error) {
 	if err != nil {
 		detail = "phase exited with failure"
 	}
-	c.diagnostic(Diagnostic{Kind: DiagnosticLifecycle, Phase: name, Detail: detail})
+	c.diagnostic(Diagnostic{Kind: DiagnosticLifecycle, Phase: name, Detail: detail, Duration: time.Since(c.phaseStarted)})
 }
 
 func (c *coordinator) diagnostic(event Diagnostic) {
-	if c != nil && c.config.OnDiagnostic != nil {
+	if event.At.IsZero() {
+		event.At = time.Now()
+	}
+	if event.Kind == DiagnosticTransportRace {
+		c.raceSummaryMu.Lock()
+		c.summary.Races = saturatingAdd(c.summary.Races, 1)
+		c.summary.TCP.record(event.Race.TCP, event.Race.Winner == peer.TransportTCP)
+		c.summary.UTP.record(event.Race.UTP, event.Race.Winner == peer.TransportUTP)
+		c.raceSummaryMu.Unlock()
+	}
+	if c.config.OnDiagnostic != nil {
 		c.config.OnDiagnostic(event)
+	}
+}
+
+func (c *coordinator) reportTrackerSkips(skipped torrent.TrackerSkips, usable int) {
+	c.summary.SkippedTrackers = skipped
+	if skipped.Total() != 0 {
+		c.diagnostic(Diagnostic{Kind: DiagnosticTrackerSkip, Count: skipped.Total(),
+			Detail: fmt.Sprintf("usable=%d invalid-url=%d unsupported-scheme=%d", usable, skipped.InvalidURL, skipped.UnsupportedScheme)})
 	}
 }
 
@@ -553,7 +596,7 @@ func (c *coordinator) observeTracker(update tracker.Update) {
 			event.Detail += ", not transmitted"
 		}
 		if update.Activated {
-			event.Detail += ", response accepted"
+			event.Detail += ", response accepted interval=" + update.Interval.String()
 		} else if update.Err != nil {
 			event.Detail += ", response failed"
 			if finalEvent {
@@ -668,11 +711,33 @@ func boundedTrackerWarning(endpoint DiagnosticEndpoint, detail string) string {
 func trackerFailureDetail(err error) string {
 	var httpErr *tracker.HTTPError
 	if errors.As(err, &httpErr) {
-		return "HTTP tracker transaction failed"
+		code := "unknown"
+		switch httpErr.Code {
+		case tracker.HTTPErrorInvalidURL, tracker.HTTPErrorRequest, tracker.HTTPErrorStatus,
+			tracker.HTTPErrorResponse, tracker.HTTPErrorBodyLimit, tracker.HTTPErrorMalformed,
+			tracker.HTTPErrorTracker, tracker.HTTPErrorInterval, tracker.HTTPErrorRetryDelay,
+			tracker.HTTPErrorCanceled, tracker.HTTPErrorTimeout:
+			code = string(httpErr.Code)
+		}
+		detail := "HTTP tracker transaction failed code=" + code
+		if httpErr.StatusCode >= 100 && httpErr.StatusCode <= 599 {
+			detail += fmt.Sprintf(" status=%d", httpErr.StatusCode)
+		}
+		if httpErr.RetryAfter > 0 {
+			detail += " retry-hint=" + httpErr.RetryAfter.String()
+		}
+		return detail
 	}
 	var udpErr *tracker.Error
 	if errors.As(err, &udpErr) {
-		return "UDP tracker transaction failed"
+		code := "unknown"
+		switch udpErr.Code {
+		case tracker.ErrorInvalidURL, tracker.ErrorResolve, tracker.ErrorDial, tracker.ErrorWrite,
+			tracker.ErrorRead, tracker.ErrorTimeout, tracker.ErrorMalformed, tracker.ErrorTransaction,
+			tracker.ErrorAction, tracker.ErrorTracker, tracker.ErrorCanceled, tracker.ErrorClosed:
+			code = string(udpErr.Code)
+		}
+		return "UDP tracker transaction failed code=" + code
 	}
 	return "transaction failed"
 }
@@ -690,7 +755,10 @@ func dialOutcomeDiagnostic(phase string, endpoint peer.Endpoint, result peer.Han
 			detail = "peer admission failed; " + detail
 		}
 	}
-	return Diagnostic{Kind: DiagnosticTransportRace, Phase: phase, Peer: endpoint, Detail: detail}
+	if errors.Is(err, context.Canceled) {
+		detail = "canceled"
+	}
+	return Diagnostic{Kind: DiagnosticTransportRace, Phase: phase, Peer: endpoint, Detail: detail, Race: result.Race, RetryAfter: result.RetryAfter}
 }
 
 func diagnosticTrackerEndpoint(raw string) DiagnosticEndpoint {
@@ -763,7 +831,7 @@ func (c *coordinator) discover(ctx context.Context, source torrent.Source) (torr
 		TrackerClock: c.config.TrackerClock, Resolver: c.config.Resolver,
 		TCPDial: c.tcpDial(), UTPDial: c.utpDial(), Clock: c.config.RaceClock,
 		UTPHeadStart: c.config.UTPHeadStart, Backoff: c.backoff,
-		LocalHandshake: local, OnSecondary: c.config.OnSecondary, OnDiagnostic: c.config.OnDiagnostic, onTrackerPump: c.drainTrackerWarnings, OnStrike: func(endpoint peer.Endpoint, count uint8) {
+		LocalHandshake: local, OnSecondary: c.config.OnSecondary, OnDiagnostic: c.diagnostic, onTrackerPump: c.drainTrackerWarnings, OnStrike: func(endpoint peer.Endpoint, count uint8) {
 			strikes[endpoint] = int(count)
 		},
 	})
@@ -844,7 +912,7 @@ func (c *coordinator) startTransferPhase(ctx context.Context, source torrent.Sou
 	if err != nil {
 		return err
 	}
-	admission := newTrackerPeerResolver(runCtx, c.config.Resolver, c.updateQueue, c.config.OnDiagnostic)
+	admission := newTrackerPeerResolver(runCtx, c.config.Resolver, c.updateQueue, c.diagnostic)
 	admission.onPump = c.drainTrackerWarnings
 	defer c.updateQueue.clear()
 	quiesceAdmission := func() {
@@ -876,7 +944,6 @@ func (c *coordinator) startTransferPhase(ctx context.Context, source torrent.Sou
 				candidate := snapshot[index]
 				candidateCursor = (index + 1) % len(snapshot)
 				if !c.backoff.Ready(candidate.Endpoint, time.Now()) {
-					c.diagnostic(Diagnostic{Kind: DiagnosticPeerSelection, Phase: "transfer", Peer: candidate.Endpoint, Detail: "candidate delayed by endpoint backoff"})
 					continue
 				}
 				c.diagnostic(Diagnostic{Kind: DiagnosticPeerSelection, Phase: "transfer", Peer: candidate.Endpoint, Detail: "candidate selected for dial"})
@@ -885,7 +952,6 @@ func (c *coordinator) startTransferPhase(ctx context.Context, source torrent.Sou
 				dialCancel()
 				if dialErr != nil {
 					c.diagnostic(dialOutcomeDiagnostic("transfer", candidate.Endpoint, raceResult, raceStarted, dialErr))
-					c.diagnostic(Diagnostic{Kind: DiagnosticPeerSelection, Phase: "transfer", Peer: candidate.Endpoint, Detail: "candidate dial failed"})
 					var budgetErr *peer.EndpointBudgetError
 					if errors.As(dialErr, &budgetErr) {
 						return ConnectedPeer{}, budgetErr
@@ -975,7 +1041,7 @@ func (c *coordinator) startTransferPhase(ctx context.Context, source torrent.Sou
 		ResumeComplete:        resume.VerifiedPieces,
 		Now:                   now,
 		OnStatus:              onStatus,
-		OnDiagnostic:          c.config.OnDiagnostic,
+		OnDiagnostic:          c.diagnostic,
 		OnPieceVerified: func(piece PieceVerified) {
 			if piece.SelectedBytes > 0 {
 				c.verifiedOutput.Store(true)
@@ -1058,6 +1124,7 @@ func (c *coordinator) startTransferPhase(ctx context.Context, source torrent.Sou
 			}
 		}
 	}
+	transferStarted := time.Now()
 	transferDone := make(chan error, 1)
 	go func() { transferDone <- transfer.Run(transferCtx) }()
 	var transferErr error
@@ -1070,6 +1137,9 @@ func (c *coordinator) startTransferPhase(ctx context.Context, source torrent.Sou
 		trackerRun.Wait()
 		transferErr = <-transferDone
 	}
+	c.summary.TransferElapsed = time.Since(transferStarted)
+	c.summary.VerifiedSelectedBytes = transfer.Progress().Verified
+	c.summary.UsefulConnections = transfer.usefulConnections
 	if stopTimeout != nil {
 		stopTimeout()
 	}

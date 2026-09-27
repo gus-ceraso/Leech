@@ -7,6 +7,14 @@ Read [DESIGN §14](../../DESIGN.md#14-utp),
 - Keep packet/sequence, receive, send, and congestion state testable without
   sockets. `Conn` owns the connected UDP socket and applies their packet actions;
   peer code sees only the resulting reliable stream.
+- Known initial-sequence interoperability defect: `Conn.handleDatagram` starts
+  reception at the SYN-ACK STATE's sequence plus one, dropping the first DATA
+  packet from peers using [libutp's sequence numbering](https://github.com/bittorrent/libutp/blob/master/utp_internal.cpp).
+  libutp's STATE does not consume a sequence number; its first DATA uses that
+  same number. BEP 29's setup diagram contradicts its ST_STATE text here.
+  Existing plus-one fixtures mirror Leech's assumption rather than establish
+  interoperability. An independent loopback fixture sending STATE N, DATA N
+  (`A`), then DATA N+1 (`B`) delivers only `B` with the current implementation.
 - `DialContext`'s context bounds setup. A successfully returned connection must
   survive cancellation of that context because the peer race cancels attempt
   contexts after choosing a winner. Failed/canceled setup closes and joins its

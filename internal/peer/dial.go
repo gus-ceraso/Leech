@@ -215,10 +215,11 @@ func (m *DialManager) RaceWithResult(ctx context.Context, candidate ResolvedCand
 			if IsProtocolViolation(err) {
 				m.backoff.Blacklist(endpoint)
 			} else {
-				m.backoff.RecordFailure(endpoint, m.now())
+				now := m.now()
+				result.RetryAfter = m.backoff.RecordFailure(endpoint, now).Sub(now)
 			}
 		}
-		return HandshakeResult{}, true, err
+		return result, true, err
 	}
 	m.backoff.RecordSuccess(endpoint)
 	return result, true, nil
@@ -283,15 +284,18 @@ func (m *DialManager) Registry() *PeerRegistry {
 	return m.registry
 }
 
-// HandshakeResult is a connected net.Conn whose remote BEP 3 handshake has
-// already validated the local info hash and optional expected peer ID. A
-// successful RaceEndpoint transfers Conn ownership to the caller; failed
-// attempts and losers are closed before the function returns.
+// HandshakeResult carries a validated BEP 3 connection on race success.
+// RaceEndpoint transfers Conn ownership to the caller; failed attempts and
+// losers are closed and joined before return. DialWithResult can return a
+// rejected, already-closed winner alongside an admission error. Race and
+// RetryAfter remain observational and never grant connection ownership.
 type HandshakeResult struct {
-	Endpoint  Endpoint
-	Transport Transport
-	Conn      net.Conn
-	Handshake Handshake
+	Endpoint   Endpoint
+	Transport  Transport
+	Conn       net.Conn
+	Handshake  Handshake
+	Race       RaceObservation
+	RetryAfter time.Duration
 }
 
 // AttemptError records one transport's bounded race outcome.
@@ -338,14 +342,20 @@ func (e *RaceError) Unwrap() error {
 // the exact same resolved endpoint. A transport wins only after both writing
 // Leech's handshake and reading a valid remote handshake. Every attempt is
 // canceled, closed, and joined before this function returns.
-func RaceEndpoint(ctx context.Context, endpoint Endpoint, config RaceConfig) (HandshakeResult, error) {
+func RaceEndpoint(ctx context.Context, endpoint Endpoint, config RaceConfig) (result HandshakeResult, err error) {
+	startedAt := time.Now()
+	var observation RaceObservation
+	defer func() {
+		observation.Duration = time.Since(startedAt)
+		result.Race = observation
+	}()
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if err := ctx.Err(); err != nil {
 		return HandshakeResult{}, err
 	}
-	endpoint, err := NormalizeEndpoint(endpoint)
+	endpoint, err = NormalizeEndpoint(endpoint)
 	if err != nil {
 		return HandshakeResult{}, err
 	}
@@ -405,7 +415,7 @@ func RaceEndpoint(ctx context.Context, endpoint Endpoint, config RaceConfig) (Ha
 		case <-ctx.Done():
 			cancel()
 			attempts.Wait()
-			closeRaceResults(results, nil)
+			closeRaceResults(results, nil, &observation)
 			if timer != nil {
 				timer.Stop()
 			}
@@ -417,11 +427,13 @@ func RaceEndpoint(ctx context.Context, endpoint Endpoint, config RaceConfig) (Ha
 			}
 		case result := <-results:
 			completed++
+			observation.record(result)
 			if result.err == nil && result.conn != nil {
 				winner = &result
 				cancel()
 				attempts.Wait()
-				closeRaceResults(results, winner.conn)
+				closeRaceResults(results, winner.conn, &observation)
+				observation.Winner = winner.transport
 				if timer != nil {
 					timer.Stop()
 				}
@@ -430,6 +442,7 @@ func RaceEndpoint(ctx context.Context, endpoint Endpoint, config RaceConfig) (Ha
 			attemptErrors = append(attemptErrors, AttemptError{Transport: result.transport, Err: result.err})
 		}
 	}
+	attempts.Wait()
 	if timer != nil {
 		timer.Stop()
 	}
@@ -447,13 +460,17 @@ func timerChan(timer RaceTimer, tcpStarted bool) <-chan time.Time {
 }
 
 type raceAttemptResult struct {
-	transport Transport
-	conn      net.Conn
-	handshake Handshake
-	err       error
+	transport   Transport
+	conn        net.Conn
+	handshake   Handshake
+	err         error
+	observation AttemptObservation
 }
 
-func runRaceAttempt(ctx context.Context, transport Transport, network, address string, dial DialFunc, config RaceConfig) raceAttemptResult {
+func runRaceAttempt(ctx context.Context, transport Transport, network, address string, dial DialFunc, config RaceConfig) (result raceAttemptResult) {
+	startedAt := time.Now()
+	stage := AttemptDial
+	defer func() { result.observation = observeAttempt(stage, result.err, ctx.Err(), time.Since(startedAt)) }()
 	conn, err := dial(ctx, networkForTransport(transport, network), address)
 	if err != nil {
 		if conn != nil {
@@ -476,12 +493,14 @@ func runRaceAttempt(ctx context.Context, transport Transport, network, address s
 		}
 	}()
 
+	stage = AttemptWriteHandshake
 	if err := WriteHandshake(conn, config.LocalHandshake.InfoHash, config.LocalHandshake.PeerID, config.LocalHandshake.Reserved); err != nil {
 		close(stopWatch)
 		watch.Wait()
 		_ = conn.Close()
 		return raceAttemptResult{transport: transport, err: err}
 	}
+	stage = AttemptReadHandshake
 	remote, err := ReadHandshake(conn, &config.LocalHandshake.InfoHash, nil)
 	close(stopWatch)
 	watch.Wait()
@@ -501,6 +520,7 @@ func runRaceAttempt(ctx context.Context, transport Transport, network, address s
 		return raceAttemptResult{transport: transport, err: ctx.Err()}
 	default:
 	}
+	stage = AttemptComplete
 	return raceAttemptResult{transport: transport, conn: conn, handshake: remote}
 }
 
@@ -525,10 +545,11 @@ func netipAddrPort(endpoint Endpoint) string {
 	return net.JoinHostPort(endpoint.Addr.String(), strconv.Itoa(int(endpoint.Port)))
 }
 
-func closeRaceResults(results <-chan raceAttemptResult, winner net.Conn) {
+func closeRaceResults(results <-chan raceAttemptResult, winner net.Conn, observation *RaceObservation) {
 	for {
 		select {
 		case result := <-results:
+			observation.record(result)
 			if result.conn != nil && result.conn != winner {
 				_ = result.conn.Close()
 			}

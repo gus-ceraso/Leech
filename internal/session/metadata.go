@@ -1130,23 +1130,14 @@ func (d *MetadataDiscovery) tryCandidate(ctx context.Context, manager *peer.Dial
 	raceCtx, cancel := context.WithTimeout(ctx, trackerEndpointRaceTimeout)
 	connected, raceStarted, err := manager.RaceWithResult(raceCtx, candidate)
 	cancel()
+	if d.config.OnDiagnostic != nil {
+		d.config.OnDiagnostic(dialOutcomeDiagnostic("metadata", candidate.Endpoint, connected, raceStarted, err))
+	}
 	if err != nil {
-		if d.config.OnDiagnostic != nil {
-			kind := DiagnosticTransportRace
-			detail := "failed"
-			if !raceStarted {
-				kind = DiagnosticPeerSelection
-				detail = "candidate failed before transport race"
-			}
-			d.config.OnDiagnostic(Diagnostic{Kind: kind, Phase: "metadata", Peer: candidate.Endpoint, Detail: detail})
-		}
 		if errors.Is(err, peer.ErrProtocolViolation) {
 			backoff.Blacklist(candidate.Endpoint)
 		}
 		return metadataCandidate{}, err
-	}
-	if d.config.OnDiagnostic != nil {
-		d.config.OnDiagnostic(Diagnostic{Kind: DiagnosticTransportRace, Phase: "metadata", Peer: connected.Endpoint, Detail: "winner=" + connected.Transport.String()})
 	}
 	defer connected.Conn.Close()
 	if connected.Handshake.Reserved[5]&metadataExtensionReservedBit == 0 {

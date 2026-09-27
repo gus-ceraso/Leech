@@ -311,6 +311,11 @@ func TestRunTrackerTraceIncludesReceivedPayload(t *testing.T) {
 	if !result.TorrentComplete {
 		t.Fatalf("result = %#v, want complete torrent", result)
 	}
+	// Totals are independent of OnDiagnostic and include the canceled loser.
+	summary := result.Summary
+	if summary.VerifiedSelectedBytes != int64(len(data)) || summary.SelectedBytes != int64(len(data)) || summary.ReceivedPayloadBytes != int64(len(data)) || summary.UsefulConnections != 1 || summary.TCP.Wins != 1 || summary.UTP.Canceled < 1 || summary.TransferElapsed <= 0 || summary.Elapsed < summary.TransferElapsed {
+		t.Fatalf("run summary = %+v", summary)
+	}
 	if err := <-peerDone; err != nil {
 		t.Fatal(err)
 	}

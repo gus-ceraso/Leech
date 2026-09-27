@@ -2,7 +2,7 @@
 
 - **Status:** Approved
 - **Design date:** 2026-09-19
-- **Last revised:** 2026-09-26
+- **Last revised:** 2026-09-27
 - **Primary specifications:** [`beps/`](beps/), especially BEP 3
 
 This document defines Leech's required behavior. Present-tense descriptions are
@@ -178,11 +178,13 @@ errors.
 most to least detail. The default is `warning`. The selected level includes
 messages at that level and every less detailed level:
 
-- `debug` adds bounded tracker, peer, scheduling, and lifecycle diagnostics;
-- `info` adds phase changes, transfer progress, and successful completion;
+- `debug` adds coalesced tracker, peer, scheduling, and lifecycle diagnostics,
+  including transport-race outcomes and run totals;
+- `info` adds phase changes, transfer progress, a final download summary, and
+  successful completion;
 - `warning` reports recoverable or important behavior, including ignored
-  `private=1`;
-- `error` reports only the primary failure and secondary shutdown failures.
+  `private=1` and explicitly nonfatal final tracker-announcement failures;
+- `error` reports only the primary failure and secondary cleanup failures.
 
 Help, usage errors, and `--list-files` output are not filtered by the log level.
 All log messages follow the redaction and escaping rules in §4.9.
@@ -230,8 +232,49 @@ verified selected bytes, selected bytes, active peers, and recent payload rate.
 Phase changes, warnings, and the final result receive permanent lines when their
 levels are enabled.
 
-When standard error is not an interactive terminal, Leech emits enabled log lines
-but no periodic progress. It never uses color or requires terminal capabilities.
+When standard error is not an interactive terminal, `info` and `debug` emit a
+permanent transfer-progress line at entry and no more often than every 30 seconds
+thereafter, including during stalls. Metadata and resume have phase lines but no
+periodic redirected progress. Leech never uses color or requires terminal
+capabilities.
+
+Permanent log lines begin with a UTC timestamp with millisecond precision, then
+`LEVEL: message`. Queued observations retain their capture time rather than
+acquiring a timestamp when printed; concurrent producers and deferred secondary
+reports can appear out of timestamp order. Phase exits and transport races also
+report elapsed durations. Logging uses bounded, nonblocking queues; queue
+pressure is summarized at shutdown. Final totals are collected before lossy
+reporting, and the reporting worker joins before the final result.
+
+Assignment diagnostics describe why **further requests** cannot be assigned after
+using existing stages, not whether a peer is productive. They distinguish zero
+`reqq`, missing advertised wanted pieces, choking, peer/global request limits,
+staged-piece/staged-byte limits, and no assignable blocks. The last category
+includes work already assigned, completed, or excluded by exact late-terminal
+obligations. Unchanged reasons are silent. Request assignments, new Allowed Fast
+grants, and consumed exact tombstones are counted in per-peer summaries at most
+once per one-second coordination tick, also flushed on retirement and shutdown;
+there is no per-block logging. Piece assignment and completion remain observable.
+
+The final `info` download summary includes verified selected bytes (including
+resume), selected bytes, session elapsed time, transfer elapsed time, received
+file-payload bytes, average payload rate, useful connections, and skipped tracker
+URL counts by reason. Session time includes final tracker announcements but not
+CLI source-syntax parsing or final rendering. Transfer time runs from transfer
+worker startup through joined peer/staging cleanup, before final tracker events.
+Payload rate includes duplicate, late, corrupt, and unselected piece bytes, not
+metadata or transport overhead; recent progress rate uses a five-second window.
+A useful connection has staged an accepted block, not necessarily a verified
+contribution; reconnects count separately rather than as unique endpoints.
+
+The final `debug` transport totals span metadata and transfer. They count race
+winners and successful, failed, and canceled transport attempts, not unique peers.
+A valid handshake can lose the race or fail later peer-ID admission. Each race
+also reports unstarted transports, dial/handshake stage, elapsed time, and bounded
+failure categories; unknown I/O errors remain generic. A canceled uTP loser does
+not establish that uTP is unsupported. Raw transport errors never enter diagnostic
+queues. Failed endpoint races report their backoff delay rather than repeating
+backoff messages on every candidate scan.
 
 Names and other untrusted text are quoted and escaped before display. Tracker
 diagnostics identify a tracker by scheme and host only; they do not print URL
@@ -381,9 +424,9 @@ A root context requests cancellation. Every goroutine has an owner, bounded work
 - A magnet must contain exactly one effective v1 `btih` topic. Hexadecimal and Base32 forms are accepted. `tr`, `x.pe`, `dn`, and `so` are honored.
 - A bare info hash accepts the same hexadecimal and Base32 forms.
 
-Any magnet containing `btmh` is rejected, even if it also contains `btih`, because such links identify v2 or hybrid content. Conflicting `btih` values, malformed endpoints or selections, and unsupported schemes are errors. Magnet `dn` is display-only and never defines an output path.
+Any magnet containing `btmh` is rejected, even if it also contains `btih`, because such links identify v2 or hybrid content. Conflicting `btih` values, malformed peer endpoints or selections, and unsupported source schemes are errors. Magnet `dn` is display-only and never defines an output path.
 
-The default tracker `http://tracker.opentrackr.org:1337/announce` is always added. Duplicate URLs are removed. For `.torrent` input, `announce-list` URLs are used when present; otherwise `announce` is used. Tier grouping is discarded.
+The default tracker `http://tracker.opentrackr.org:1337/announce` is always added. Empty, malformed, invalid-UTF-8, overlong, and unsupported tracker URLs (including WebSocket URLs) are skipped; valid HTTP(S) and UDP URLs are deduplicated in order. For `.torrent` input, `announce-list` URLs are used when present, even if none is usable; otherwise `announce` is used. Tier grouping is discarded. Skipped URL entries are counted as invalid URLs (including empty, overlong, or invalid-UTF-8 values) or unsupported schemes, without retaining their text for diagnostics; valid duplicates do not count as skipped. The selected `announce-list` or `announce` must still have the specified bencode structure. The 64-unique-tracker limit includes the default; exceeding it is an error.
 
 ### 7.2 Strict bencoding and info hashes
 
@@ -406,7 +449,7 @@ Leech validates:
 - positive bounded piece length;
 - nonnegative lengths and an overflow-safe total;
 - a `pieces` byte string whose length is exactly 20 times the logical piece count;
-- valid UTF-8 for BEP-defined human-readable strings;
+- valid UTF-8 for BEP-defined human-readable strings, except discarded tracker URLs;
 - no v2 `meta version`, `file tree`, or other recognized hybrid structure;
 - bounded file count, path depth, path bytes, and decoded structure.
 
@@ -553,7 +596,7 @@ For each phase and tracker:
 Definitive HTTP client-error classification survives a body-read or body-size
 failure unless a parsed applicable retry hint changes it.
 
-On a phase transition or final shutdown, the session first cancels and joins every regular announce loop. It then uses a separate bounded context to send at most one announce for each applicable final event per tracker: successful full completion, including cache cleanup, sends `completed` and then `stopped`; every other exit sends only `stopped`. `stopped` is attempted for every nonpermanently-disabled tracker to which a `started` request was transmitted, whether or not a response arrived. No regular announce may begin after the final-event sequence starts. Final announce failure is secondary and never changes an existing primary result.
+On a phase transition or final shutdown, the session first cancels and joins every regular announce loop. It then uses a separate bounded context to send at most one announce for each applicable final event per tracker: successful full completion, including cache cleanup, sends `completed` and then `stopped`; every other exit sends only `stopped`. `stopped` is attempted for every nonpermanently-disabled tracker to which a `started` request was transmitted, whether or not a response arrived. No regular announce may begin after the final-event sequence starts. Final announce failure is secondary and never changes an existing primary result. The CLI reports a compact, explicitly nonfatal warning per phase; individual final-attempt details remain at debug level. Cleanup failures retain the separate error semantics in §13.1.
 
 `stopped` has its own bounded transmission opportunity if `completed` stalls;
 the total final-event sequence remains bounded.

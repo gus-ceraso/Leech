@@ -107,7 +107,8 @@ func TestExecutableUsageDiagnostics(t *testing.T) {
 		if !errors.As(err, &exit) || exit.ExitCode() != 1 {
 			t.Fatalf("listing exit = %v, want 1", err)
 		}
-		if !strings.HasPrefix(stderr.String(), "error: failure: cli: write file listing: ") {
+		timestamp, message, ok := strings.Cut(stderr.String(), " ")
+		if _, err := time.Parse(time.RFC3339Nano, timestamp); !ok || err != nil || !strings.HasPrefix(message, "error: failure: cli: write file listing: ") {
 			t.Fatalf("listing diagnostic = %q", stderr.String())
 		}
 	})

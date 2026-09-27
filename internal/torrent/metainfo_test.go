@@ -5,6 +5,7 @@ import (
 	"crypto/sha1"
 	"errors"
 	"io"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -193,19 +194,61 @@ func TestParseMetainfoRejectsPathCollisionsAndMalformedSymlinks(t *testing.T) {
 	}
 }
 
-func TestParseMetainfoRejectsInvalidUTF8TrackerURLs(t *testing.T) {
+func TestParseMetainfoSkipsUnusableTrackers(t *testing.T) {
 	info := metaDict(
 		metaEntry("length", metaInteger(0)),
 		metaEntry("name", metaStringValue("empty")),
 		metaEntry("piece length", metaInteger(16<<10)),
 		metaEntry("pieces", metaStringBytes(nil)),
 	)
+	root := metaDict(
+		metaEntry("announce", metaStringValue("http://ignored.example/announce")),
+		metaEntry("announce-list", metaList(metaList(
+			metaStringValue("wss://tracker.example/announce"),
+			metaStringValue("http://tracker.example:bad/announce"),
+			metaStringBytes([]byte{'h', 't', 't', 'p', ':', '/', '/', 0xff}),
+			metaStringValue("udp://tracker.example:6969/announce"),
+			metaStringValue("https://tracker.example/announce"),
+		))),
+		metaEntry("info", info),
+	)
+	got, err := ParseMetainfo(metaEncode(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.SkippedTrackers != (TrackerSkips{InvalidURL: 2, UnsupportedScheme: 1}) {
+		t.Fatalf("skipped URLs = %+v", got.SkippedTrackers)
+	}
+	want := []string{DefaultTracker, "udp://tracker.example:6969/announce", "https://tracker.example/announce"}
+	if !reflect.DeepEqual(got.Trackers, want) {
+		t.Fatalf("trackers = %#v, want %#v", got.Trackers, want)
+	}
 	for _, root := range []bencode.Value{
+		metaDict(metaEntry("announce", metaStringValue("wss://tracker.example/announce")), metaEntry("info", info)),
 		metaDict(metaEntry("announce", metaStringBytes([]byte{'h', 't', 't', 'p', ':', '/', '/', 0xff})), metaEntry("info", info)),
-		metaDict(metaEntry("announce-list", metaList(metaList(metaStringBytes([]byte{'u', 'd', 'p', ':', '/', '/', 0xff})))), metaEntry("info", info)),
+		metaDict(metaEntry("announce", metaStringValue("http://ignored.example/announce")), metaEntry("announce-list", metaList(metaList(metaStringValue("wss://tracker.example/announce")))), metaEntry("info", info)),
 	} {
-		if _, err := ParseMetainfo(metaEncode(root)); err == nil {
-			t.Fatalf("invalid UTF-8 tracker URL succeeded: %#v", root)
+		got, err := ParseMetainfo(metaEncode(root))
+		if err != nil || got.SkippedTrackers.Total() != 1 || !reflect.DeepEqual(got.Trackers, []string{DefaultTracker}) {
+			t.Fatalf("unusable announce: trackers = %#v, err = %v", got.Trackers, err)
+		}
+	}
+}
+
+func TestParseMetainfoRejectsMalformedTrackerStructure(t *testing.T) {
+	info := metaDict(
+		metaEntry("length", metaInteger(0)),
+		metaEntry("name", metaStringValue("empty")),
+		metaEntry("piece length", metaInteger(1)),
+		metaEntry("pieces", metaStringBytes(nil)),
+	)
+	for _, bad := range []bencode.Value{
+		metaList(metaStringValue("wss://tracker.example/announce")),
+		metaList(metaList(metaInteger(1))),
+	} {
+		root := metaDict(metaEntry("announce-list", bad), metaEntry("info", info))
+		if _, err := ParseMetainfo(metaEncode(root)); !errors.Is(err, ErrInvalidMetainfo) {
+			t.Fatalf("malformed announce-list: error = %v", err)
 		}
 	}
 }

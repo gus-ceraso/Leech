@@ -20,6 +20,9 @@ Read [DESIGN §10](../../DESIGN.md#10-tracker-subsystem),
 - Use tracker-specific bencode structure limits. One response owns one endpoint
   deduplication set across dictionary, IPv4, and IPv6 peers, retaining first
   endpoint order. Validate the entire compact stride before dropping records.
+  Current HTTP/UDP compact parsers fail the entire response for an unusable peer
+  endpoint, not just that record. Do not change that policy as a logging fix;
+  compact provenance counts describe successful decoding.
 - UDP transaction retries follow BEP 15 independently of tracker-loop backoff;
   refresh expired connection IDs before announce retransmission. Family
   transactions are independent and both must join on cancellation. Retained UDP
@@ -47,7 +50,11 @@ Read [DESIGN §10](../../DESIGN.md#10-tracker-subsystem),
   failure suppresses `completed`, even after all output verifies, but not an
   otherwise applicable `stopped`. Partial selection never sends `completed`.
   Reserve a bounded opportunity for `stopped` if `completed` stalls. No regular
-  announce may follow the final-event sequence.
+  announce may follow the final-event sequence. `Finalize` wraps joined failures
+  in `FinalAnnounceError`, preserving causes for callbacks and `errors.Is` while
+  exposing a bounded failure count. CLI renders that count as a nonfatal warning,
+  not an error or a joined multiline message. Per-attempt debug reasons use
+  allowlisted HTTP/UDP codes and HTTP status, never raw errors or tracker text.
 
 Use captured local traces and controlled clocks for retries, response loss,
 unequal families, failure classification, and shutdown ordering. Test both

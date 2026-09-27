@@ -36,7 +36,7 @@ func TestReviewListingWriteFailureIsReported(t *testing.T) {
 	if got, want := stdout.attempted.String(), "\"one.txt\"\n"; got != want {
 		t.Fatalf("stdout = %q, want listing only %q", got, want)
 	}
-	if got, want := stderr.String(), "error: failure: cli: write file listing: listing output failed\\x1b[2J\n"; got != want {
+	if got, want := withoutLogTimes(stderr.String()), "error: failure: cli: write file listing: listing output failed\\x1b[2J\n"; got != want {
 		t.Fatalf("stderr = %q, want primary error %q", got, want)
 	}
 }

@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"net"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/gus-ceraso/Leech/internal/peer"
 	"github.com/gus-ceraso/Leech/internal/session"
+	"github.com/gus-ceraso/Leech/internal/tracker"
 )
 
 const (
@@ -52,7 +54,21 @@ type reportQueue struct {
 type secondaryFailures struct {
 	mu      sync.Mutex
 	count   int
-	records [secondaryFailureLimit]string
+	records [secondaryFailureLimit]secondaryFailure
+}
+
+type secondaryFailure struct {
+	at       time.Time
+	text     string
+	nonfatal bool
+}
+
+func prepareSecondary(err error, at time.Time) secondaryFailure {
+	var final *tracker.FinalAnnounceError
+	if errors.As(err, &final) {
+		return secondaryFailure{at: at, nonfatal: true, text: fmt.Sprintf("%d best-effort final tracker announcements failed; primary result unchanged (details at debug)", final.Failures)}
+	}
+	return secondaryFailure{at: at, text: sanitizeError(err, DefaultDiagnosticBytes)}
 }
 
 func newDiagnosticQueue() *diagnosticQueue {
@@ -65,9 +81,9 @@ func newReportQueue() *reportQueue {
 
 // enqueuePrepared retains already-sanitized phase or warning lines without
 // waiting for the reporting worker. Queue pressure is summarized when it joins.
-func (q *reportQueue) enqueuePrepared(kind reportEventKind, text string) {
+func (q *reportQueue) enqueuePrepared(kind reportEventKind, text string, at time.Time) {
 	select {
-	case q.records <- reportEvent{kind: kind, text: text}:
+	case q.records <- reportEvent{kind: kind, text: text, at: at}:
 	default:
 		incrementSaturating(&q.dropped)
 	}
@@ -98,19 +114,19 @@ func (q *secondaryFailures) add(err error) {
 	if err == nil {
 		return
 	}
-	text := SanitizeDiagnostic(err.Error())
+	record := prepareSecondary(err, time.Now())
 	q.mu.Lock()
 	if q.count < len(q.records) {
-		q.records[q.count] = text
+		q.records[q.count] = record
 		q.count++
 	}
 	q.mu.Unlock()
 }
 
-func (q *secondaryFailures) snapshot() []string {
+func (q *secondaryFailures) snapshot() []secondaryFailure {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	return append([]string(nil), q.records[:q.count]...)
+	return append([]secondaryFailure(nil), q.records[:q.count]...)
 }
 
 func incrementSaturating(counter *atomic.Uint64) {
@@ -125,6 +141,9 @@ func incrementSaturating(counter *atomic.Uint64) {
 // enqueue sanitizes and bounds all retained text before the nonblocking send.
 // The total retained string data is at most DefaultDiagnosticBytes per record.
 func (q *diagnosticQueue) enqueue(record session.Diagnostic) {
+	if record.At.IsZero() {
+		record.At = time.Now()
+	}
 	remaining := DefaultDiagnosticBytes
 	bounded := func(value string) string {
 		if remaining <= 0 {
@@ -173,6 +192,9 @@ func renderDiagnostic(reporter *Reporter, diagnostic session.Diagnostic) {
 	if diagnostic.Duration != 0 {
 		fields = append(fields, "duration="+diagnostic.Duration.Round(time.Millisecond).String())
 	}
+	if diagnostic.RetryAfter > 0 {
+		fields = append(fields, "retry-after="+diagnostic.RetryAfter.Round(time.Millisecond).String())
+	}
 	if diagnostic.Detail != "" {
 		fields = append(fields, diagnostic.Detail)
 	}
@@ -187,18 +209,28 @@ func renderDiagnostic(reporter *Reporter, diagnostic session.Diagnostic) {
 	case session.DiagnosticPeerSelection:
 		message = "peer selection phase=" + diagnostic.Phase
 	case session.DiagnosticLifecycle:
-		message = "session lifecycle"
+		message = "session lifecycle phase=" + diagnostic.Phase
 	case session.DiagnosticTransfer:
 		message = "transfer"
 	case session.DiagnosticTransportRace:
-		message = "transport race"
+		message = "transport race phase=" + diagnostic.Phase
+		fields = append(fields, formatAttempt("utp", diagnostic.Race.UTP), formatAttempt("tcp", diagnostic.Race.TCP), "race-duration="+diagnostic.Race.Duration.Round(time.Millisecond).String())
+	case session.DiagnosticTrackerSkip:
+		message = "skipped tracker URLs"
 	default:
 		return
 	}
 	if len(fields) != 0 {
 		message += " " + strings.Join(fields, " ")
 	}
-	_ = reporter.Debug("%s", message)
+	_ = reporter.logAt(diagnostic.At, LogDebug, "%s", message)
+}
+
+func formatAttempt(name string, attempt peer.AttemptObservation) string {
+	if attempt.Outcome == peer.AttemptNotStarted {
+		return name + "=not-started"
+	}
+	return fmt.Sprintf("%s=%s(stage=%s reason=%s duration=%s)", name, attempt.Outcome, attempt.Stage, attempt.Failure, attempt.Duration.Round(time.Millisecond))
 }
 
 // formatDiagnosticPeer accepts only normalized numeric addresses without zones.

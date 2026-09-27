@@ -2726,10 +2726,12 @@ func TestTransferTimeoutPreservesFastLateTerminalWithoutStrike(t *testing.T) {
 	if transfer.scheduler.StrikeCount(p.input.Endpoint) != 0 {
 		t.Fatalf("timeout or late terminal caused a strike: %d", transfer.scheduler.StrikeCount(p.input.Endpoint))
 	}
-	lateCount := 0
+	transfer.reportPeerActivity([]*transferPeer{p})
+	transfer.reportPeerActivity([]*transferPeer{p}) // A flush cannot count the same terminal twice.
+	var lateCount uint64
 	for _, event := range observations {
-		if event.Detail == "exact tombstone consumed" {
-			lateCount++
+		if event.Detail == "exact tombstones consumed" {
+			lateCount += event.Count
 		}
 	}
 	if lateCount != 1 || transfer.Progress().Verified != 0 {
@@ -2774,10 +2776,12 @@ func TestTransferTimeoutPreservesFastLateRejectWithoutStrike(t *testing.T) {
 	if transfer.scheduler.StrikeCount(p.input.Endpoint) != 0 {
 		t.Fatalf("timeout or late Reject caused a strike: %d", transfer.scheduler.StrikeCount(p.input.Endpoint))
 	}
-	lateCount := 0
+	transfer.reportPeerActivity([]*transferPeer{p})
+	transfer.reportPeerActivity([]*transferPeer{p})
+	var lateCount uint64
 	for _, event := range observations {
-		if event.Detail == "exact tombstone consumed" {
-			lateCount++
+		if event.Detail == "exact tombstones consumed" {
+			lateCount += event.Count
 		}
 	}
 	if lateCount != 1 || transfer.Progress().Verified != 0 {

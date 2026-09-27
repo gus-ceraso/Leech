@@ -136,6 +136,7 @@ type Transfer struct {
 	now                    func() time.Time
 	initialReleased        bool
 	endgameReported        bool
+	usefulConnections      uint64
 }
 
 type transferPeer struct {
@@ -154,6 +155,7 @@ type transferPeer struct {
 	allowedFastUsed         bool
 	allowedFastSinceSummary uint64
 	requestsSinceSummary    uint64
+	tombstonesSinceSummary  uint64
 	lastBlocked             string
 	released                bool
 }
@@ -612,19 +614,10 @@ func (t *Transfer) drive(ctx context.Context, peers *[]*transferPeer) error {
 			_ = t.disconnectPeer(p, fmt.Errorf("peer endpoint blacklisted"))
 			continue
 		}
-		if p.state.RequestableCount() == 0 || !t.scheduler.hasRequestCapacity(t.scheduler.peers[p.input.ID]) {
-			reason := "no advertised wanted pieces"
-			if p.state.ReqQ() == 0 {
-				reason = "zero reqq"
-			} else if p.state.Choked() && p.state.RequestableCount() == 0 {
-				reason = "remote choking"
-			} else if !t.scheduler.hasRequestCapacity(t.scheduler.peers[p.input.ID]) {
-				reason = "request pipeline full"
-			}
+		if reason := t.capacityBlocker(p); reason != "" {
 			t.blocked(p, reason)
 			continue
 		}
-		p.lastBlocked = ""
 		// Admission is separate from assignment.  A stage must exist before
 		// any request can be sent, and a failed admission is fatal storage
 		// failure rather than a peer-local retry.
@@ -634,7 +627,6 @@ func (t *Transfer) drive(ctx context.Context, peers *[]*transferPeer) error {
 				return err
 			}
 			if !ok {
-				t.blocked(p, "staging pressure or no assignable piece")
 				reclaimed, err := t.reclaimUnusableStages(*peers, p)
 				if err != nil {
 					return err
@@ -708,6 +700,15 @@ func (t *Transfer) drive(ctx context.Context, peers *[]*transferPeer) error {
 			}
 			p.requestsSinceSummary = saturatingAdd(p.requestsSinceSummary, 1)
 		}
+		if !p.done {
+			// Report why another assignment cannot be made *after* using existing
+			// stages. A failed reservation alone does not block block assignment.
+			reason, err := t.assignmentBlocker(p)
+			if err != nil {
+				return err
+			}
+			t.blocked(p, reason)
+		}
 		if t.scheduler.Endgame() && !t.endgameReported {
 			t.endgameReported = true
 			t.observe(p, "endgame entered")
@@ -768,6 +769,7 @@ func (t *Transfer) reclaimUnusableStages(peers []*transferPeer, waiting *transfe
 			return false, err
 		}
 		reclaimed = true
+		t.observe(waiting, fmt.Sprintf("piece %d reclaimed for staging pressure", index))
 		_, fit, _, _, err := s.nextReservation(p, waiting.input.ID, waiting.tombstoned)
 		if err != nil {
 			return false, err
@@ -997,6 +999,10 @@ func (t *Transfer) reportPeerActivity(peers []*transferPeer) {
 			t.observeCount(p, "Allowed Fast grant summary", p.allowedFastSinceSummary, "")
 			p.allowedFastSinceSummary = 0
 		}
+		if p.tombstonesSinceSummary != 0 {
+			t.observeCount(p, "exact tombstones consumed", p.tombstonesSinceSummary, "")
+			p.tombstonesSinceSummary = 0
+		}
 	}
 }
 
@@ -1005,6 +1011,48 @@ func saturatingAdd(value, increment uint64) uint64 {
 		return ^uint64(0)
 	}
 	return value + increment
+}
+
+// capacityBlocker uses only bounded, already-maintained state. The reason
+// describes capacity for further assignments, not whether a peer is productive.
+func (t *Transfer) capacityBlocker(p *transferPeer) string {
+	s := t.scheduler
+	if p.state.ReqQ() == 0 {
+		return "zero reqq"
+	}
+	if !p.state.Interested() {
+		return "no advertised wanted pieces"
+	}
+	if p.state.RequestableCount() == 0 {
+		return "remote choking"
+	}
+	if s.peers[p.input.ID].active >= s.peers[p.input.ID].limit {
+		return "peer request pipeline full"
+	}
+	if s.active >= min(s.cfg.MaxGlobal, s.cfg.MaxQueue) {
+		return "global request limit"
+	}
+	return ""
+}
+
+func (t *Transfer) assignmentBlocker(p *transferPeer) (string, error) {
+	if reason := t.capacityBlocker(p); reason != "" {
+		return reason, nil
+	}
+	s := t.scheduler
+	_, _, _, pressure, err := s.nextReservation(s.peers[p.input.ID], p.input.ID, p.tombstoned)
+	if err != nil {
+		return "", err
+	}
+	if pressure {
+		if s.staged+s.reserved >= s.cfg.MaxStagedPieces {
+			return "staged piece limit", nil
+		}
+		return "staged byte limit", nil
+	}
+	// Existing requests, completion, or exact terminal obligations can make
+	// advertised pieces unassignable; none of these implies staging pressure.
+	return "no assignable blocks", nil
 }
 
 func (t *Transfer) blocked(p *transferPeer, reason string) {
@@ -1203,6 +1251,7 @@ func (t *Transfer) handleEventWithPeers(ctx context.Context, peers []*transferPe
 			p.lastUseful = t.clock()
 			if !p.firstUseful {
 				p.firstUseful = true
+				t.usefulConnections = saturatingAdd(t.usefulConnections, 1)
 				t.observe(p, "first useful block accepted and staged")
 			}
 			if err := t.cancelRedundant(ctx, peers, result.Canceled); err != nil {
@@ -1226,7 +1275,7 @@ func (t *Transfer) handleEventWithPeers(ctx context.Context, peers []*transferPe
 			// The request table consumed the bounded tombstone. The payload
 			// cannot be attributed to a current scheduler assignment.
 			delete(p.tombstoned, block)
-			t.observe(p, "exact tombstone consumed")
+			p.tombstonesSinceSummary = saturatingAdd(p.tombstonesSinceSummary, 1)
 		}
 	}
 	return nil

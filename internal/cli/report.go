@@ -23,9 +23,11 @@ const DefaultDiagnosticBytes = 4096
 const maxRedactableURLBytes = 64 << 20
 
 const (
-	maxRedactionScanBytes = maxRedactableURLBytes + DefaultDiagnosticBytes
-	maxTrackerHostBytes   = 1024
-	statusInterval        = time.Second
+	maxRedactionScanBytes      = maxRedactableURLBytes + DefaultDiagnosticBytes
+	maxTrackerHostBytes        = 1024
+	statusInterval             = time.Second
+	redirectedProgressInterval = 30 * time.Second
+	logTimeLayout              = "2006-01-02T15:04:05.000Z"
 )
 
 // ReporterOptions contains the seams needed by the CLI and its deterministic
@@ -115,8 +117,15 @@ func (r *Reporter) Log(level LogLevel, format string, args ...any) error {
 	if r == nil || !r.enabled(level) {
 		return nil
 	}
+	return r.logAt(r.currentTime(), level, format, args...)
+}
+
+func (r *Reporter) logAt(at time.Time, level LogLevel, format string, args ...any) error {
+	if r == nil || !r.enabled(level) {
+		return nil
+	}
 	message := SanitizeDiagnostic(fmt.Sprintf(format, args...), r.maxBytes)
-	return r.writePermanent(level, message)
+	return r.writePermanentAt(at, level, message)
 }
 
 // Debug writes a debug diagnostic.
@@ -236,6 +245,29 @@ func (r *Reporter) renderStatusLocked(snapshot Status, now time.Time) (bool, err
 	return true, nil
 }
 
+// renderProgressAt uses the same coalesced snapshot for TTY status and sparse
+// redirected progress. It runs only on the CLI reporting owner, never a worker.
+func (r *Reporter) renderProgressAt(snapshot Status, at time.Time) (bool, error) {
+	if r.interactive {
+		return r.renderStatusAt(snapshot, at)
+	}
+	if !r.enabled(LogInfo) || snapshot.Phase != "transfer" {
+		return true, nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.status.updated && at.Sub(r.status.lastTime) < redirectedProgressInterval {
+		return false, nil
+	}
+	message := fmt.Sprintf("progress: verified=%d/%d bytes peers=%d rate=%d B/s", snapshot.VerifiedSelectedBytes, snapshot.SelectedBytes, maxInt(0, snapshot.ActivePeers), snapshot.RecentRateBytesPerSec)
+	err := r.writePermanentLocked(at, LogInfo, truncateString(message, r.maxBytes))
+	if err == nil {
+		r.status.updated = true
+		r.status.lastTime = at
+	}
+	return err == nil, err
+}
+
 // Result describes a successful terminal result. SelectionComplete and
 // TorrentComplete are separate because a selected download may intentionally
 // leave the rest of the torrent absent.
@@ -277,22 +309,24 @@ func (r *Reporter) PrimaryFailure(err error, resumable bool) error {
 	return r.writePermanent(LogError, truncateString(message, r.maxBytes))
 }
 
-// SecondaryFailure records a shutdown or final-event diagnostic without
-// replacing the primary result.
+// SecondaryFailure records a secondary failure without replacing the primary
+// result. Best-effort final tracker failures are warnings, not download errors.
 func (r *Reporter) SecondaryFailure(err error) error {
-	if r == nil || !r.enabled(LogError) {
+	if r == nil {
 		return nil
 	}
-	return r.secondaryFailureText(sanitizeError(err, r.maxBytes))
+	return r.secondaryFailure(prepareSecondary(err, r.currentTime()))
 }
 
-// secondaryFailureText writes a message already redacted and bounded before
-// retention by the CLI reporting owner.
-func (r *Reporter) secondaryFailureText(message string) error {
-	if r == nil || !r.enabled(LogError) {
+func (r *Reporter) secondaryFailure(record secondaryFailure) error {
+	level, prefix := LogError, "shutdown: "
+	if record.nonfatal {
+		level, prefix = LogWarning, "nonfatal: "
+	}
+	if r == nil || !r.enabled(level) {
 		return nil
 	}
-	return r.writePermanent(LogError, truncateString("shutdown: "+message, r.maxBytes))
+	return r.writePermanentAt(record.at, level, truncateString(prefix+record.text, r.maxBytes))
 }
 
 // PrivateIgnored emits the required warning for the deliberate BEP 27
@@ -313,8 +347,19 @@ func (r *Reporter) statusEnabled() bool {
 }
 
 func (r *Reporter) writePermanent(level LogLevel, message string) error {
+	return r.writePermanentAt(r.currentTime(), level, message)
+}
+
+func (r *Reporter) writePermanentAt(at time.Time, level LogLevel, message string) error {
+	if at.IsZero() {
+		at = r.currentTime()
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	return r.writePermanentLocked(at, level, message)
+}
+
+func (r *Reporter) writePermanentLocked(at time.Time, level LogLevel, message string) error {
 	if r.status.shown {
 		if _, err := io.WriteString(r.stderr, "\r"+strings.Repeat(" ", r.status.lastLen)+"\r"); err != nil {
 			return err
@@ -322,7 +367,7 @@ func (r *Reporter) writePermanent(level LogLevel, message string) error {
 		r.status.shown = false
 		r.status.lastLen = 0
 	}
-	_, err := fmt.Fprintf(r.stderr, "%s: %s\n", level, message)
+	_, err := fmt.Fprintf(r.stderr, "%s %s: %s\n", at.UTC().Format(logTimeLayout), level, message)
 	return err
 }
 

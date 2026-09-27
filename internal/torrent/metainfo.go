@@ -147,11 +147,12 @@ func normalizeInfo(info bencode.Value, trackers []string, expected *InfoHash) (M
 		}
 		files := []File{{Index: 0, Path: name, Range: ByteRange{Begin: 0, End: length}, Kind: RegularFile}}
 		pieces := makePieces(piecesValue.Bytes, pieceCount, pieceLength, length)
-		normalizedTrackers, err := TrackersWithDefault(trackers)
+		var skipped TrackerSkips
+		normalizedTrackers, err := trackersWithDefault(trackers, &skipped)
 		if err != nil {
 			return Metainfo{}, fmt.Errorf("%w: trackers: %v", ErrInvalidMetainfo, err)
 		}
-		return Metainfo{InfoHash: infoHash, Name: name, PieceLength: pieceLength, TotalLength: length, Files: files, Pieces: pieces, Trackers: normalizedTrackers, Private: private}, nil
+		return Metainfo{InfoHash: infoHash, Name: name, PieceLength: pieceLength, TotalLength: length, Files: files, Pieces: pieces, Trackers: normalizedTrackers, SkippedTrackers: skipped, Private: private}, nil
 	}
 	filesValue, ok := info.Lookup("files")
 	if !ok || filesValue.Type != bencode.List {
@@ -168,11 +169,12 @@ func normalizeInfo(info bencode.Value, trackers []string, expected *InfoHash) (M
 	if len(piecesValue.Bytes) != pieceCount*sha1.Size {
 		return Metainfo{}, fmt.Errorf("%w: pieces count does not match total length", ErrInvalidMetainfo)
 	}
-	normalizedTrackers, err := TrackersWithDefault(trackers)
+	var skipped TrackerSkips
+	normalizedTrackers, err := trackersWithDefault(trackers, &skipped)
 	if err != nil {
 		return Metainfo{}, fmt.Errorf("%w: trackers: %v", ErrInvalidMetainfo, err)
 	}
-	return Metainfo{InfoHash: infoHash, Name: name, MultiFile: true, PieceLength: pieceLength, TotalLength: total, Files: files, Pieces: makePieces(piecesValue.Bytes, pieceCount, pieceLength, total), Trackers: normalizedTrackers, Private: private}, nil
+	return Metainfo{InfoHash: infoHash, Name: name, MultiFile: true, PieceLength: pieceLength, TotalLength: total, Files: files, Pieces: makePieces(piecesValue.Bytes, pieceCount, pieceLength, total), Trackers: normalizedTrackers, SkippedTrackers: skipped, Private: private}, nil
 }
 
 func metainfoTrackers(root bencode.Value) ([]string, error) {
@@ -189,9 +191,6 @@ func metainfoTrackers(root bencode.Value) ([]string, error) {
 				if value.Type != bencode.Bytes {
 					return nil, fmt.Errorf("%w: announce-list URL is not a string", ErrInvalidMetainfo)
 				}
-				if !utf8.Valid(value.Bytes) {
-					return nil, fmt.Errorf("%w: announce-list URL is not valid UTF-8", ErrInvalidMetainfo)
-				}
 				raw = append(raw, string(value.Bytes))
 			}
 		}
@@ -199,16 +198,10 @@ func metainfoTrackers(root bencode.Value) ([]string, error) {
 		if announce.Type != bencode.Bytes {
 			return nil, fmt.Errorf("%w: announce is not a string", ErrInvalidMetainfo)
 		}
-		if !utf8.Valid(announce.Bytes) {
-			return nil, fmt.Errorf("%w: announce URL is not valid UTF-8", ErrInvalidMetainfo)
-		}
 		raw = append(raw, string(announce.Bytes))
 	}
-	trackers, err := TrackersWithDefault(raw)
-	if err != nil {
-		return nil, fmt.Errorf("%w: trackers: %v", ErrInvalidMetainfo, err)
-	}
-	return trackers, nil
+	// Normalize once in normalizeInfo so discarded entries can be counted.
+	return raw, nil
 }
 
 func infoName(info bencode.Value) (string, error) {

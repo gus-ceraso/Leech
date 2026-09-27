@@ -710,7 +710,7 @@ func TestV1CLITimeoutReportsStagedCloseFailureSeparately(t *testing.T) {
 	if err := peers.wait(t); err != nil {
 		t.Fatal(err)
 	}
-	lines := strings.Split(strings.TrimSpace(stderr.String()), "\n")
+	lines := strings.Split(strings.TrimSpace(withoutLogTimes(stderr.String())), "\n")
 	if len(lines) != 2 {
 		t.Fatalf("diagnostics = %q, want one primary and one secondary line", stderr.String())
 	}
@@ -782,7 +782,7 @@ func TestV1CLIPrimaryAndSecondaryErrorsRedactBeforeTruncation(t *testing.T) {
 		return v1ReadFailureStageFile{File: file, err: primaryErr}, nil
 	}
 	var stdout, stderr bytes.Buffer
-	opts := parseV1Options(t, "--output", t.TempDir(), "--loglevel", "error", torrentPath)
+	opts := parseV1Options(t, "--output", t.TempDir(), "--loglevel", "warning", torrentPath)
 	runErr := RunWithSession(context.Background(), opts, &stdout, &stderr, config)
 	if !errors.Is(runErr, primaryErr) {
 		t.Fatalf("session error = %v, want staged read failure", runErr)
@@ -793,7 +793,7 @@ func TestV1CLIPrimaryAndSecondaryErrorsRedactBeforeTruncation(t *testing.T) {
 	if stdout.Len() != 0 {
 		t.Fatalf("errors wrote stdout: %q", stdout.String())
 	}
-	lines := strings.Split(strings.TrimSpace(stderr.String()), "\n")
+	lines := strings.Split(strings.TrimSpace(withoutLogTimes(stderr.String())), "\n")
 	if len(lines) != 2 {
 		t.Fatalf("diagnostics = %q, want primary and secondary lines", stderr.String())
 	}
@@ -808,20 +808,20 @@ func TestV1CLIPrimaryAndSecondaryErrorsRedactBeforeTruncation(t *testing.T) {
 			t.Errorf("CLI diagnostics leaked %q: %q", secret, stderr.String())
 		}
 	}
-	for _, host := range []string{"[2001:db8::11]:8443", "[2001:db8::22]:9443"} {
+	for _, host := range []string{"[2001:db8::11]:8443"} {
 		if !strings.Contains(stderr.String(), host) {
 			t.Errorf("CLI diagnostics lost IPv6 host %q: %q", host, stderr.String())
 		}
 	}
 	for _, line := range lines {
-		if len(line) > DefaultDiagnosticBytes+len("error: ")+1 {
+		if len(line) > DefaultDiagnosticBytes+len("warning: ")+1 {
 			t.Errorf("rendered error line is unbounded (%d bytes): %q", len(line), line)
 		}
 	}
 	primaryLine, secondaryLine := false, false
 	for _, line := range lines {
 		primaryLine = primaryLine || strings.HasPrefix(line, "error: failure: ")
-		secondaryLine = secondaryLine || strings.HasPrefix(line, "error: shutdown: ")
+		secondaryLine = secondaryLine || strings.HasPrefix(line, "warning: nonfatal: ")
 	}
 	if !primaryLine || !secondaryLine {
 		t.Fatalf("primary and secondary classifications changed: %q", lines)

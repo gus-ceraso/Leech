@@ -7,10 +7,16 @@ import (
 	"io"
 	"net/url"
 	"os"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
 )
+
+var logTimePattern = regexp.MustCompile(`[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z `)
+
+// Existing presentation goldens compare messages; timing has its own exact checks.
+func withoutLogTimes(text string) string { return logTimePattern.ReplaceAllString(text, "") }
 
 func TestReporterLevelFilteringUsesWarningDefault(t *testing.T) {
 	var output bytes.Buffer
@@ -30,7 +36,7 @@ func TestReporterLevelFilteringUsesWarningDefault(t *testing.T) {
 	if err := r.Error("error"); err != nil {
 		t.Fatal(err)
 	}
-	if got, want := output.String(), "warning: warning\nerror: error\n"; got != want {
+	if got, want := withoutLogTimes(output.String()), "warning: warning\nerror: error\n"; got != want {
 		t.Fatalf("output = %q, want %q", got, want)
 	}
 }
@@ -85,7 +91,7 @@ func TestReporterNonTTYOmitsStatus(t *testing.T) {
 	if err := r.Debug("worker joined"); err != nil {
 		t.Fatal(err)
 	}
-	if output.String() != "debug: worker joined\n" {
+	if withoutLogTimes(output.String()) != "debug: worker joined\n" {
 		t.Fatalf("debug output = %q", output.String())
 	}
 }
@@ -228,7 +234,7 @@ func TestReporterRedactsNestedURLErrorAndKeepsOrdinaryDetails(t *testing.T) {
 	if err := reporter.SecondaryFailure(trackerErr); err != nil {
 		t.Fatal(err)
 	}
-	if got, want := output.String(), "error: failure: announce failed: Get \"http://[::1]:8080\": dial tcp: connection refused\nerror: shutdown: announce failed: Get \"http://[::1]:8080\": dial tcp: connection refused\n"; got != want {
+	if got, want := withoutLogTimes(output.String()), "error: failure: announce failed: Get \"http://[::1]:8080\": dial tcp: connection refused\nerror: shutdown: announce failed: Get \"http://[::1]:8080\": dial tcp: connection refused\n"; got != want {
 		t.Fatalf("output = %q, want %q", got, want)
 	}
 	if got, want := SanitizeDiagnostic("ordinary validation error: missing file; retry later"), "ordinary validation error: missing file; retry later"; got != want {
