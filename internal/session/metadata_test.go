@@ -488,12 +488,57 @@ func TestMetadataDiscoveryObservesMetadataReject(t *testing.T) {
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("discovery error = %v, want timeout", err)
 	}
+	var sawRefusal, sawWinner bool
 	for _, event := range diagnostics {
-		if event.Kind == DiagnosticMetadataRefusal && event.Peer.Port == port {
+		sawRefusal = sawRefusal || event.Kind == DiagnosticMetadataRefusal && event.Peer.Port == port
+		sawWinner = sawWinner || event.Kind == DiagnosticTransportRace && event.Phase == "metadata" && event.Peer.Port == port && strings.HasPrefix(event.Detail, "winner=")
+	}
+	if !sawRefusal || !sawWinner {
+		t.Fatalf("metadata reject/winning transport observations refusal=%t winner=%t: %+v", sawRefusal, sawWinner, diagnostics)
+	}
+}
+
+func TestMetadataDiscoveryReportsFailedTransportRace(t *testing.T) {
+	info := testInfo(t)
+	digest := sha1.Sum(info)
+	var expected torrent.InfoHash
+	copy(expected[:], digest[:])
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	observations := make(chan Diagnostic, 8)
+	_, err := DiscoverMetadata(ctx, MetadataConfig{
+		InfoHash: expected,
+		Peers:    []torrent.PeerAddress{{Host: "127.0.0.1", Port: 51423}},
+		HTTP:     &metadataFixtureTracker{},
+		TCPDial: func(context.Context, string, string) (net.Conn, error) {
+			return nil, errors.New("injected local dial failure")
+		},
+		OnDiagnostic: func(event Diagnostic) {
+			observations <- event
+			if event.Kind == DiagnosticTransportRace && event.Phase == "metadata" {
+				cancel()
+			}
+		},
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("metadata discovery error = %v, want cancellation after race result", err)
+	}
+	timer := time.NewTimer(time.Second)
+	defer timer.Stop()
+	for {
+		select {
+		case event := <-observations:
+			if event.Kind != DiagnosticTransportRace {
+				continue
+			}
+			if event.Phase != "metadata" || event.Peer.Port != 51423 || event.Detail != "failed" {
+				t.Fatalf("failed transport observation = %+v", event)
+			}
 			return
+		case <-timer.C:
+			t.Fatal("metadata failed transport race was not observed")
 		}
 	}
-	t.Fatalf("metadata reject observation missing: %+v", diagnostics)
 }
 
 func TestMetadataDiscoveryCancellationClosesSilentPeer(t *testing.T) {

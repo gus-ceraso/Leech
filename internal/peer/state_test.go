@@ -96,6 +96,22 @@ func TestPeerStateAvailabilityAndAllowedFastAreIndependent(t *testing.T) {
 	}
 }
 
+func TestPeerStateAllowedFastEffectOnlyForNewGrant(t *testing.T) {
+	state, err := NewPeerState(4, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	grant := Message{ID: AllowedFastID, Payload: uint32Payload(2)}
+	first, err := state.ApplyMessage(grant)
+	if err != nil || !first.AllowedFastAdded {
+		t.Fatalf("first grant effect = %+v, %v", first, err)
+	}
+	duplicate, err := state.ApplyMessage(grant)
+	if err != nil || duplicate.AllowedFastAdded {
+		t.Fatalf("duplicate grant effect = %+v, %v", duplicate, err)
+	}
+}
+
 func TestPeerStateInitialAvailabilityOrdering(t *testing.T) {
 	state, err := NewPeerStateWithConfig(PeerStateConfig{PieceCount: 8, Fast: true})
 	if err != nil {

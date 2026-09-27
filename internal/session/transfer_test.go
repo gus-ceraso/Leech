@@ -192,7 +192,7 @@ func TestTransferDiagnosticsObserveAvailabilityAndFirstUsefulBlock(t *testing.T)
 			sawAvailable = true
 			availableTransitions++
 		default:
-			if strings.HasPrefix(event.Detail, "requests assigned ") {
+			if strings.HasPrefix(event.Detail, "request assignment summary ") {
 				sawRequest = true
 			}
 		case "first useful block accepted and staged":
@@ -203,6 +203,17 @@ func TestTransferDiagnosticsObserveAvailabilityAndFirstUsefulBlock(t *testing.T)
 	}
 	if !sawEmpty || !sawAvailable || !sawRequest || !sawUseful || !sawComplete || emptyTransitions != 2 || availableTransitions != 2 {
 		t.Fatalf("transfer observations empty=%t available=%t request=%t useful=%t complete=%t transitions=%d/%d: %+v", sawEmpty, sawAvailable, sawRequest, sawUseful, sawComplete, emptyTransitions, availableTransitions, observations)
+	}
+}
+
+func TestTransferActivityDiagnosticsSummarizeRepeatedRequests(t *testing.T) {
+	var observations []Diagnostic
+	transfer := &Transfer{onDiagnostic: func(event Diagnostic) { observations = append(observations, event) }}
+	p := &transferPeer{requestsSinceSummary: 257, allowedFastSinceSummary: 16}
+	transfer.reportPeerActivity([]*transferPeer{p})
+	transfer.reportPeerActivity([]*transferPeer{p})
+	if len(observations) != 2 || observations[0].Detail != "request assignment summary outstanding=0" || observations[0].Count != 257 || observations[1].Detail != "Allowed Fast grant summary" || observations[1].Count != 16 {
+		t.Fatalf("repeated activity diagnostics = %+v", observations)
 	}
 }
 
@@ -1685,9 +1696,11 @@ func TestTransferFastAllowedPieceCanProgressWhileChoked(t *testing.T) {
 			return
 		}
 		allowed := make([]byte, 4)
-		if err := writeFixtureFrame(conn, peer.AllowedFastID, allowed); err != nil {
-			serverDone <- err
-			return
+		for range 32 {
+			if err := writeFixtureFrame(conn, peer.AllowedFastID, allowed); err != nil {
+				serverDone <- err
+				return
+			}
 		}
 		requested := false
 		for {
@@ -1739,7 +1752,7 @@ func TestTransferFastAllowedPieceCanProgressWhileChoked(t *testing.T) {
 		Now: func() time.Time { return clock },
 		OnDiagnostic: func(event Diagnostic) {
 			observations = append(observations, event)
-			if event.Detail == "Allowed Fast received piece=0" {
+			if event.Detail == "Allowed Fast grant summary" {
 				clock = clock.Add(3 * time.Second)
 			}
 		},
@@ -1761,14 +1774,21 @@ func TestTransferFastAllowedPieceCanProgressWhileChoked(t *testing.T) {
 		t.Fatalf("output = %q, %v", got, err)
 	}
 	var allowed, used, useful, chokeDuration bool
+	grantSummaries, requestSummaries := 0, 0
 	for _, event := range observations {
-		allowed = allowed || event.Detail == "Allowed Fast received piece=0"
+		if event.Detail == "Allowed Fast grant summary" {
+			allowed = event.Count == 1
+			grantSummaries++
+		}
+		if event.Detail == "request assignment summary outstanding=1" {
+			requestSummaries++
+		}
 		used = used || event.Detail == "Allowed Fast enabled request piece=0"
 		useful = useful || event.Detail == "first useful block accepted and staged"
 		chokeDuration = chokeDuration || event.Detail == "peer disconnected while choked" && event.Duration >= 3*time.Second
 	}
-	if !allowed || !used || !useful || !chokeDuration {
-		t.Fatalf("Fast/choke observations allowed=%t used=%t useful=%t duration=%t: %+v", allowed, used, useful, chokeDuration, observations)
+	if !allowed || !used || !useful || !chokeDuration || grantSummaries != 1 || requestSummaries > 1 {
+		t.Fatalf("Fast/choke observations allowed=%t used=%t useful=%t duration=%t summaries=%d/%d: %+v", allowed, used, useful, chokeDuration, grantSummaries, requestSummaries, observations)
 	}
 }
 

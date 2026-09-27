@@ -38,6 +38,7 @@ type StateEffect struct {
 	Interested          bool
 	AvailabilityAdded   []uint32
 	AvailabilityRemoved []uint32
+	AllowedFastAdded    bool
 	SuggestedPiece      uint32
 	HasSuggestion       bool
 	Terminal            Terminal
@@ -402,6 +403,7 @@ func (s *PeerState) ApplyMessage(message Message) (StateEffect, error) {
 		index := binary.BigEndian.Uint32(message.Payload)
 		if !s.allowedFast.has(index) {
 			s.allowedFast.set(index, true)
+			effect.AllowedFastAdded = true
 			if s.choked && s.availability.has(index) && s.wanted.has(index) {
 				s.requestableCount++
 				effect.AvailabilityAdded = append(effect.AvailabilityAdded, index)

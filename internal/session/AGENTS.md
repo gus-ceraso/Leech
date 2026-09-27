@@ -66,9 +66,14 @@ piece/request state, and `transfer.go` coordinates peer I/O and finalization.
   records on pressure. Transfer emits `DiagnosticTransfer` transitions from the
   coordinator at choke, availability, Allowed Fast, useful-block, tombstone,
   scheduling, and finalizer state effects. Initial empty availability is observed
-  at admission; unchanged availability is silent. Keep event details summarized,
-  with no per-block logging. `DiagnosticTransportRace` records handshake winner,
-  failure, and peer-ID collision without retaining raw errors.
+  at admission; unchanged availability is silent. Request assignments and newly
+  received Allowed Fast grants accumulate in saturating per-peer counters and are
+  emitted at most once per peer per existing replacement tick (also flushed on
+  retirement or shutdown); duplicate grants do not increment them. Keep event
+  details summarized, with no per-block logging. `DiagnosticTransportRace`
+  records the actual handshake winner or a failed race, including metadata phase,
+  without retaining raw errors. `DialWithResult` carries the winner through
+  collision rejection while its closed connection remains unowned by session.
 - The coordinator alone mutates rarity, request ownership, provenance, strikes,
   and completion. Give the finalizer immutable coverage snapshots. Worker
   callbacks and command enqueueing must not stall coordination indefinitely.

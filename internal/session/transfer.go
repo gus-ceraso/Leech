@@ -139,21 +139,23 @@ type Transfer struct {
 }
 
 type transferPeer struct {
-	input           ConnectedPeer
-	worker          *peer.ConnectionWorker
-	state           *peer.PeerState
-	extensions      *peer.ExtensionState
-	active          map[peer.Block]time.Time
-	tombstoned      map[peer.Block]struct{}
-	done            bool
-	removed         bool
-	deferDrive      bool
-	lastUseful      time.Time
-	chokedSince     time.Time
-	firstUseful     bool
-	allowedFastUsed bool
-	lastBlocked     string
-	released        bool
+	input                   ConnectedPeer
+	worker                  *peer.ConnectionWorker
+	state                   *peer.PeerState
+	extensions              *peer.ExtensionState
+	active                  map[peer.Block]time.Time
+	tombstoned              map[peer.Block]struct{}
+	done                    bool
+	removed                 bool
+	deferDrive              bool
+	lastUseful              time.Time
+	chokedSince             time.Time
+	firstUseful             bool
+	allowedFastUsed         bool
+	allowedFastSinceSummary uint64
+	requestsSinceSummary    uint64
+	lastBlocked             string
+	released                bool
 }
 
 func (p *transferPeer) sendCommand(ctx context.Context, message peer.Message) error {
@@ -416,6 +418,7 @@ func (t *Transfer) Run(ctx context.Context) error {
 			if t.onStatus != nil {
 				t.onStatus(countLive(peers))
 			}
+			t.reportPeerActivity(peers)
 			continue
 		}
 		if !result.OK {
@@ -438,6 +441,7 @@ func (t *Transfer) Run(ctx context.Context) error {
 	acquireWG.Wait()
 	t.drainAcquired(acquired)
 	primary = t.callBeforePeerShutdown(primary)
+	t.reportPeerActivity(peers)
 
 	// Closing workers is the cancellation/unblock mechanism for their raw
 	// reads. Every worker joins before the private staging workspace is gone.
@@ -700,9 +704,7 @@ func (t *Transfer) drive(ctx context.Context, peers *[]*transferPeer) error {
 				delete(p.active, request.Block)
 				return err
 			}
-		}
-		if len(requests) > 0 {
-			t.observeCount(p, "requests assigned", uint64(len(requests)), fmt.Sprintf("outstanding=%d", len(p.active)))
+			p.requestsSinceSummary = saturatingAdd(p.requestsSinceSummary, 1)
 		}
 		if t.scheduler.Endgame() && !t.endgameReported {
 			t.endgameReported = true
@@ -971,6 +973,29 @@ func (t *Transfer) observeSession(detail string, count uint64) {
 	t.observeCount(nil, detail, count, "")
 }
 
+func (t *Transfer) reportPeerActivity(peers []*transferPeer) {
+	for _, p := range peers {
+		if p == nil || p.done {
+			continue
+		}
+		if p.requestsSinceSummary != 0 {
+			t.observeCount(p, "request assignment summary", p.requestsSinceSummary, fmt.Sprintf("outstanding=%d", len(p.active)))
+			p.requestsSinceSummary = 0
+		}
+		if p.allowedFastSinceSummary != 0 {
+			t.observeCount(p, "Allowed Fast grant summary", p.allowedFastSinceSummary, "")
+			p.allowedFastSinceSummary = 0
+		}
+	}
+}
+
+func saturatingAdd(value, increment uint64) uint64 {
+	if ^uint64(0)-value < increment {
+		return ^uint64(0)
+	}
+	return value + increment
+}
+
 func (t *Transfer) blocked(p *transferPeer, reason string) {
 	if p.lastBlocked == reason {
 		return
@@ -1082,9 +1107,8 @@ func (t *Transfer) handleEventWithPeers(ctx context.Context, peers []*transferPe
 		}
 		return err
 	}
-	if event.Message.ID == peer.AllowedFastID {
-		index := binary.BigEndian.Uint32(event.Message.Payload)
-		t.observe(p, fmt.Sprintf("Allowed Fast received piece=%d", index))
+	if effect.AllowedFastAdded {
+		p.allowedFastSinceSummary = saturatingAdd(p.allowedFastSinceSummary, 1)
 	}
 	if event.Message.ID == peer.ChokeID && !wasChoked {
 		p.chokedSince = t.clock()
@@ -1329,6 +1353,7 @@ func (t *Transfer) disconnectPeer(p *transferPeer, cause error) error {
 	if p.done {
 		return nil
 	}
+	t.reportPeerActivity([]*transferPeer{p})
 	if p.state.Choked() {
 		duration := t.clock().Sub(p.chokedSince)
 		t.observeDuration(p, "peer disconnected while choked", duration)

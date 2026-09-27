@@ -302,16 +302,17 @@ func TestTransferDiagnosticsObserveCandidateAdmissionAndDialOutcome(t *testing.T
 		t.Fatal("transfer candidate did not reach a dial outcome")
 	}
 	close(events)
-	admitted, dialFailed, phaseExited := false, false, false
+	admitted, dialFailed, phaseExited, raceFailed := false, false, false, false
 	for event := range events {
 		if event.Kind == session.DiagnosticPeerSelection && event.Phase == "transfer" {
 			admitted = admitted || event.Detail == "candidate admitted"
 			dialFailed = dialFailed || event.Detail == "candidate dial failed"
 		}
+		raceFailed = raceFailed || event.Kind == session.DiagnosticTransportRace && event.Phase == "transfer" && event.Detail == "failed"
 		phaseExited = phaseExited || event.Kind == session.DiagnosticLifecycle && event.Phase == "transfer" && event.Detail == "phase exited with failure"
 	}
-	if !admitted || !dialFailed || !phaseExited {
-		t.Fatalf("transfer diagnostic outcomes admitted=%t dialFailed=%t phaseExited=%t", admitted, dialFailed, phaseExited)
+	if !admitted || !dialFailed || !phaseExited || !raceFailed {
+		t.Fatalf("transfer diagnostic outcomes admitted=%t dialFailed=%t raceFailed=%t phaseExited=%t", admitted, dialFailed, raceFailed, phaseExited)
 	}
 }
 

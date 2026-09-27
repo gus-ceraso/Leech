@@ -898,7 +898,13 @@ func TestV1MagnetAndBareHashRunMetadataThenTransferThroughCLI(t *testing.T) {
 			opts := parseV1Options(t, "--output", output, test.source)
 			config := v1SessionConfig(t, trackerFixture, peers)
 			var phases []string
+			var races []session.Diagnostic
 			config.OnPhase = func(phase string) { phases = append(phases, phase) }
+			config.OnDiagnostic = func(event session.Diagnostic) {
+				if event.Kind == session.DiagnosticTransportRace {
+					races = append(races, event)
+				}
+			}
 			ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 			defer cancel()
 			err := RunWithSession(ctx, opts, &bytes.Buffer{}, &bytes.Buffer{}, config)
@@ -907,6 +913,17 @@ func TestV1MagnetAndBareHashRunMetadataThenTransferThroughCLI(t *testing.T) {
 			}
 			if got := strings.Join(phases, ","); got != "metadata,selection,transfer" {
 				t.Fatalf("CLI phases = %q, want metadata,selection,transfer", got)
+			}
+			metadataWinner, transferWinner := false, false
+			for _, event := range races {
+				if !strings.HasPrefix(event.Detail, "winner=") {
+					continue
+				}
+				metadataWinner = metadataWinner || event.Phase == "metadata"
+				transferWinner = transferWinner || event.Phase == "transfer"
+			}
+			if !metadataWinner || !transferWinner {
+				t.Fatalf("transport race winners metadata=%t transfer=%t: %+v", metadataWinner, transferWinner, races)
 			}
 			if err := peers.wait(t); err != nil {
 				t.Fatal(err)

@@ -220,8 +220,17 @@ func (m *DialManager) Race(ctx context.Context, candidate ResolvedCandidate) (Ha
 // registry. On success, the returned LivePeer owns its connection. On every
 // failure, any connection from the race is closed by the relevant owner.
 func (m *DialManager) Dial(ctx context.Context, candidate ResolvedCandidate) (*LivePeer, error) {
+	admitted, _, err := m.DialWithResult(ctx, candidate)
+	return admitted, err
+}
+
+// DialWithResult also returns a successful handshake race result when peer-ID
+// registry admission fails, so the caller can observe the winning transport.
+// The result is observational: on success the LivePeer owns its connection; on
+// admission error DialManager closes it.
+func (m *DialManager) DialWithResult(ctx context.Context, candidate ResolvedCandidate) (*LivePeer, HandshakeResult, error) {
 	if m == nil {
-		return nil, ErrDialConfig
+		return nil, HandshakeResult{}, ErrDialConfig
 	}
 	if ctx == nil {
 		ctx = context.Background()
@@ -229,19 +238,19 @@ func (m *DialManager) Dial(ctx context.Context, candidate ResolvedCandidate) (*L
 	select {
 	case m.liveSlots <- struct{}{}:
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		return nil, HandshakeResult{}, ctx.Err()
 	}
 	peerResult, err := m.Race(ctx, candidate)
 	if err != nil {
 		<-m.liveSlots
-		return nil, err
+		return nil, HandshakeResult{}, err
 	}
 	peer, err := m.registry.Admit(peerResult)
 	if err != nil {
 		<-m.liveSlots
-		return nil, err
+		return nil, peerResult, err
 	}
-	return peer, nil
+	return peer, peerResult, nil
 }
 
 // Release closes and releases a peer admitted by Dial. A stale release is a

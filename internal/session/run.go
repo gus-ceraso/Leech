@@ -677,6 +677,19 @@ func trackerFailureDetail(err error) string {
 	return "transaction failed"
 }
 
+func transportRaceDiagnostic(phase string, endpoint peer.Endpoint, result peer.HandshakeResult, err error) Diagnostic {
+	detail := "failed"
+	if errors.Is(err, peer.ErrPeerIDCollision) {
+		detail = "peer ID collision; older connection retained; winner=" + result.Transport.String()
+	} else if result.Conn != nil {
+		detail = "winner=" + result.Transport.String()
+		if err != nil {
+			detail = "peer admission failed; " + detail
+		}
+	}
+	return Diagnostic{Kind: DiagnosticTransportRace, Phase: phase, Peer: endpoint, Detail: detail}
+}
+
 func diagnosticTrackerEndpoint(raw string) DiagnosticEndpoint {
 	u, err := url.Parse(raw)
 	if err != nil {
@@ -865,14 +878,10 @@ func (c *coordinator) startTransferPhase(ctx context.Context, source torrent.Sou
 				}
 				c.diagnostic(Diagnostic{Kind: DiagnosticPeerSelection, Phase: "transfer", Peer: candidate.Endpoint, Detail: "candidate selected for dial"})
 				dialCtx, dialCancel := context.WithTimeout(acquireCtx, trackerEndpointRaceTimeout)
-				admitted, dialErr := manager.Dial(dialCtx, candidate)
+				admitted, raceResult, dialErr := manager.DialWithResult(dialCtx, candidate)
 				dialCancel()
 				if dialErr != nil {
-					detail := "failed"
-					if errors.Is(dialErr, peer.ErrPeerIDCollision) {
-						detail = "peer ID collision; older connection retained"
-					}
-					c.diagnostic(Diagnostic{Kind: DiagnosticTransportRace, Phase: "transfer", Peer: candidate.Endpoint, Detail: detail})
+					c.diagnostic(transportRaceDiagnostic("transfer", candidate.Endpoint, raceResult, dialErr))
 					c.diagnostic(Diagnostic{Kind: DiagnosticPeerSelection, Phase: "transfer", Peer: candidate.Endpoint, Detail: "candidate dial failed"})
 					var budgetErr *peer.EndpointBudgetError
 					if errors.As(dialErr, &budgetErr) {
@@ -880,7 +889,7 @@ func (c *coordinator) startTransferPhase(ctx context.Context, source torrent.Sou
 					}
 					continue
 				}
-				c.diagnostic(Diagnostic{Kind: DiagnosticTransportRace, Phase: "transfer", Peer: admitted.Endpoint, Detail: "winner=" + admitted.Transport.String()})
+				c.diagnostic(transportRaceDiagnostic("transfer", admitted.Endpoint, raceResult, nil))
 				c.diagnostic(Diagnostic{Kind: DiagnosticPeerSelection, Phase: "transfer", Peer: admitted.Endpoint, Detail: "candidate connected"})
 				liveMu.Lock()
 				live[admitted.Conn] = admitted

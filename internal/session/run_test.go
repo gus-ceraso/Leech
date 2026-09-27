@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
@@ -24,6 +25,22 @@ import (
 	"github.com/gus-ceraso/Leech/internal/torrent"
 	"github.com/gus-ceraso/Leech/internal/tracker"
 )
+
+func TestTransportRaceDiagnosticsRetainCollisionWinner(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+	endpoint := peer.Endpoint{Addr: netip.MustParseAddr("192.0.2.44"), Port: 51444}
+	result := peer.HandshakeResult{Endpoint: endpoint, Transport: peer.TransportUTP, Conn: client}
+	diagnostic := transportRaceDiagnostic("transfer", endpoint, result, peer.ErrPeerIDCollision)
+	if diagnostic.Kind != DiagnosticTransportRace || diagnostic.Peer != endpoint || diagnostic.Detail != "peer ID collision; older connection retained; winner=utp" {
+		t.Fatalf("collision transport diagnostic = %+v", diagnostic)
+	}
+	failed := transportRaceDiagnostic("metadata", endpoint, peer.HandshakeResult{}, errors.New("untrusted dial error"))
+	if failed.Detail != "failed" || failed.Phase != "metadata" {
+		t.Fatalf("failed transport diagnostic = %+v", failed)
+	}
+}
 
 func TestTrackerWarningsCoalesceRecoverAndKeepFinalFailuresSecondary(t *testing.T) {
 	var warnings []string

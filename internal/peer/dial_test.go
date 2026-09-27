@@ -611,6 +611,51 @@ func (c *closeSpy) Close() error {
 	return c.Conn.Close()
 }
 
+func TestDialWithResultRetainsWinnerOnPeerIDCollision(t *testing.T) {
+	local := testHandshake()
+	remote := Handshake{InfoHash: local.InfoHash, PeerID: [20]byte{42}}
+	serverDone := make(chan struct{}, 2)
+	dial := func(context.Context, string, string) (net.Conn, error) {
+		client, server := net.Pipe()
+		go func() {
+			defer func() { serverDone <- struct{}{} }()
+			defer server.Close()
+			if _, err := ReadHandshake(server, &local.InfoHash, nil); err == nil {
+				_ = WriteHandshake(server, remote.InfoHash, remote.PeerID, remote.Reserved)
+			}
+		}()
+		return client, nil
+	}
+	manager, err := NewDialManager(DialManagerConfig{Race: RaceConfig{LocalHandshake: local, TCPDial: dial}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstCandidate := ResolvedCandidate{Endpoint: Endpoint{Addr: netip.MustParseAddr("192.0.2.41"), Port: 5141}}
+	first, firstResult, err := manager.DialWithResult(context.Background(), firstCandidate)
+	if err != nil || firstResult.Transport != TransportTCP {
+		t.Fatalf("first DialWithResult = %v, %v, want TCP winner", firstResult.Transport, err)
+	}
+	secondCandidate := ResolvedCandidate{Endpoint: Endpoint{Addr: netip.MustParseAddr("192.0.2.42"), Port: 5142}}
+	second, collisionResult, err := manager.DialWithResult(context.Background(), secondCandidate)
+	if second != nil || !errors.Is(err, ErrPeerIDCollision) || collisionResult.Transport != TransportTCP || collisionResult.Handshake.PeerID != remote.PeerID {
+		t.Fatalf("collision result peer=%v transport=%v id=%x err=%v", second, collisionResult.Transport, collisionResult.Handshake.PeerID, err)
+	}
+	retained, ok := manager.Registry().Lookup(remote.PeerID)
+	if !ok || retained != first || retained.Transport != TransportTCP {
+		t.Fatalf("collision replaced older peer: retained=%p first=%p", retained, first)
+	}
+	if !manager.Release(first) {
+		t.Fatal("release older peer failed")
+	}
+	for range 2 {
+		select {
+		case <-serverDone:
+		case <-time.After(time.Second):
+			t.Fatal("handshake server did not join")
+		}
+	}
+}
+
 func TestPeerRegistryRetainsOlderPeerIDConnectionAndReleasesIt(t *testing.T) {
 	registry, err := NewPeerRegistry(2)
 	if err != nil {

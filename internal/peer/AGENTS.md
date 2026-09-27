@@ -19,6 +19,8 @@ BEPs [3](../../beps/bep_0003.rst), [6](../../beps/bep_0006.rst),
 - Availability and Allowed Fast are separate sets; choked requests require both.
   `AvailabilityCount` exposes the coordinator-owned ordinary set size for
   transition observations; it does not conflate Allowed Fast with availability.
+  `StateEffect.AllowedFastAdded` marks only a newly retained valid grant, so
+  session observers need not reparse frames or report duplicates.
   `Have None` clears only availability. During file transfer, preserve initial
   availability-message ordering and use one validator for every spare bit in an
   initial bitfield. Metadata discovery follows the exception in
@@ -52,7 +54,9 @@ BEPs [3](../../beps/bep_0003.rst), [6](../../beps/bep_0006.rst),
 - Race both transports to the same literal endpoint. Preserve the uTP head start
   even after early failure; a valid BEP 3 handshake wins. Cancel, close, and join
   the loser before evaluating capabilities. Never revive it to obtain an
-  extension. See the [uTP dial-context lifetime rule](../utp/AGENTS.md).
+  extension. `DialWithResult` preserves the validated winner fields if peer-ID
+  registry admission rejects a collision; the result connection is already
+  closed in that case. See the [uTP dial-context lifetime rule](../utp/AGENTS.md).
 - Distinguish severe peer-origin violations from ordinary disconnects, stalls,
   and compatibility failures; keep bounded well-framed unknown messages ignorable.
 
