@@ -77,8 +77,5 @@ untrusted parsers and state transitions with useful valid seeds, explicit
 invariants, and retained regressions. Use independently specified wire bytes and
 expected outcomes rather than Leech's own encoders alone.
 
-Never test against live trackers or existing BitTorrent clients, manually or
-automatically. Use specification-derived local peers/trackers, controlled clocks,
-and narrow injected dependencies. Route the mandatory default tracker locally
-in tests while asserting its inclusion. Do not add test-only CLI flags,
-environment settings, generic simulators, or arbitrary coverage targets.
+Never test against live trackers or existing BitTorrent clients without the user's
+explict permission.
