@@ -43,7 +43,10 @@ piece/request state, and `transfer.go` coordinates peer I/O and finalization.
   already-admitted peers remain schedulable.
 - Acquisition retries only `ErrNoPeer` or errors reporting `Temporary() == true`;
   other errors terminate transfer. Advance the candidate cursor only for examined
-  candidates, preserving it across tracker notifications.
+  candidates, preserving it across tracker notifications. Production transfer
+  currently acquires endpoints serially: the dial manager's 32-race bound is a
+  ceiling, not active parallelism. Do not parallelize `AcquirePeer` callbacks
+  without preserving single ownership of the candidate cursor and admission pump.
 - `RunConfig.OnDiagnostic` is optional and separate from progress, warnings, and
   secondary failures. Its exact value shape is
   `Diagnostic{At time.Time, Kind DiagnosticKind, Phase string,
