@@ -295,7 +295,7 @@ func serveAcknowledgeStream(server *net.UDPConn, wantBytes int) error {
 		}
 		ack := receiver.AckPacket()
 		ack.ConnectionID = packet.ConnectionID - 1
-		ack.SeqNr = 1_001
+		ack.SeqNr = 1_000
 		ack.WindowSize = peerWindow
 		if err := sendTo(server, ack, addr); err != nil {
 			return err
@@ -400,7 +400,7 @@ func serveScriptedStream(server *net.UDPConn, want []byte) (scriptedStreamStats,
 	if err := sendTo(server, Packet{
 		Type:         State,
 		ConnectionID: syn.ConnectionID,
-		SeqNr:        peerSequence.Add(^uint16(0)),
+		SeqNr:        peerSequence,
 		AckNr:        syn.SeqNr,
 		WindowSize:   peerWindow,
 		Timestamp:    timestamp(time.Now()),
@@ -542,7 +542,7 @@ func sendScriptAck(server *net.UDPConn, addr *net.UDPAddr, connectionID uint16, 
 		ConnectionID: connectionID,
 		Timestamp:    timestamp(time.Now()),
 		AckNr:        ack,
-		SeqNr:        0x1234,
+		SeqNr:        0xffff,
 		WindowSize:   window,
 	}
 	maxDistance := 0
@@ -579,7 +579,7 @@ func serveEchoLoop(server *net.UDPConn) error {
 	if err := sendTo(server, Packet{Type: State, ConnectionID: packet.ConnectionID, SeqNr: 500, AckNr: packet.SeqNr, WindowSize: 4 << 20}, addr); err != nil {
 		return err
 	}
-	seq := Sequence(501)
+	seq := Sequence(500)
 	for {
 		packet, addr, err = readPacket(server)
 		if err != nil {
@@ -775,8 +775,8 @@ func serveRetransmissionHeaders(server *net.UDPConn) error {
 		return errors.New("retransmission fixture did not receive first DATA")
 	}
 	// The peer data is deliberately ACK-stale, so the client retains the
-	// first DATA packet while its receive ACK advances to sequence 901.
-	if err := sendTo(server, Packet{Type: Data, ConnectionID: syn.ConnectionID, Timestamp: timestamp(time.Now().Add(-time.Second)), SeqNr: 901, AckNr: syn.SeqNr, WindowSize: 4 << 20, Payload: []byte("peer")}, addr); err != nil {
+	// first DATA packet while its receive ACK advances to sequence 900.
+	if err := sendTo(server, Packet{Type: Data, ConnectionID: syn.ConnectionID, Timestamp: timestamp(time.Now().Add(-time.Second)), SeqNr: 900, AckNr: syn.SeqNr, WindowSize: 4 << 20, Payload: []byte("peer")}, addr); err != nil {
 		return err
 	}
 	if _, _, err := readRawPacket(server); err != nil {
@@ -793,7 +793,7 @@ func serveRetransmissionHeaders(server *net.UDPConn) error {
 	if retry.SeqNr != first.SeqNr || !bytes.Equal(retry.Payload, first.Payload) {
 		return errors.New("retransmitted DATA changed sequence or payload")
 	}
-	if retry.AckNr != 901 {
+	if retry.AckNr != 900 {
 		return errors.New("retransmitted DATA did not refresh receive ACK")
 	}
 	if retry.WindowSize != 4<<20-uint32(len("peer")) {
@@ -832,7 +832,7 @@ func serveHeaderTracking(server *net.UDPConn) error {
 	if got := binary.BigEndian.Uint16(dataWire[2:4]); got != syn.ConnectionID+1 {
 		return errors.New("DATA connection ID did not use SYN ID plus one")
 	}
-	if got := binary.BigEndian.Uint16(dataWire[18:20]); got != 800 {
+	if got := binary.BigEndian.Uint16(dataWire[18:20]); got != 799 {
 		return errors.New("DATA ACK did not track handshake STATE")
 	}
 	if got := binary.BigEndian.Uint32(dataWire[12:16]); got != 4<<20 {
@@ -842,7 +842,7 @@ func serveHeaderTracking(server *net.UDPConn) error {
 		return errors.New("DATA timestamp difference was not measured")
 	}
 	serverDataTimestamp := timestamp(time.Now().Add(-time.Second))
-	if err := sendTo(server, Packet{Type: Data, ConnectionID: syn.ConnectionID, Timestamp: serverDataTimestamp, SeqNr: 801, AckNr: data.SeqNr, WindowSize: 4 << 20, Payload: []byte("server")}, addr); err != nil {
+	if err := sendTo(server, Packet{Type: Data, ConnectionID: syn.ConnectionID, Timestamp: serverDataTimestamp, SeqNr: 800, AckNr: data.SeqNr, WindowSize: 4 << 20, Payload: []byte("server")}, addr); err != nil {
 		return err
 	}
 	ackWire, _, err := readRawPacket(server)
@@ -859,7 +859,7 @@ func serveHeaderTracking(server *net.UDPConn) error {
 	if got := binary.BigEndian.Uint16(ackWire[16:18]); got != uint16(data.SeqNr+1) {
 		return errors.New("STATE ACK sequence did not track sender sequence")
 	}
-	if got := binary.BigEndian.Uint16(ackWire[18:20]); got != 801 {
+	if got := binary.BigEndian.Uint16(ackWire[18:20]); got != 800 {
 		return errors.New("STATE ACK did not track receive ACK")
 	}
 	if got := binary.BigEndian.Uint32(ackWire[8:12]); got == 0 {
@@ -906,7 +906,7 @@ func servePeerHandshake(server *net.UDPConn, infoHash, expectedClientID, serverI
 	if !bytes.Equal(packet.Payload, want) {
 		return errors.New("client BEP3 handshake wire mismatch")
 	}
-	if err := sendTo(server, Packet{Type: State, ConnectionID: packet.ConnectionID - 1, AckNr: packet.SeqNr, WindowSize: 4 << 20}, addr); err != nil {
+	if err := sendTo(server, Packet{Type: State, ConnectionID: packet.ConnectionID - 1, SeqNr: 700, AckNr: packet.SeqNr, WindowSize: 4 << 20}, addr); err != nil {
 		return err
 	}
 	response := make([]byte, len(want))
@@ -915,5 +915,5 @@ func servePeerHandshake(server *net.UDPConn, infoHash, expectedClientID, serverI
 	response[1+len(peer.ProtocolName)+7] = peer.FastExtensionBit
 	copy(response[1+len(peer.ProtocolName)+8:], infoHash[:])
 	copy(response[1+len(peer.ProtocolName)+8+20:], serverID[:])
-	return sendTo(server, Packet{Type: Data, ConnectionID: packet.ConnectionID - 1, SeqNr: 701, AckNr: packet.SeqNr, WindowSize: 4 << 20, Payload: response}, addr)
+	return sendTo(server, Packet{Type: Data, ConnectionID: packet.ConnectionID - 1, SeqNr: 700, AckNr: packet.SeqNr, WindowSize: 4 << 20, Payload: response}, addr)
 }

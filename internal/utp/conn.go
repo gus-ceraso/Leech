@@ -398,9 +398,14 @@ func (c *Conn) service() {
 }
 
 func (c *Conn) handleDatagram(wire []byte) {
-	// Every inbound packet, including handshake STATE and RESET, uses recvID.
+	// A peer with no connection state echoes the offending packet's ID in
+	// RESET, which may be sendID. All other inbound packets require recvID.
 	// Reject unrelated IDs before walking a potentially long extension chain.
-	if len(wire) < HeaderBytes || binary.BigEndian.Uint16(wire[2:4]) != c.recvID {
+	if len(wire) < HeaderBytes {
+		return
+	}
+	id := binary.BigEndian.Uint16(wire[2:4])
+	if id != c.recvID && !(id == c.sendID && wire[0] == byte(Reset)<<4|ProtocolVersion) {
 		return
 	}
 	packet, err := ParsePacket(wire)
@@ -428,9 +433,9 @@ func (c *Conn) handleDatagram(wire []byte) {
 			// context in charge of eventual failure.
 			return
 		}
-		// The peer's STATE both acknowledges our SYN and supplies its first
-		// sequence number. Do not accept data until this transition succeeds.
-		c.recv = NewReceiveState(packet.SeqNr.Add(1))
+		// STATE does not consume a sequence number: the peer's first DATA
+		// uses this same sequence (BEP 29 ST_STATE and libutp send_ack).
+		c.recv = NewReceiveState(packet.SeqNr)
 		c.syncSendStateLocked(now, &packet)
 		result := c.send.Handle(packet, now)
 		if result.Err != nil {

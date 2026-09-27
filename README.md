@@ -88,8 +88,9 @@ tracker. Peers that require reciprocation may refuse to serve it.
 
 Automated validation uses local deterministic tracker and peer fixtures. Live
 Big Buck Bunny downloads have completed with HTTP/UDP tracker discovery and TCP
-peers. A known uTP setup sequencing defect drops the first incoming data packet
-with libutp-style sequence numbering; live uTP transfers remain unverified.
+peers. The uTP setup sequencing defect is fixed; an 8 MiB local loopback stream
+has been verified against libutp. Live uTP transfers remain unverified; see the
+[uTP audit](internal/utp/AUDIT.md) for findings and validation limits.
 See the design's [supported bounds](DESIGN.md#16-supported-bounds) and
 [trust boundaries](DESIGN.md#17-security-and-trust-boundaries) for the complete
 limits and accepted risks.

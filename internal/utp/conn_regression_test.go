@@ -80,7 +80,7 @@ func (f writeFixture) readData(t *testing.T) Packet {
 // waits until the corresponding ACK proves ReceiveState accepted it.
 func (f writeFixture) sendIndependentData(t *testing.T, payload []byte) {
 	t.Helper()
-	const seq = uint16(201) // handshake STATE sequence 200, then DATA sequence 201
+	const seq = uint16(200) // STATE and the first DATA use the same sequence.
 	wire := make([]byte, HeaderBytes+len(payload))
 	wire[0] = byte(Data)<<4 | ProtocolVersion
 	binary.BigEndian.PutUint16(wire[2:4], f.id)

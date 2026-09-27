@@ -12,8 +12,8 @@ import (
 var ErrInvalidCongestionConfig = errors.New("utp: invalid congestion configuration")
 
 // uTP's delay controller is deliberately kept independent of the socket. The
-// sender owns one controller and feeds it the timestamp-difference value from
-// each packet received from the peer. This also makes the controller useful in
+// sender owns one controller and feeds it measured timestamp-difference
+// feedback and newly acknowledged bytes from the peer. This also makes the controller useful in
 // deterministic tests without a clock or a UDP socket.
 const (
 	defaultTargetDelay = 100 * time.Millisecond
@@ -171,9 +171,9 @@ func (c *CongestionController) BaseDelay() (time.Duration, bool) {
 
 // ObserveDelay consumes the peer's timestamp-difference measurement. The
 // measurement is a one-way delay estimate relative to an unsynchronized clock,
-// so only its change from the sliding minimum is meaningful. outstanding is
-// the current number of payload bytes in flight.
-func (c *CongestionController) ObserveDelay(now time.Time, reported time.Duration, outstanding uint32) {
+// so only its change from the sliding minimum is meaningful. ackedBytes is
+// newly acknowledged payload, or zero to update only the delay history.
+func (c *CongestionController) ObserveDelay(now time.Time, reported time.Duration, ackedBytes uint32) {
 	if c == nil || reported < 0 {
 		return
 	}
@@ -207,17 +207,16 @@ func (c *CongestionController) ObserveDelay(now time.Time, reported time.Duratio
 		return
 	}
 	c.hasBase = true
-	if outstanding == 0 || c.maxWindow == 0 {
+	if ackedBytes == 0 || c.maxWindow == 0 {
 		return
 	}
 	ourDelay := reported - c.baseDelay
 	offTarget := c.target - ourDelay
 
 	// The BEP expression scales a gain measured in packets per RTT by the
-	// window utilization. One packet per observation is deliberately modest;
-	// it avoids an unbounded jump when ACKs arrive in a burst while preserving
-	// the required direction and byte-based window semantics.
-	gain := boundedGain(c.packet, offTarget, c.target, outstanding, c.maxWindow)
+	// acknowledged share of the window. Unrelated peer traffic earns no
+	// credit, and duplicate ACKs cannot apply the same credit twice.
+	gain := boundedGain(c.packet, offTarget, c.target, ackedBytes, c.maxWindow)
 	if gain == 0 && offTarget != 0 {
 		if offTarget > 0 {
 			gain = 1

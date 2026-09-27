@@ -184,7 +184,7 @@ func TestSendRestartsZeroCongestionWindowAfterAllACKs(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := time.Unix(100, 0)
-	if result := s.Handle(Packet{Type: State, AckNr: 9, WindowSize: 2_400}, now); result.Err != nil {
+	if result := s.Handle(Packet{Type: State, AckNr: 9, WindowSize: 2_400, TimestampDifference: 1}, now); result.Err != nil {
 		t.Fatalf("base-delay feedback = %+v", result)
 	}
 	if n, err := s.Queue(make([]byte, 2_400)); n != 2_400 || err != nil {
@@ -195,7 +195,7 @@ func TestSendRestartsZeroCongestionWindowAfterAllACKs(t *testing.T) {
 		t.Fatalf("first send = %+v", first)
 	}
 	ackAt := now.Add(2 * time.Millisecond)
-	result := s.Handle(Packet{Type: State, AckNr: 10, WindowSize: 2_400, TimestampDifference: 1_000_000}, ackAt)
+	result := s.Handle(Packet{Type: State, AckNr: 10, WindowSize: 2_400, TimestampDifference: 1_000_001}, ackAt)
 	if result.Err != nil || len(result.Actions) != 0 || s.MaxWindow() != 0 || s.UnackedPackets() != 0 || s.PendingBytes() != 1_200 {
 		t.Fatalf("zero window after ACK = %+v, cwnd=%d unacked=%d queued=%d", result, s.MaxWindow(), s.UnackedPackets(), s.PendingBytes())
 	}

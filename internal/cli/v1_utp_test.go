@@ -177,11 +177,11 @@ func serveV1UTPPeer(socket *net.UDPConn, infoHash [20]byte, payload []byte, outb
 	}
 	serverID := [20]byte{0x73, 0x31}
 	remoteHandshake := v1BEP3Handshake(infoHash, serverID, peer.FastExtensionBit)
-	serverSeq++
 	clientAck := handshakePacket.SeqNr
 	if err := writeV1UTPPacket(socket, address, utp.Packet{Type: utp.Data, ConnectionID: recvID, SeqNr: serverSeq, AckNr: clientAck, WindowSize: 4 << 20, Payload: remoteHandshake}); err != nil {
 		return err
 	}
+	serverSeq++ // DATA consumes a sequence number; STATE does not.
 	peerWire := append(v1RawMessage(peer.BitfieldID, []byte{0x80}), v1RawMessage(peer.UnchokeID, nil)...)
 	var stream []byte
 	pieceSent := false
@@ -200,7 +200,7 @@ func serveV1UTPPeer(socket *net.UDPConn, infoHash [20]byte, payload []byte, outb
 			continue
 		case utp.Data:
 			clientAck = packet.SeqNr
-			if err := writeV1UTPPacket(socket, address, utp.Packet{Type: utp.State, ConnectionID: recvID, SeqNr: serverSeq - 1, AckNr: clientAck, WindowSize: 4 << 20}); err != nil {
+			if err := writeV1UTPPacket(socket, address, utp.Packet{Type: utp.State, ConnectionID: recvID, SeqNr: serverSeq, AckNr: clientAck, WindowSize: 4 << 20}); err != nil {
 				return err
 			}
 			stream = append(stream, packet.Payload...)
@@ -230,11 +230,11 @@ func serveV1UTPPeer(socket *net.UDPConn, infoHash [20]byte, payload []byte, outb
 					if err := writeV1UTPPacket(socket, address, utp.Packet{Type: utp.Data, ConnectionID: recvID, SeqNr: serverSeq, AckNr: clientAck, WindowSize: 4 << 20, Payload: v1RawMessage(peer.PieceID, piece)}); err != nil {
 						return err
 					}
+					serverSeq++
 					pieceSent = true
 				}
 			}
 			if len(peerWire) != 0 {
-				serverSeq++
 				if err := writeV1UTPPacket(socket, address, utp.Packet{Type: utp.Data, ConnectionID: recvID, SeqNr: serverSeq, AckNr: clientAck, WindowSize: 4 << 20, Payload: peerWire}); err != nil {
 					return err
 				}

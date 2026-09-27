@@ -89,7 +89,7 @@ type SendState struct {
 	finSeq   Sequence
 	terminal error
 
-	lastActivity  time.Time
+	retrySince    time.Time // New flight, ACK progress, or timeout; not arbitrary traffic.
 	timeoutCount  uint
 	duplicateAcks uint8
 	ackEvidence   map[Sequence]uint8
@@ -430,9 +430,7 @@ func (s *SendState) Handle(packet Packet, now time.Time) SendResult {
 	if err := packet.Validate(); err != nil {
 		return s.failResult(err)
 	}
-	s.lastActivity = now
 	s.SetRemoteWindow(packet.WindowSize)
-	s.congestion.ObserveDelay(now, time.Duration(uint64(packet.TimestampDifference))*time.Microsecond, s.inFlight)
 	if packet.Type == Reset {
 		s.terminal = ErrSendReset
 		result.Err = ErrSendReset
@@ -444,6 +442,11 @@ func (s *SendState) Handle(packet Packet, now time.Time) SendResult {
 	}
 	if err := s.applyACK(packet, now, &result); err != nil {
 		return s.failResult(err)
+	}
+	if packet.TimestampDifference != 0 {
+		// Zero means the peer has no measurement yet. Only newly ACKed
+		// bytes earn congestion credit, not unacknowledging DATA or duplicate ACKs.
+		s.congestion.ObserveDelay(now, time.Duration(uint64(packet.TimestampDifference))*time.Microsecond, uint32(result.AckedBytes))
 	}
 	s.compactOrder()
 	result.Actions = append(result.Actions, s.produce(now)...)
@@ -492,10 +495,15 @@ func (s *SendState) applyACK(packet Packet, now time.Time, result *SendResult) e
 		s.lastAck = packet.AckNr
 		s.duplicateAcks = 0
 		s.timeoutCount = 0
-	} else if packet.AckNr == s.lastAck {
+		s.retrySince = now
+	} else if packet.Type == State && packet.AckNr == s.lastAck && len(s.unacked) != 0 {
+		// Only standalone ACKs indicate receipt of later local packets.
+		// Streaming peer DATA can carry an unchanged ACK without any loss.
 		if s.duplicateAcks < math.MaxUint8 {
 			s.duplicateAcks++
 		}
+	} else {
+		s.duplicateAcks = 0
 	}
 
 	// Selective ACK bits refer to ack_nr+2. Unknown bits outside our sent
@@ -536,6 +544,9 @@ func (s *SendState) ackOne(sequence Sequence, now time.Time, result *SendResult)
 		return
 	}
 	delete(s.unacked, sequence)
+	// Both cumulative and selective progress restart the retry timer.
+	s.retrySince = now
+	s.timeoutCount = 0
 	if uint64(s.inFlight) >= uint64(len(record.packet.Payload)) {
 		s.inFlight -= uint32(len(record.packet.Payload))
 	} else {
@@ -569,7 +580,6 @@ func (s *SendState) retransmitLost(sequence Sequence, now time.Time, result *Sen
 	record.sentAt = now
 	record.packet.Timestamp = timestamp(now)
 	record.packet.TimestampDifference = s.tsDifference
-	s.lastActivity = now
 	result.Actions = append(result.Actions, PacketAction{Kind: ActionSend, Packet: record.packet})
 	result.LostPackets++
 }
@@ -585,12 +595,12 @@ func (s *SendState) Tick(now time.Time) []PacketAction {
 		if len(s.queue) == 0 || (s.remoteWindow != 0 && s.congestion.maxWindow != 0) {
 			return nil
 		}
-		if s.lastActivity.IsZero() {
-			s.lastActivity = now
+		if s.retrySince.IsZero() {
+			s.retrySince = now
 			return nil
 		}
 		backoff := time.Duration(1 << minUint(s.timeoutCount, 6))
-		if now.Sub(s.lastActivity) < saturatingDuration(s.congestion.RTO(), backoff) {
+		if now.Sub(s.retrySince) < saturatingDuration(s.congestion.RTO(), backoff) {
 			return nil
 		}
 		s.timeoutCount++
@@ -607,19 +617,15 @@ func (s *SendState) Tick(now time.Time) []PacketAction {
 			s.consumeQueue(1)
 			return []PacketAction{s.record(packet, now)}
 		}
-		s.lastActivity = now
+		s.retrySince = now
 		return s.produce(now)
 	}
 	oldest := s.oldest()
 	if oldest == nil || oldest.sentAt.IsZero() {
 		return nil
 	}
-	lastActivity := s.lastActivity
-	if lastActivity.IsZero() {
-		lastActivity = oldest.sentAt
-	}
 	backoff := time.Duration(1 << minUint(s.timeoutCount, 6))
-	if now.Sub(lastActivity) < saturatingDuration(s.congestion.RTO(), backoff) {
+	if now.Sub(s.retrySince) < saturatingDuration(s.congestion.RTO(), backoff) {
 		return nil
 	}
 	s.timeoutCount++
@@ -629,7 +635,7 @@ func (s *SendState) Tick(now time.Time) []PacketAction {
 	oldest.sentAt = now
 	oldest.packet.Timestamp = timestamp(now)
 	oldest.packet.TimestampDifference = s.tsDifference
-	s.lastActivity = now
+	s.retrySince = now
 	return []PacketAction{{Kind: ActionSend, Packet: oldest.packet}}
 }
 
@@ -663,6 +669,11 @@ func (s *SendState) header(kind PacketType, now time.Time) Packet {
 
 func (s *SendState) record(packet Packet, now time.Time) PacketAction {
 	sequence := packet.SeqNr
+	// Start a new flight's timer, but do not let later sends postpone loss
+	// recovery for its oldest packet. Only ACK progress or a timeout does so.
+	if len(s.unacked) == 0 {
+		s.retrySince = now
+	}
 	// Packet payloads are immutable after record returns. The action and the
 	// retransmission record intentionally share this one payload allocation;
 	// U4 must pass the action to MarshalBinary without mutating it.
@@ -678,7 +689,6 @@ func (s *SendState) record(packet Packet, now time.Time) PacketAction {
 	} else {
 		s.inFlight += uint32(len(packet.Payload))
 	}
-	s.lastActivity = now
 	return PacketAction{Kind: ActionSend, Packet: packet}
 }
 

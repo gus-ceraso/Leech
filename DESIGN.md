@@ -779,11 +779,26 @@ It covers:
 
 It does not accept unsolicited SYN packets, share a listener, perform hole punching, or expose server APIs. The peer layer depends only on `net.Conn` and does not branch by transport after dialing.
 
+STATE, including SYN-ACK, does not consume a sequence number: first peer DATA
+uses the SYN-ACK's sequence, and the initial receive ACK is one less. This
+follows BEP 29's ST_STATE text and libutp, not the contradictory setup diagram.
+A validated RESET may use either connection ID because an unknown-connection
+response echoes the offending packet's ID.
+
+Only STATE packets count toward duplicate-ACK loss detection; SACKs remain
+meaningful on DATA. Zero delay feedback means no measurement. Congestion gain
+uses newly acknowledged payload bytes, not unrelated incoming traffic.
+
 Duplicate packets reuse unchanged selective-ACK state rather than repeatedly
 scanning the reorder window. A zero congestion window has bounded timeout
 recovery with a one-packet restart, including when no packet remains
 unacknowledged. A persistently closed remote receive window is probed at a bounded
 rate so a lost reopen update cannot stall queued writes indefinitely.
+Retry timers restart on a new flight, genuine cumulative/SACK progress, or a
+timeout—not arbitrary traffic or later sends. This follows libutp's ACK-progress
+behavior rather than BEP 29's every-packet timer wording, which can indefinitely
+postpone loss recovery during a download. See the [uTP audit](internal/utp/AUDIT.md)
+for reference evidence and validation limits.
 
 ## 15. Concurrency and lifecycle
 

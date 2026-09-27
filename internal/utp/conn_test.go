@@ -227,7 +227,7 @@ func TestConnRemoteFINReturnsEOF(t *testing.T) {
 			err = sendTo(server, Packet{Type: State, ConnectionID: packet.ConnectionID, SeqNr: 300, AckNr: packet.SeqNr, WindowSize: 4 << 20}, addr)
 		}
 		if err == nil {
-			err = sendTo(server, Packet{Type: Fin, ConnectionID: packet.ConnectionID, SeqNr: 301, AckNr: packet.SeqNr, WindowSize: 4 << 20}, addr)
+			err = sendTo(server, Packet{Type: Fin, ConnectionID: packet.ConnectionID, SeqNr: 300, AckNr: packet.SeqNr, WindowSize: 4 << 20}, addr)
 		}
 		serverErr <- err
 	}()
@@ -306,7 +306,7 @@ func serveOne(t *testing.T, server *net.UDPConn) error {
 	if err := sendTo(server, state, addr); err != nil {
 		return err
 	}
-	dataSeq := serverSeq.Add(1)
+	dataSeq := serverSeq // STATE does not consume a sequence number.
 	for {
 		packet, addr, err = readPacket(server)
 		if err != nil {
