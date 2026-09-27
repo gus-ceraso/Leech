@@ -44,9 +44,9 @@ exit; this package adapts arguments, reporting, and signals to `session.Run`.
   final output; status remains separately TTY/level gated. Tracker identifiers
   retain scheme and host only.
 - Keep phase/progress reporting testable with controlled time and TTY state.
-  Queue-pressure tests should use bounded diagnostic sources such as local
-  tracker events and coordinate peer transfer with request/release barriers;
-  synthetic peer-message churn can starve transfer scheduling under `-race`.
+  Queue-pressure tests should use local tracker events and gate peer messages
+  with request, processed-event, and release barriers; synthetic peer-message
+  churn can starve transfer scheduling under `-race`.
   Phase-entry status uses `OnPhaseStatus`; `OnProgress` remains commit-only.
   Live transfer `OnStatus` refreshes the same display without affecting the
   session no-progress timer. Preserve caller callbacks and install CLI activity

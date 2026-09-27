@@ -1254,27 +1254,28 @@ func writeV1Torrent(t *testing.T, data []byte) string {
 }
 
 type v1PeerFixture struct {
-	infoHash        torrent.InfoHash
-	info            []byte
-	data            []byte
-	pieceLength     int
-	bitfield        []byte
-	metadataFirst   bool
-	stall           bool
-	withhold        bool
-	partial         bool
-	requestSeen     chan struct{}
-	releasePiece    chan struct{}
-	requestOnce     sync.Once
-	failAfterFirst  bool
-	calls           atomic.Int32
-	done            chan error
-	mu              sync.Mutex
-	outbound        []byte
-	requested       [][2]uint32
-	requestedPieces []uint32
-	serverMu        sync.Mutex
-	servers         []net.Conn
+	infoHash          torrent.InfoHash
+	info              []byte
+	data              []byte
+	pieceLength       int
+	bitfield          []byte
+	metadataFirst     bool
+	stall             bool
+	withhold          bool
+	partial           bool
+	requestSeen       chan struct{}
+	releasePiece      chan struct{}
+	duplicateHaveGate chan struct{}
+	requestOnce       sync.Once
+	failAfterFirst    bool
+	calls             atomic.Int32
+	done              chan error
+	mu                sync.Mutex
+	outbound          []byte
+	requested         [][2]uint32
+	requestedPieces   []uint32
+	serverMu          sync.Mutex
+	servers           []net.Conn
 }
 
 func newV1Peers(t *testing.T, infoHash torrent.InfoHash, info, data []byte, metadataFirst bool) *v1PeerFixture {
@@ -1412,9 +1413,7 @@ func (f *v1PeerFixture) serveTransfer(conn net.Conn) error {
 		f.outbound = append(f.outbound, message.ID)
 		f.mu.Unlock()
 		switch message.ID {
-		case peer.InterestedID:
-			continue
-		case peer.HaveNoneID:
+		case peer.InterestedID, peer.NotInterestedID, peer.HaveNoneID:
 			continue
 		case peer.RequestID:
 			if len(message.Payload) != 12 {
@@ -1441,6 +1440,21 @@ func (f *v1PeerFixture) serveTransfer(conn net.Conn) error {
 				requested = true
 				if f.requestSeen != nil {
 					f.requestOnce.Do(func() { close(f.requestSeen) })
+				}
+				if f.duplicateHaveGate != nil {
+					<-f.duplicateHaveGate
+					have := make([]byte, 4)
+					for range 2 {
+						if err := v1WriteFrame(conn, v1RawMessage(peer.HaveID, have)); err != nil {
+							return err
+						}
+					}
+					if err := v1WriteFrame(conn, v1RawMessage(peer.HaveNoneID, nil)); err != nil {
+						return err
+					}
+					if err := v1WriteFrame(conn, v1RawMessage(peer.HaveID, have)); err != nil {
+						return err
+					}
 				}
 				if f.releasePiece != nil {
 					<-f.releasePiece

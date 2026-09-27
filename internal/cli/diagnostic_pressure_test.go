@@ -20,9 +20,8 @@ import (
 )
 
 type pressureFailTracker struct {
-	mu       sync.Mutex
-	seen     map[string]int
-	attempts chan string
+	mu   sync.Mutex
+	seen map[string]int
 }
 
 func (f *pressureFailTracker) Announce(ctx context.Context, rawURL string, _ tracker.AnnounceRequest) (tracker.HTTPAnnounceResult, error) {
@@ -32,10 +31,6 @@ func (f *pressureFailTracker) Announce(ctx context.Context, rawURL string, _ tra
 	f.mu.Lock()
 	f.seen[rawURL]++
 	f.mu.Unlock()
-	select {
-	case f.attempts <- rawURL:
-	default:
-	}
 	return tracker.HTTPAnnounceResult{Transmitted: true}, errors.New("controlled local tracker failure")
 }
 
@@ -258,17 +253,18 @@ func TestCLIBlockedWarningDoesNotStallTransferStatusOrShutdown(t *testing.T) {
 func TestCLITransferContinuesAndJoinsUnderDiagnosticQueuePressure(t *testing.T) {
 	data := []byte("bounded diagnostics still download")
 	info, infoHash := v1Info(t, data)
-	// Keep the peer wire quiet: tracker attempts create queue pressure, and the
-	// request barrier should measure transfer progress, not synthetic churn.
+	// Keep the peer wire quiet until pressure is established; duplicate Have
+	// frames are then followed by availability transitions as a processing barrier.
 	peers := newV1Peers(t, infoHash, info, data, true)
 	peers.requestSeen = make(chan struct{})
 	peers.releasePiece = make(chan struct{})
+	peers.duplicateHaveGate = make(chan struct{})
 	var source strings.Builder
 	fmt.Fprintf(&source, "magnet:?xt=urn:btih:%x&x.pe=127.0.0.1%%3A%d", infoHash, v1FixturePeerPort)
 	for i := 0; i < 63; i++ {
 		fmt.Fprintf(&source, "&tr=http%%3A%%2F%%2Ftracker-%02d.test%%2Fannounce", i)
 	}
-	trackerFixture := &pressureFailTracker{seen: make(map[string]int), attempts: make(chan string, 512)}
+	trackerFixture := &pressureFailTracker{seen: make(map[string]int)}
 	// Hold stderr from the first debug line so tracker events deterministically
 	// fill the bounded diagnostic queue.
 	writer := newBlockedDebugWriter()
@@ -277,6 +273,33 @@ func TestCLITransferContinuesAndJoinsUnderDiagnosticQueuePressure(t *testing.T) 
 	progress := make(chan struct{}, 1)
 	config := v1SessionConfig(t, nil, peers)
 	config.HTTP = trackerFixture
+	trackerDiagnostics := make(chan struct{}, diagnosticQueueCapacity+1)
+	availabilityTransitions := make(chan string, 8)
+	var emptyTransitions, nonemptyTransitions atomic.Int32
+	config.OnDiagnostic = func(event session.Diagnostic) {
+		switch event.Kind {
+		case session.DiagnosticTrackerAttempt:
+			select {
+			case trackerDiagnostics <- struct{}{}:
+			default:
+			}
+		case session.DiagnosticTransfer:
+			switch event.Detail {
+			case "availability became empty":
+				emptyTransitions.Add(1)
+				select {
+				case availabilityTransitions <- event.Detail:
+				default:
+				}
+			case "availability became nonempty":
+				nonemptyTransitions.Add(1)
+				select {
+				case availabilityTransitions <- event.Detail:
+				default:
+				}
+			}
+		}
+	}
 	config.OnProgress = func(session.RunProgress) {
 		select {
 		case progress <- struct{}{}:
@@ -286,10 +309,12 @@ func TestCLITransferContinuesAndJoinsUnderDiagnosticQueuePressure(t *testing.T) 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	done := make(chan error, 1)
 	sessionReturned := false
-	var releasePeer sync.Once
+	var releasePeer, releaseDuplicate sync.Once
 	unblockPeer := func() { releasePeer.Do(func() { close(peers.releasePiece) }) }
+	unblockDuplicates := func() { releaseDuplicate.Do(func() { close(peers.duplicateHaveGate) }) }
 	defer func() {
 		writer.unblock()
+		unblockDuplicates()
 		unblockPeer()
 		if !sessionReturned {
 			cancel()
@@ -314,20 +339,40 @@ func TestCLITransferContinuesAndJoinsUnderDiagnosticQueuePressure(t *testing.T) 
 	case <-ctx.Done():
 		t.Fatal("diagnostic consumer did not reach the blocked writer")
 	}
+	for observed := 0; observed < diagnosticQueueCapacity+1; observed++ {
+		select {
+		case <-trackerDiagnostics:
+		case <-ctx.Done():
+			t.Fatalf("tracker diagnostics did not fill the blocked queue: observed %d", observed)
+		}
+	}
 	select {
 	case <-peers.requestSeen:
 	case <-ctx.Done():
 		t.Fatalf("local peer did not receive the transfer request (dials=%d, tracker URLs=%d)",
 			peers.calls.Load(), len(trackerFixture.snapshot()))
 	}
-	attemptCount := 0
-	for attemptCount < 128 {
+	unblockDuplicates()
+	sawEmpty, sawRestored := false, false
+	for !sawRestored {
 		select {
-		case <-trackerFixture.attempts:
-			attemptCount++
+		case detail := <-availabilityTransitions:
+			if detail == "availability became empty" {
+				sawEmpty = true
+			} else if sawEmpty && detail == "availability became nonempty" {
+				sawRestored = true
+			}
 		case <-ctx.Done():
-			t.Fatalf("tracker retries did not fill the diagnostic queue: observed %d attempts", attemptCount)
+			t.Fatal("duplicate Have processing barrier did not complete")
 		}
+	}
+	// The two identical Have frames are silent; only Have None/Have drive the
+	// single empty/nonempty transition pair used to confirm coordinator processing.
+	if got := emptyTransitions.Load(); got != 1 {
+		t.Fatalf("availability-empty transitions = %d, want 1; duplicate Have emitted excess diagnostics", got)
+	}
+	if got := nonemptyTransitions.Load(); got != 2 {
+		t.Fatalf("availability-nonempty transitions = %d, want initial and restored state", got)
 	}
 	unblockPeer()
 	select {
