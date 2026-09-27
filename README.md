@@ -87,10 +87,10 @@ listener, upload, BitTorrent v2, or hybrid-torrent support. Leech ignores
 tracker. Peers that require reciprocation may refuse to serve it.
 
 Automated validation uses local deterministic tracker and peer fixtures. Live
-Big Buck Bunny downloads have completed with HTTP/UDP tracker discovery and TCP
-peers. The uTP setup sequencing defect is fixed; an 8 MiB local loopback stream
-has been verified against libutp. Live uTP transfers remain unverified; see the
-[uTP audit](internal/utp/AUDIT.md) for findings and validation limits.
+Big Buck Bunny downloads have completed with HTTP/UDP tracker discovery and both
+TCP and uTP peers, with independently verified output. An 8 MiB local loopback
+stream has also been verified against libutp. See the
+[uTP audit](internal/utp/AUDIT.md) for findings and remaining validation limits.
 See the design's [supported bounds](DESIGN.md#16-supported-bounds) and
 [trust boundaries](DESIGN.md#17-security-and-trust-boundaries) for the complete
 limits and accepted risks.

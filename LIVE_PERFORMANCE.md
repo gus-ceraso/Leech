@@ -1,6 +1,6 @@
 # Live download performance investigation
 
-## Findings and proposed decision
+## Findings and integration
 
 **Completed, 2026-09-27. No investigation-owned processes remain active.**
 Worktree: `/home/user/Desktop/Leech-live-performance`; branch:
@@ -24,8 +24,9 @@ No push, other-worktree changes, host/network changes, or subagents.
    The event-drain policy turns ordinary bursts and scheduling delays into
    disconnections even when aggregate resource utilization is low.
 
-**Recommend parent review of proposed patch
-`5dceb5e47658bf16f70a6671a3f78966ddea9660`.** It yields instead of disconnecting,
+**Integrated:** the parent reviewed proposed patch
+`5dceb5e47658bf16f70a6671a3f78966ddea9660` and applied it to main as `d8276d7`.
+It yields instead of disconnecting,
 retaining the 16-message work bound, four-slot event queue, deferred assignment
 while events remain, supported request/staging bounds, no-upload boundary, and
 verification-before-output. It includes a regression and owning guidance.
@@ -348,20 +349,46 @@ was shared with other agents, so system-wide load was not controlled. No peer's
 upload policy or remote bandwidth was measured. No statistical speedup estimate
 is warranted from these four sequential runs.
 
-Recommended order:
+## Parent integration and live verification
 
-1. Review/cherry-pick **`5dceb5e`** as the narrow productive-peer retention fix.
-   Preserve the separate logging and uTP agents' changes; this patch does not
-   duplicate those audits.
-2. Reassess ordinary downloads with the uTP correction and this fix combined.
-   Preserve no-upload and verified-before-output behavior.
-3. If startup/replacement remains slow, investigate a bounded asynchronous dial
-   dispatcher with deterministic ownership/cancellation tests. Do not merely
-   multiply callbacks or extend deadlines without evidence.
-4. Only if throughput still falls short with retained useful peers, profile
-   scheduling and stage-count pressure. Do not tune request/staging limits from
-   blocker-message counts alone or relax compact-peer validation for benchmarks.
+The parent integrated the productive-peer fix as `d8276d7`, the logging fixes as
+`e0cd004`, and the uTP audit fixes as `b186d86`. `make check` passed on their
+combined tree: tests, the full race suite, vet, and a pure-Go build. No temporary
+observation code was included. Validation log: `/tmp/leech-combined-check.log`.
 
-The parent/user owns integration decisions. All experimental observation code is
-out of the worktree; only the documented patch, regression, durable guidance,
-and this report are retained in git.
+A fresh, non-resume Big Buck Bunny download used the clean binary at `86f44e8`,
+with the same bounded runner and a 600-second total limit. Artifacts are in
+`/home/user/Downloads/leech-integrated.at5rlY`, including command, revision,
+binary hash, process samples, log, result, analysis, and independent verification.
+
+| Combined run | Result |
+| --- | ---: |
+| Transfer / session seconds | 194.544 / 209.550 |
+| Independently verified output | 276,445,467 bytes; all 1,055 piece hashes |
+| Received payload / average rate | 282,933,531 bytes / 1,454,338 B/s |
+| Handshake winners | 19 uTP; 9 TCP |
+| Useful connections, correlated from log events | 10 uTP; 4 TCP |
+| Exit / timeout | 0 / no interruption |
+
+The run observed useful live uTP data for the first time. Its timing was between
+the unchanged baseline and the two TCP-only patch runs; it does **not** establish
+that enabling uTP sped up or slowed down the transfer. Peer samples, transports,
+and swarm conditions changed. The separate regressions establish the fixed
+correctness defects; these live runs establish successful real-world operation,
+not a universal speedup.
+
+The log reported specific invalid-compact-endpoint and deadline-exceeded causes.
+Transfer reporting switched to `shutdown` before final announces, with no stale
+progress afterward. Three final announcements failed nonfatally; final tracker
+work still took about 15 seconds. No hash mismatch, staging failure, or diagnostic
+drop was observed. All output hashes passed, the cache workspace was removed,
+and both owned processes exited. Original downloads were untouched.
+
+Remaining performance work, if needed:
+
+1. Investigate a bounded asynchronous dial dispatcher with deterministic
+   ownership/cancellation tests if startup or replacement remains slow. Do not
+   merely multiply callbacks or extend deadlines without evidence.
+2. Profile scheduling and stage-count pressure if throughput still falls short
+   with retained useful peers. Do not tune supported limits from blocker-message
+   counts alone or relax compact-peer validation for benchmarks.

@@ -9,9 +9,10 @@ This incremental audit compares Leech's promised outgoing BEP 29 stream with
 (2018-05-15, master HEAD fetched for this audit), cloned to
 `/tmp/leech-libutp-audit-reference`. Reference line numbers below refer to
 [`utp_internal.cpp` at that commit](https://github.com/bittorrent/libutp/blob/2b364cbb0650bdab64a5de2abb4518f9f228ec44/utp_internal.cpp).
-No live tracker, swarm, or existing download is used; interoperability
-experiments are local loopback only. Reference C/C++ is an external oracle,
-not a production dependency.
+The reference-audit agent used no live tracker, swarm, or existing download;
+its experiments were local loopback only. The parent's separate integrated live
+check is recorded below. Reference C/C++ is an external oracle, not a production
+dependency.
 
 All five confirmed baseline defects below are fixed in this change. The report
 was created before investigation and updated after material findings and checks.
@@ -202,10 +203,32 @@ was created before investigation and updated after material findings and checks.
 - README now removes the known sequence-defect caveat without claiming live
   uTP validation; DESIGN §14 and uTP guidance record the corrected invariants.
 
+## Parent integration and live check
+
+The parent integrated the audit as `b186d86`, logging fixes as `e0cd004`, and the
+separate valid-peer-backlog fix as `d8276d7`. A clean build at `86f44e8` passed
+`make check` (tests, full race suite, vet, and pure-Go build), then downloaded a
+fresh Big Buck Bunny copy under `/home/user/Downloads/leech-integrated.at5rlY`.
+
+- Exit 0; all 1,055 SHA-1 piece hashes independently verified (276,445,467 bytes).
+- Transfer 194.544 seconds; session 209.550 seconds, including final announces.
+- 19 uTP and 9 TCP handshake winners. Correlating connected peers with first
+  accepted/staged block events identifies 10 useful uTP and 4 useful TCP
+  connections. This is a mixed-transport live download, not a uTP-only test.
+- No hash mismatch, staging failure, or dropped diagnostic was observed. The
+  cache workspace was removed and the owned processes joined.
+- `debug.log`, `result.json`, `analysis.json`, `verification.json`, binary hash,
+  and exact command/build revision are retained in that artifact directory.
+
+This extends validation beyond the reference loopback experiment but does not
+establish universal client interoperability or isolate uTP performance. See
+[the performance report](../../LIVE_PERFORMANCE.md) for the combined measurements
+and their limits.
+
 ## Unresolved limits
 
-- No live uTP swarm transfer was tested. The parent's successful live download
-  used TCP and does not validate uTP.
+- The live check used mixed TCP/uTP peers; it did not force a uTP-only download
+  or identify and validate every remote client's implementation.
 - Actual libutp interoperability was exercised on IPv4 loopback without injected
   loss. Differential loss/reordering, remote zero-window pressure, FIN, and IPv6
   experiments remain future work; existing Go fixtures cover those behaviors
