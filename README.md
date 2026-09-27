@@ -61,12 +61,16 @@ or see the [CLI contract](DESIGN.md#4-command-line-interface).
 - **Output:** `--list-files` uses standard output. Diagnostics go to standard
   error with UTC timestamps. `--loglevel info` enables progress, a final summary,
   and completion messages. Redirected transfer progress appears at most every
-  30 seconds; terminal status refreshes at most once per second.
+  30 seconds; terminal status refreshes at most once per second. Transfer progress
+  ends before the bounded final tracker wait, shown as the `shutdown` phase rather
+  than frozen peer counts or payload rates, including on failure or cancellation.
 - **Diagnostics:** `--loglevel debug` adds state changes, batched request/late-reply
   counts, and per-transport race outcomes with safe failure categories. Final
   totals distinguish TCP/uTP wins, failures, and cancellations. Skipped tracker
   URLs are counted by reason without printing them. Final tracker-announcement
   failures are explicitly nonfatal warnings and do not change a successful exit.
+  Debug tracker causes distinguish invalid compact endpoints, incomplete replies,
+  invalid intervals, deadlines, and cancellation without exposing raw tracker text.
   Summary payload rates include discarded bytes; `useful-connections` counts
   connections that staged data, with reconnects counted separately.
 

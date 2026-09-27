@@ -999,8 +999,8 @@ func TestV1MagnetAndBareHashRunMetadataThenTransferThroughCLI(t *testing.T) {
 			if err != nil {
 				t.Fatalf("CLI run: %v", err)
 			}
-			if got := strings.Join(phases, ","); got != "metadata,selection,transfer" {
-				t.Fatalf("CLI phases = %q, want metadata,selection,transfer", got)
+			if got := strings.Join(phases, ","); got != "metadata,selection,transfer,shutdown" {
+				t.Fatalf("CLI phases = %q, want metadata,selection,transfer,shutdown", got)
 			}
 			metadataWinner, transferWinner := false, false
 			for _, event := range races {

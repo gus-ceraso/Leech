@@ -242,11 +242,14 @@ func TestCLIBlockedWarningDoesNotStallTransferStatusOrShutdown(t *testing.T) {
 		t.Fatalf("writer still active after CLI returned: %d", writer.active.Load())
 	}
 	output := writer.String()
-	if !strings.Contains(output, "warning: tracker http://warning.fixture failure; retrying") {
+	warningAt := strings.Index(output, "warning: tracker http://warning.fixture failure; retrying")
+	if warningAt < 0 {
 		t.Fatalf("recoverable warning was lost: %q", output)
 	}
-	if strings.LastIndex(output, "status:") < strings.LastIndex(output, "warning: tracker") {
-		t.Fatalf("status was not restored after warning: %q", output)
+	// The transfer ended while stderr was blocked. Neither the deferred
+	// warning nor the final flush may restore its retired status snapshot.
+	if strings.Index(output, `info: phase: "shutdown"`) < warningAt || strings.Contains(output[warningAt:], "status:") {
+		t.Fatalf("retired status restored or shutdown phase lost: %q", output)
 	}
 }
 

@@ -235,8 +235,12 @@ levels are enabled.
 When standard error is not an interactive terminal, `info` and `debug` emit a
 permanent transfer-progress line at entry and no more often than every 30 seconds
 thereafter, including during stalls. Metadata and resume have phase lines but no
-periodic redirected progress. Leech never uses color or requires terminal
-capabilities.
+periodic redirected progress. After joined transfer cleanup, Leech retires live
+transfer progress and reports the `shutdown` phase before final tracker
+announcements, on success, failure, and cancellation. That bounded wait does not
+refresh the frozen transfer snapshot or claim active peers and payload rate.
+Retirement follows lifecycle completion, not the verified-byte count. Leech never
+uses color or requires terminal capabilities.
 
 Permanent log lines begin with a UTC timestamp with millisecond precision, then
 `LEVEL: message`. Queued observations retain their capture time rather than
@@ -600,6 +604,14 @@ On a phase transition or final shutdown, the session first cancels and joins eve
 
 `stopped` has its own bounded transmission opportunity if `completed` stalls;
 the total final-event sequence remains bounded.
+
+Debug tracker failures use allowlisted codes and structured causes, distinguishing
+invalid compact endpoints, incomplete responses or compact records, and invalid
+intervals. They also distinguish deadline expiry, other timeouts, and ordinary
+cancellation. HTTP status, retry hints, and recognized UDP operations remain
+observable; unknown causes stay generic. These observations never log raw errors,
+tracker-supplied failure text, or response bodies, and do not change peer-list
+rejection, retry policy, or final-announcement deadlines.
 
 Peer endpoints from trackers or magnets may be public, private, or loopback. Reject peer endpoints with invalid ports, unspecified addresses, or multicast addresses. Tracker-server destinations retain unrestricted address resolution, including loopback and private addresses. This intentionally permits untrusted inputs to induce connections to local services.
 

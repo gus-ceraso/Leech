@@ -103,7 +103,14 @@ func runWithReporter(ctx context.Context, opts Options, stdout io.Writer, depend
 	}
 	renderPendingStatus := func() {
 		statusMu.Lock()
-		if !active || !pending {
+		if !active {
+			statusMu.Unlock()
+			// Retirement is snapshot state, not a droppable queue event. Clear
+			// the TTY even if the permanent phase line was lost under pressure.
+			_ = reporter.clearStatus()
+			return
+		}
+		if !pending {
 			statusMu.Unlock()
 			return
 		}

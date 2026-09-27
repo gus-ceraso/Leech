@@ -70,6 +70,7 @@ var (
 // is lost. RetryAfter is set for a finite BEP 31 delay.
 type HTTPError struct {
 	Code        HTTPErrorCode
+	Cause       FailureCause
 	Class       HTTPFailureClass
 	StatusCode  int
 	RetryAfter  time.Duration
@@ -403,7 +404,7 @@ func httpTransportError(err error, transmitted bool, ctx context.Context) *HTTPE
 			code = HTTPErrorTimeout
 			wrapped = ErrHTTPTimeout
 		}
-		return &HTTPError{Code: code, Class: HTTPFailureTransient, Transmitted: transmitted, Err: wrapped}
+		return &HTTPError{Code: code, Cause: CauseOf(ctxErr), Class: HTTPFailureTransient, Transmitted: transmitted, Err: wrapped}
 	}
 	return &HTTPError{Code: HTTPErrorRequest, Class: HTTPFailureTransient, Transmitted: transmitted, Err: err}
 }
@@ -418,14 +419,14 @@ func parseHTTPAnnounceResponse(body []byte) (HTTPAnnounceResult, error) {
 		MaxDepth:             limits.BencodeDepth,
 	})
 	if err != nil {
-		return result, &HTTPError{Code: HTTPErrorMalformed, Class: HTTPFailureTransient, Err: err}
+		return result, &HTTPError{Code: HTTPErrorMalformed, Cause: CauseInvalidBencode, Class: HTTPFailureTransient, Err: err}
 	}
 	if value.Type != bencode.Dictionary {
-		return result, &HTTPError{Code: HTTPErrorMalformed, Class: HTTPFailureTransient, Err: errors.New("tracker response is not a dictionary")}
+		return result, &HTTPError{Code: HTTPErrorMalformed, Cause: CauseInvalidResponseField, Class: HTTPFailureTransient, Err: errors.New("tracker response is not a dictionary")}
 	}
 	if failure, ok := dictionaryValue(value, "failure reason"); ok {
 		if failure.Type != bencode.Bytes {
-			return result, &HTTPError{Code: HTTPErrorMalformed, Class: HTTPFailureTransient, Err: errors.New("tracker failure reason is not a string")}
+			return result, &HTTPError{Code: HTTPErrorMalformed, Cause: CauseInvalidResponseField, Class: HTTPFailureTransient, Err: errors.New("tracker failure reason is not a string")}
 		}
 		retry, retryErr := parseRetryIn(value)
 		if retryErr != nil {
@@ -442,11 +443,11 @@ func parseHTTPAnnounceResponse(body []byte) (HTTPAnnounceResult, error) {
 
 	intervalValue, ok := dictionaryValue(value, "interval")
 	if !ok || intervalValue.Type != bencode.Integer || intervalValue.Int < limits.MinTrackerSeconds || intervalValue.Int > limits.MaxTrackerSeconds {
-		return result, &HTTPError{Code: HTTPErrorInterval, Class: HTTPFailureInvalidDelay, Err: errors.New("tracker interval is outside supported range")}
+		return result, &HTTPError{Code: HTTPErrorInterval, Cause: CauseInvalidInterval, Class: HTTPFailureInvalidDelay, Err: errors.New("tracker interval is outside supported range")}
 	}
 	peersValue, ok := dictionaryValue(value, "peers")
 	if !ok {
-		return result, &HTTPError{Code: HTTPErrorMalformed, Class: HTTPFailureTransient, Err: errors.New("tracker response has no peers")}
+		return result, &HTTPError{Code: HTTPErrorMalformed, Cause: CauseInvalidResponseField, Class: HTTPFailureTransient, Err: errors.New("tracker response has no peers")}
 	}
 	peers := newHTTPPeerSet(httpPeerCapacity(peersValue))
 	if err := parseHTTPPeers(peersValue, peers); err != nil {
@@ -454,7 +455,7 @@ func parseHTTPAnnounceResponse(body []byte) (HTTPAnnounceResult, error) {
 	}
 	if peers6, ok := dictionaryValue(value, "peers6"); ok {
 		if peers6.Type != bencode.Bytes {
-			return result, &HTTPError{Code: HTTPErrorMalformed, Class: HTTPFailureTransient, Err: errors.New("tracker peers6 is not compact")}
+			return result, &HTTPError{Code: HTTPErrorMalformed, Cause: CauseInvalidResponseField, Class: HTTPFailureTransient, Err: errors.New("tracker peers6 is not compact")}
 		}
 		if err := parseCompactPeers(peers6.Bytes, 16, peers); err != nil {
 			return result, err
@@ -517,12 +518,12 @@ func parseRetryIn(value bencode.Value) (time.Duration, error) {
 }
 
 func invalidRetryDelay() error {
-	return &HTTPError{Code: HTTPErrorRetryDelay, Class: HTTPFailureInvalidDelay, Err: errors.New("tracker retry delay is outside supported range")}
+	return &HTTPError{Code: HTTPErrorRetryDelay, Cause: CauseInvalidRetryDelay, Class: HTTPFailureInvalidDelay, Err: errors.New("tracker retry delay is outside supported range")}
 }
 
 func parseCounter(value bencode.Value) (uint32, error) {
 	if value.Type != bencode.Integer || value.Int < 0 || value.Int > math.MaxUint32 {
-		return 0, &HTTPError{Code: HTTPErrorMalformed, Class: HTTPFailureTransient, Err: errors.New("tracker counter is invalid")}
+		return 0, &HTTPError{Code: HTTPErrorMalformed, Cause: CauseInvalidResponseField, Class: HTTPFailureTransient, Err: errors.New("tracker counter is invalid")}
 	}
 	return uint32(value.Int), nil
 }
@@ -598,24 +599,24 @@ func parseHTTPPeers(value bencode.Value, peers *httpPeerSet) error {
 				break
 			}
 			if item.Type != bencode.Dictionary {
-				return &HTTPError{Code: HTTPErrorMalformed, Class: HTTPFailureTransient, Err: errors.New("tracker peer is not a dictionary")}
+				return &HTTPError{Code: HTTPErrorMalformed, Cause: CauseInvalidDictionaryPeer, Class: HTTPFailureTransient, Err: errors.New("tracker peer is not a dictionary")}
 			}
 			ipValue, ok := dictionaryValue(item, "ip")
 			if !ok || ipValue.Type != bencode.Bytes {
-				return &HTTPError{Code: HTTPErrorMalformed, Class: HTTPFailureTransient, Err: errors.New("tracker peer has no IP")}
+				return &HTTPError{Code: HTTPErrorMalformed, Cause: CauseInvalidDictionaryPeer, Class: HTTPFailureTransient, Err: errors.New("tracker peer has no IP")}
 			}
 			portValue, ok := dictionaryValue(item, "port")
 			if !ok || portValue.Type != bencode.Integer || portValue.Int < 1 || portValue.Int > math.MaxUint16 {
-				return &HTTPError{Code: HTTPErrorMalformed, Class: HTTPFailureTransient, Err: errors.New("tracker peer has invalid port")}
+				return &HTTPError{Code: HTTPErrorMalformed, Cause: CauseInvalidDictionaryPeer, Class: HTTPFailureTransient, Err: errors.New("tracker peer has invalid port")}
 			}
 			host := string(ipValue.Bytes)
 			if !validDictionaryPeerHost(host) {
-				return &HTTPError{Code: HTTPErrorMalformed, Class: HTTPFailureTransient, Err: errors.New("tracker peer has invalid IP")}
+				return &HTTPError{Code: HTTPErrorMalformed, Cause: CauseInvalidDictionaryPeer, Class: HTTPFailureTransient, Err: errors.New("tracker peer has invalid IP")}
 			}
 			peer := HTTPPeer{Host: host, Port: uint16(portValue.Int)}
 			if idValue, hasID := dictionaryValue(item, "peer id"); hasID {
 				if idValue.Type != bencode.Bytes || len(idValue.Bytes) != len(peer.PeerID) {
-					return &HTTPError{Code: HTTPErrorMalformed, Class: HTTPFailureTransient, Err: errors.New("tracker peer has invalid peer ID")}
+					return &HTTPError{Code: HTTPErrorMalformed, Cause: CauseInvalidDictionaryPeer, Class: HTTPFailureTransient, Err: errors.New("tracker peer has invalid peer ID")}
 				}
 				copy(peer.PeerID[:], idValue.Bytes)
 				peer.HasID = true
@@ -624,14 +625,14 @@ func parseHTTPPeers(value bencode.Value, peers *httpPeerSet) error {
 		}
 		return nil
 	default:
-		return &HTTPError{Code: HTTPErrorMalformed, Class: HTTPFailureTransient, Err: errors.New("tracker peers has invalid type")}
+		return &HTTPError{Code: HTTPErrorMalformed, Cause: CauseInvalidResponseField, Class: HTTPFailureTransient, Err: errors.New("tracker peers has invalid type")}
 	}
 }
 
 func parseCompactPeers(value []byte, addressBytes int, peers *httpPeerSet) error {
 	stride := addressBytes + 2
 	if len(value)%stride != 0 {
-		return &HTTPError{Code: HTTPErrorMalformed, Class: HTTPFailureTransient, Err: errors.New("compact peer list has incomplete endpoint")}
+		return &HTTPError{Code: HTTPErrorMalformed, Cause: CauseIncompleteCompactPeer, Class: HTTPFailureTransient, Err: errors.New("compact peer list has incomplete endpoint")}
 	}
 	count := len(value) / stride
 	if count > limits.Candidates {
@@ -650,7 +651,7 @@ func parseCompactPeers(value []byte, addressBytes int, peers *httpPeerSet) error
 		}
 		port := int(value[offset+addressBytes])<<8 | int(value[offset+addressBytes+1])
 		if port == 0 || addr.IsUnspecified() || addr.IsMulticast() {
-			return &HTTPError{Code: HTTPErrorMalformed, Class: HTTPFailureTransient, Err: errors.New("invalid compact peer endpoint")}
+			return &HTTPError{Code: HTTPErrorMalformed, Cause: CauseInvalidCompactEndpoint, Class: HTTPFailureTransient, Err: errors.New("invalid compact peer endpoint")}
 		}
 		if addressBytes == 4 {
 			peers.ipv4Compact++

@@ -24,7 +24,9 @@ exit; this package adapts arguments, reporting, and signals to `session.Run`.
   retained verified partial output. `tracker.FinalAnnounceError` is a separate
   best-effort category: retain its count, not its joined error text, and render a
   `warning: nonfatal:` line. Other secondary cleanup errors remain error-level;
-  callbacks still receive the original wrapped causes.
+  callbacks still receive the original wrapped causes. Debug tracker reasons
+  retain only allowlisted code/cause/operation fields and numeric status or retry
+  hints. Do not restore raw joined error text to recover parser detail.
 - Session diagnostics have fixed shape
   `Diagnostic{At time.Time, Kind DiagnosticKind, Phase string,
   Endpoint DiagnosticEndpoint, Peer peer.Endpoint,
@@ -56,10 +58,14 @@ exit; this package adapts arguments, reporting, and signals to `session.Run`.
   identifiers retain scheme and host only. Summary counters come from
   `RunResult.Summary`, independently of CLI queue drops; useful connections are
   not unique endpoints, and payload rate includes discarded bytes.
-  Known reporting gap: `session.Run` waits for final tracker announcements after
-  transfer workers join. During that wait, the reporter can render its frozen
-  final transfer snapshot with stale peer/rate values and a fresh timestamp;
-  stopping the reporter only when `Run` returns does not prevent this.
+  Session emits `OnPhase("shutdown")` after joined transfer cleanup and before
+  final tracker events, on every transfer outcome. That callback retires active
+  and pending status and invalidates queued live snapshots by generation; never
+  infer retirement from verified bytes. Warnings, diagnostics, ticker retries,
+  and the final flush must not restore retired status. Retirement is snapshot
+  state, not a droppable queue event: the reporting worker also clears inactive
+  TTY status on its ticker/final flush if the phase line was dropped. Already
+  queued phase-entry observations retain their original ordering and timestamps.
 - Keep phase/progress reporting testable with controlled time and TTY state.
   Queue-pressure tests should use local tracker events and gate peer messages
   with request, processed-event, and release barriers; synthetic peer-message

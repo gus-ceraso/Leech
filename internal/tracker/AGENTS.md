@@ -22,7 +22,10 @@ Read [DESIGN §10](../../DESIGN.md#10-tracker-subsystem),
   endpoint order. Validate the entire compact stride before dropping records.
   Current HTTP/UDP compact parsers fail the entire response for an unusable peer
   endpoint, not just that record. Do not change that policy as a logging fix;
-  compact provenance counts describe successful decoding.
+  compact provenance counts describe successful decoding. Attach `FailureCause`
+  at the rejecting check to distinguish invalid compact endpoints, incomplete
+  framing, and invalid intervals without exposing input. Causes are observational,
+  not retry-policy inputs; preserve existing error identities and classifications.
 - UDP transaction retries follow BEP 15 independently of tracker-loop backoff;
   refresh expired connection IDs before announce retransmission. Family
   transactions are independent and both must join on cancellation. Retained UDP
@@ -54,7 +57,14 @@ Read [DESIGN §10](../../DESIGN.md#10-tracker-subsystem),
   in `FinalAnnounceError`, preserving causes for callbacks and `errors.Is` while
   exposing a bounded failure count. CLI renders that count as a nonfatal warning,
   not an error or a joined multiline message. Per-attempt debug reasons use
-  allowlisted HTTP/UDP codes and HTTP status, never raw errors or tracker text.
+  allowlisted HTTP/UDP codes, `FailureCause` labels, recognized UDP operations,
+  and HTTP status/retry hints, never raw errors or tracker text. `CauseOf` uses
+  typed parser causes and standard error identities/interfaces, not text matching.
+  UDP context deadline expiry is `ErrorTimeout`/`CauseDeadline`, not
+  `ErrorCanceled`; keep the original context error and transmission bit. HTTP
+  records the context cause before replacing deadline errors with its existing
+  timeout sentinel. Unknown causes remain generic. None of this changes retries,
+  disablement, or bounded final-event timing.
 
 Use captured local traces and controlled clocks for retries, response loss,
 unequal families, failure classification, and shutdown ordering. Test both

@@ -108,6 +108,7 @@ var (
 // response was received or the response was invalid.
 type Error struct {
 	Code        ErrorCode
+	Cause       FailureCause
 	Operation   string
 	Transmitted bool
 	Err         error
@@ -271,7 +272,7 @@ func (c *UDPClient) Announce(ctx context.Context, trackerURL string, req Announc
 	}
 
 	if err := ctx.Err(); err != nil {
-		return result, &Error{Code: ErrorCanceled, Operation: "announce", Err: err}
+		return result, udpContextError("announce", false, err)
 	}
 	familyCtx, cancelFamilies := context.WithCancel(ctx)
 	defer cancelFamilies()
@@ -364,7 +365,7 @@ waitFamilies:
 		result.Peers = appendUniquePeers(result.Peers, family.Peers)
 	}
 	if err := ctx.Err(); err != nil {
-		return result, &Error{Code: ErrorCanceled, Operation: "announce", Transmitted: result.Transmitted, Err: err}
+		return result, udpContextError("announce", result.Transmitted, err)
 	}
 	if result.Interval > 0 {
 		return result, nil
@@ -477,7 +478,7 @@ func (c *UDPClient) announceFamily(ctx context.Context, endpoint netip.AddrPort,
 func (c *UDPClient) acquireSession(ctx context.Context, key string, endpoint netip.AddrPort) (*udpSession, error) {
 	for {
 		if err := ctx.Err(); err != nil {
-			return nil, &Error{Code: ErrorCanceled, Operation: "announce", Err: err}
+			return nil, udpContextError("announce", false, err)
 		}
 		c.mu.Lock()
 		if c.closed {
@@ -495,7 +496,7 @@ func (c *UDPClient) acquireSession(ctx context.Context, key string, endpoint net
 			select {
 			case <-changed:
 			case <-ctx.Done():
-				return nil, &Error{Code: ErrorCanceled, Operation: "announce", Err: ctx.Err()}
+				return nil, udpContextError("announce", false, ctx.Err())
 			}
 			continue
 		}
@@ -531,7 +532,7 @@ func (c *UDPClient) acquireSession(ctx context.Context, key string, endpoint net
 		select {
 		case <-changed:
 		case <-ctx.Done():
-			return nil, &Error{Code: ErrorCanceled, Operation: "announce", Err: ctx.Err()}
+			return nil, udpContextError("announce", false, ctx.Err())
 		}
 	}
 }
@@ -636,7 +637,7 @@ func (c *UDPClient) ensureConnection(ctx context.Context, s *udpSession, network
 			s.conn = nil
 		}
 		s.connMu.Unlock()
-		return &Error{Code: ErrorMalformed, Operation: "connect", Err: ErrMalformed}
+		return &Error{Code: ErrorMalformed, Cause: CauseIncompleteResponse, Operation: "connect", Err: ErrMalformed}
 	}
 	s.connID = binary.BigEndian.Uint64(response[8:16])
 	s.expires = c.clock.Now().Add(connectionLife)
@@ -677,7 +678,7 @@ func (c *UDPClient) exchangeWithRefresh(ctx context.Context, conn net.Conn, pack
 		return nil, false, &Error{Code: ErrorWrite, Operation: operation, Err: errors.New("UDP datagram exceeds limit")}
 	}
 	if err := ctx.Err(); err != nil {
-		return nil, false, &Error{Code: ErrorCanceled, Operation: operation, Err: err}
+		return nil, false, udpContextError(operation, false, err)
 	}
 	transmitted := false
 	write := func() error {
@@ -721,15 +722,15 @@ func (c *UDPClient) exchangeWithRefresh(ctx context.Context, conn net.Conn, pack
 			if result.err != nil {
 				if ctxErr := ctx.Err(); ctxErr != nil {
 					closeForCleanup = true
-					return nil, transmitted, &Error{Code: ErrorCanceled, Operation: operation, Transmitted: transmitted, Err: ctxErr}
+					return nil, transmitted, udpContextError(operation, transmitted, ctxErr)
 				}
 				return nil, transmitted, &Error{Code: ErrorRead, Operation: operation, Transmitted: transmitted, Err: result.err}
 			}
 			if len(result.packet) > limits.DatagramBytes {
-				return nil, transmitted, &Error{Code: ErrorMalformed, Operation: operation, Transmitted: transmitted, Err: errors.New("UDP datagram exceeds limit")}
+				return nil, transmitted, &Error{Code: ErrorMalformed, Cause: CauseDatagramLimit, Operation: operation, Transmitted: transmitted, Err: errors.New("UDP datagram exceeds limit")}
 			}
 			if len(result.packet) < 8 {
-				return nil, transmitted, &Error{Code: ErrorMalformed, Operation: operation, Transmitted: transmitted, Err: ErrMalformed}
+				return nil, transmitted, &Error{Code: ErrorMalformed, Cause: CauseIncompleteResponse, Operation: operation, Transmitted: transmitted, Err: ErrMalformed}
 			}
 			responseTx := binary.BigEndian.Uint32(result.packet[4:8])
 			if responseTx != tx {
@@ -751,7 +752,7 @@ func (c *UDPClient) exchangeWithRefresh(ctx context.Context, conn net.Conn, pack
 			}
 			if err := ctx.Err(); err != nil {
 				closeForCleanup = true
-				return nil, transmitted, &Error{Code: ErrorCanceled, Operation: operation, Transmitted: transmitted, Err: err}
+				return nil, transmitted, udpContextError(operation, transmitted, err)
 			}
 			if refresh != nil && needsRefresh != nil && needsRefresh() {
 				// Stop the old reader before it can race a response from the
@@ -783,7 +784,7 @@ func (c *UDPClient) exchangeWithRefresh(ctx context.Context, conn net.Conn, pack
 			}
 		case <-ctx.Done():
 			closeForCleanup = true
-			return nil, transmitted, &Error{Code: ErrorCanceled, Operation: operation, Transmitted: transmitted, Err: ctx.Err()}
+			return nil, transmitted, udpContextError(operation, transmitted, ctx.Err())
 		}
 	}
 }
@@ -846,7 +847,7 @@ type udpAnnounceResponse struct {
 
 func parseAnnounceResponse(packet []byte, tx uint32, v4 bool) (udpAnnounceResponse, error) {
 	if len(packet) < 20 {
-		return udpAnnounceResponse{}, &Error{Code: ErrorMalformed, Operation: "announce", Err: ErrMalformed}
+		return udpAnnounceResponse{}, &Error{Code: ErrorMalformed, Cause: CauseIncompleteResponse, Operation: "announce", Err: ErrMalformed}
 	}
 	if binary.BigEndian.Uint32(packet[4:8]) != tx {
 		return udpAnnounceResponse{}, &Error{Code: ErrorTransaction, Operation: "announce", Err: errors.New("announce transaction mismatch")}
@@ -856,7 +857,7 @@ func parseAnnounceResponse(packet []byte, tx uint32, v4 bool) (udpAnnounceRespon
 	}
 	seconds := binary.BigEndian.Uint32(packet[8:12])
 	if seconds < limits.MinTrackerSeconds || seconds > limits.MaxTrackerSeconds {
-		return udpAnnounceResponse{}, &Error{Code: ErrorMalformed, Operation: "announce", Err: errors.New("tracker interval outside supported range")}
+		return udpAnnounceResponse{}, &Error{Code: ErrorMalformed, Cause: CauseInvalidInterval, Operation: "announce", Err: errors.New("tracker interval outside supported range")}
 	}
 	stride := 18
 	if v4 {
@@ -864,7 +865,7 @@ func parseAnnounceResponse(packet []byte, tx uint32, v4 bool) (udpAnnounceRespon
 	}
 	peersBytes := packet[20:]
 	if len(peersBytes)%stride != 0 {
-		return udpAnnounceResponse{}, &Error{Code: ErrorMalformed, Operation: "announce", Err: errors.New("compact peer list has incomplete endpoint")}
+		return udpAnnounceResponse{}, &Error{Code: ErrorMalformed, Cause: CauseIncompleteCompactPeer, Operation: "announce", Err: errors.New("compact peer list has incomplete endpoint")}
 	}
 	peers := make([]netip.AddrPort, 0, len(peersBytes)/stride)
 	for offset := 0; offset < len(peersBytes); offset += stride {
@@ -880,7 +881,7 @@ func parseAnnounceResponse(packet []byte, tx uint32, v4 bool) (udpAnnounceRespon
 		}
 		port := binary.BigEndian.Uint16(peersBytes[offset+stride-2 : offset+stride])
 		if port == 0 || !addr.IsValid() || addr.IsUnspecified() || addr.IsMulticast() {
-			return udpAnnounceResponse{}, &Error{Code: ErrorMalformed, Operation: "announce", Err: errors.New("invalid compact peer endpoint")}
+			return udpAnnounceResponse{}, &Error{Code: ErrorMalformed, Cause: CauseInvalidCompactEndpoint, Operation: "announce", Err: errors.New("invalid compact peer endpoint")}
 		}
 		peers = append(peers, netip.AddrPortFrom(addr, port))
 	}

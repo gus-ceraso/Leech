@@ -359,13 +359,26 @@ func (r *Reporter) writePermanentAt(at time.Time, level LogLevel, message string
 	return r.writePermanentLocked(at, level, message)
 }
 
-func (r *Reporter) writePermanentLocked(at time.Time, level LogLevel, message string) error {
+func (r *Reporter) clearStatus() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.clearStatusLocked()
+}
+
+func (r *Reporter) clearStatusLocked() error {
 	if r.status.shown {
 		if _, err := io.WriteString(r.stderr, "\r"+strings.Repeat(" ", r.status.lastLen)+"\r"); err != nil {
 			return err
 		}
 		r.status.shown = false
 		r.status.lastLen = 0
+	}
+	return nil
+}
+
+func (r *Reporter) writePermanentLocked(at time.Time, level LogLevel, message string) error {
+	if err := r.clearStatusLocked(); err != nil {
+		return err
 	}
 	_, err := fmt.Fprintf(r.stderr, "%s %s: %s\n", at.UTC().Format(logTimeLayout), level, message)
 	return err

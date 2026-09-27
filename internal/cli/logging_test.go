@@ -68,14 +68,16 @@ func TestSuccessfulDownloadKeepsFinalTrackerFailureNonfatal(t *testing.T) {
 	data := []byte("logging fixture")
 	info, infoHash := v1Info(t, data)
 	torrentPath := writeV1Torrent(t, v1Metainfo(t, info, ""))
-	for _, level := range []LogLevel{LogInfo, LogError} {
+	for _, level := range []LogLevel{LogDebug, LogInfo, LogError} {
 		t.Run(string(level), func(t *testing.T) {
 			peers := newV1Peers(t, infoHash, info, data, false)
 			defer peers.close()
 			delegate := &v1Tracker{}
 			config := v1SessionConfig(t, delegate, peers)
 			cause := errors.New("untrusted-secret\nhttps://user:password@example.test/private?token=secret")
-			config.HTTP = v1FinalFailureTracker{delegate: delegate, err: cause}
+			config.HTTP = v1FinalFailureTracker{delegate: delegate, err: &tracker.HTTPError{
+				Code: tracker.HTTPErrorMalformed, Cause: tracker.CauseInvalidCompactEndpoint, StatusCode: 200, Err: cause,
+			}}
 			observed := false
 			config.OnSecondary = func(err error) {
 				var final *tracker.FinalAnnounceError
@@ -92,6 +94,9 @@ func TestSuccessfulDownloadKeepsFinalTrackerFailureNonfatal(t *testing.T) {
 			got := stderr.String()
 			if strings.Contains(got, "error:") || strings.Contains(got, "secret") || strings.Contains(got, `\n`) {
 				t.Fatalf("nonfatal diagnostics leaked error text or claimed failure: %q", got)
+			}
+			if detailed := strings.Contains(got, "code=malformed cause=invalid-compact-endpoint status=200"); detailed != (level == LogDebug) {
+				t.Fatalf("safe final detail filtering at %s: %q", level, got)
 			}
 			if level == LogError {
 				if got != "" {

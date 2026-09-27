@@ -79,6 +79,7 @@ type RunConfig struct {
 	Updates    <-chan tracker.Update
 	backoff    *peer.EndpointBackoff
 
+	// OnPhase includes shutdown after transfer work joins, before final announces.
 	OnPhase func(string)
 	// OnPhaseStatus follows OnPhase for metadata, resume, and transfer entry.
 	// It is separate from OnProgress, which reports committed pieces only.
@@ -404,10 +405,8 @@ func Run(ctx context.Context, config RunConfig) (result RunResult, err error) {
 	}
 	run.activePhase("transfer", RunProgress{VerifiedSelectedBytes: verifiedSelected, SelectedBytes: runSelectedBytes(selection)})
 	if err := run.startTransferPhase(ctx, source, meta, selection, plan, resumeResult); err != nil {
-		run.phaseExit("transfer", err)
 		return RunResult{}, err
 	}
-	run.phaseExit("transfer", nil)
 	return RunResult{Metainfo: meta, Selection: selection, SelectionComplete: true, TorrentComplete: fullSelection(meta, selection)}, nil
 }
 
@@ -709,6 +708,10 @@ func boundedTrackerWarning(endpoint DiagnosticEndpoint, detail string) string {
 }
 
 func trackerFailureDetail(err error) string {
+	causeDetail := ""
+	if cause := tracker.CauseOf(err); cause != tracker.CauseUnknown {
+		causeDetail = " cause=" + cause.String()
+	}
 	var httpErr *tracker.HTTPError
 	if errors.As(err, &httpErr) {
 		code := "unknown"
@@ -719,7 +722,7 @@ func trackerFailureDetail(err error) string {
 			tracker.HTTPErrorCanceled, tracker.HTTPErrorTimeout:
 			code = string(httpErr.Code)
 		}
-		detail := "HTTP tracker transaction failed code=" + code
+		detail := "HTTP tracker transaction failed code=" + code + causeDetail
 		if httpErr.StatusCode >= 100 && httpErr.StatusCode <= 599 {
 			detail += fmt.Sprintf(" status=%d", httpErr.StatusCode)
 		}
@@ -737,9 +740,14 @@ func trackerFailureDetail(err error) string {
 			tracker.ErrorAction, tracker.ErrorTracker, tracker.ErrorCanceled, tracker.ErrorClosed:
 			code = string(udpErr.Code)
 		}
-		return "UDP tracker transaction failed code=" + code
+		detail := "UDP tracker transaction failed code=" + code + causeDetail
+		switch udpErr.Operation {
+		case "resolve", "connect", "announce":
+			detail += " operation=" + udpErr.Operation
+		}
+		return detail
 	}
-	return "transaction failed"
+	return "transaction failed" + causeDetail
 }
 
 func dialOutcomeDiagnostic(phase string, endpoint peer.Endpoint, result peer.HandshakeResult, raceStarted bool, err error) Diagnostic {
@@ -870,7 +878,24 @@ func (c *coordinator) utpDial() peer.DialFunc {
 	return utp.DialContext
 }
 
-func (c *coordinator) startTransferPhase(ctx context.Context, source torrent.Source, meta torrent.Metainfo, selection *torrent.SelectionPlan, output *storage.Plan, resume storage.ResumeResult) error {
+func (c *coordinator) startTransferPhase(ctx context.Context, source torrent.Source, meta torrent.Metainfo, selection *torrent.SelectionPlan, output *storage.Plan, resume storage.ResumeResult) (err error) {
+	var trackerRun *tracker.PhaseRun
+	var transfer *Transfer
+	defer func() {
+		// Later defers join admission and regular trackers first. Any started
+		// Transfer.Run has joined peers/finalization and removed its workspace.
+		// End live progress on every exit, not just verified completion.
+		c.phaseExit("transfer", err)
+		c.phase("shutdown")
+		if trackerRun != nil {
+			full := err == nil && fullSelection(meta, selection)
+			// Preserve primary-only reporting for transfer construction failures.
+			if finalErr := trackerRun.Finalize(context.Background(), full); finalErr != nil && transfer != nil && c.config.OnSecondary != nil {
+				c.config.OnSecondary(finalErr)
+			}
+			c.updateQueue.clear()
+		}
+	}()
 	if c.set == nil {
 		if err := c.makeSet(meta.Trackers, meta.InfoHash, false); err != nil {
 			return err
@@ -908,20 +933,19 @@ func (c *coordinator) startTransferPhase(ctx context.Context, source torrent.Sou
 	}
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	trackerRun, err := c.set.Start(runCtx, tracker.TransferPhase)
+	trackerRun, err = c.set.Start(runCtx, tracker.TransferPhase)
 	if err != nil {
 		return err
 	}
 	admission := newTrackerPeerResolver(runCtx, c.config.Resolver, c.updateQueue, c.diagnostic)
 	admission.onPump = c.drainTrackerWarnings
-	defer c.updateQueue.clear()
-	quiesceAdmission := func() {
+	defer func() {
 		cancel()
 		trackerRun.Wait()
 		admission.close()
 		c.updateQueue.clear()
 		c.drainTrackerWarnings()
-	}
+	}()
 	var liveMu sync.Mutex
 	live := make(map[net.Conn]*peer.LivePeer)
 	candidateCursor := 0
@@ -1030,7 +1054,7 @@ func (c *coordinator) startTransferPhase(ctx context.Context, source torrent.Sou
 			c.config.OnStatus(statusSnapshot(activePeers))
 		}
 	}
-	transfer, err := NewTransfer(TransferConfig{
+	transfer, err = NewTransfer(TransferConfig{
 		Selection: selection, Output: output, Stager: stager,
 		PrepareMode:     prepareMode,
 		SchedulerConfig: Config{Streaming: c.config.Streaming}, LocalHandshake: local,
@@ -1068,8 +1092,6 @@ func (c *coordinator) startTransferPhase(ctx context.Context, source torrent.Sou
 		},
 	})
 	if err != nil {
-		quiesceAdmission()
-		_ = trackerRun.Finalize(context.Background(), false)
 		return err
 	}
 	transferCtx := runCtx
@@ -1159,17 +1181,7 @@ func (c *coordinator) startTransferPhase(ctx context.Context, source torrent.Sou
 			}
 		}
 	}
-	full := err == nil && fullSelection(meta, selection)
-	// Transfer.Run has joined every peer and finalizer worker. Join admission
-	// too, and discard queued peers before the one-shot terminal sequence.
-	quiesceAdmission()
-	if finalErr := trackerRun.Finalize(context.Background(), full); finalErr != nil && c.config.OnSecondary != nil {
-		c.config.OnSecondary(finalErr)
-	}
-	if err != nil {
-		return err
-	}
-	return nil
+	return err
 }
 
 type payloadRateBucket struct {

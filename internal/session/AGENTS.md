@@ -18,6 +18,10 @@ piece/request state, and `transfer.go` coordinates peer I/O and finalization.
 - During transfer shutdown, join peers and the finalizer, close cache resources,
   and remove this run's workspace before final tracker events. Announcements do
   not need the workspace; early cleanup avoids retaining it through that wait.
+  `startTransferPhase` emits the transfer-exit diagnostic and `OnPhase("shutdown")`
+  after joined cleanup, before one-shot final events, including failed/canceled
+  exits and construction failures. Preserve that defer order: the CLI must retire
+  progress before waiting for trackers, not when `Run` eventually returns.
 - A metadata candidate has one supplier. Verify its complete hash and canonical
   encoding before normalization; retain no network worker in the result. Keep
   invalid complete metadata, severe messages, and ordinary refusal/timeouts
@@ -64,8 +68,11 @@ piece/request state, and `transfer.go` coordinates peer I/O and finalization.
   regular failures and reports recovery through `OnWarning`; pending warning
   transitions retain at most three per tracker (192 total) and drain from the
   session admission pump, including after normal loops join. Final one-shot
-  failures remain secondary and never claim a retry. Tracker callbacks only
-  enqueue bounded warning state and debug observations; they run after protocol
+  failures remain secondary and never claim a retry. Debug failure details use
+  tracker-owned `FailureCause` labels, allowlisted HTTP/UDP codes and UDP
+  operations, plus bounded HTTP status/retry hints; never inspect error text to
+  recover a cause. Tracker callbacks only enqueue bounded warning state and debug
+  observations; they run after protocol
   transactions and outside coordinator/protocol locks. The CLI drops debug
   records on pressure. Transfer emits `DiagnosticTransfer` transitions from the
   coordinator at choke, availability, Allowed Fast, useful-block, tombstone,
@@ -130,6 +137,7 @@ not replace them with direct calls to `observe` or `Reporter.Debug`.
 | Metadata refusal | `TestMetadataDiscoveryObservesMetadataReject` |
 | Compact IPv4/IPv6 response provenance | `TestHTTPAnnounceParsesCompactFamiliesAndDictionaryPeers` |
 | Final tracker attempts, including transmitted unanswered started | `TestMetadataUnansweredStartedTrackerGetsStoppedWithoutLaterRegularAnnounce`; `TestRunReportsMetadataFinalEventFailureAsSecondary` |
+| Transfer status retires before held final events on success, failure, and cancellation; blocked warning output cannot restore it | `TestCLITransferStatusEndsBeforeFinalAnnounces`; `TestCLIBlockedWarningDoesNotStallTransferStatusOrShutdown` |
 | Clean corruption reports retry; simultaneous corruption/storage failure reports fatal, not retry, and preserves strikes/cleanup | `TestTransferCorruptPieceRetriesWithoutOutput`; `TestFinalizePieceCorruptStageCloseFailurePropagatesFatal`; `TestTransferFatalCorruptStageCloseFailureShutsDownImmediately` |
 | Fatal cache-start, piece-admission, and block-write failures report one bounded diagnostic | `TestTransferFatalStagingStartDiagnostic`; `TestTransferFatalStagingFailureDiagnosticAtStorageBoundary` |
 | Incoming transfer requests reject only where Fast/metadata is usable, never upload payload, and do not read cache or output during rejection | `TestTransferRejectsIncomingPayloadRequestWithoutUploading`; `TestTransferIgnoresIncomingNonFastPayloadRequest`; `TestMetadataFetcherIgnoresIncomingCorePayloadRequest`; `TestMetadataDiscoveryRejectsIncomingMetadataRequest` |
