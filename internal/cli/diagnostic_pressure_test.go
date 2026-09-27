@@ -132,8 +132,9 @@ func TestCLITransferContinuesAndJoinsUnderDiagnosticQueuePressure(t *testing.T) 
 			}
 		}
 		cancel()
-		if err := peers.waitCalls(t, 2); err != nil {
-			t.Errorf("peer fixtures did not join during cleanup: %v", err)
+		started := peers.calls.Load()
+		if err := peers.waitCalls(t, started); err != nil {
+			t.Errorf("%d started peer fixtures did not join during cleanup: %v", started, err)
 		}
 	}()
 	go func() { done <- RunWithSession(ctx, opts, &bytes.Buffer{}, writer, config) }()
@@ -177,6 +178,9 @@ func TestCLITransferContinuesAndJoinsUnderDiagnosticQueuePressure(t *testing.T) 
 	}
 	if writer.active.Load() != 0 {
 		t.Fatalf("writer still active after RunWithSession returned: %d", writer.active.Load())
+	}
+	if got := peers.calls.Load(); got < 2 {
+		t.Fatalf("successful metadata/transfer run used %d peer fixture calls, want at least 2", got)
 	}
 	outputText := writer.String()
 	if strings.Count(outputText, "debug: diagnostics: dropped ") != 1 {
