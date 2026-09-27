@@ -10,7 +10,9 @@ Read [DESIGN §§8–9](../../DESIGN.md#8-selection-and-storage-mapping),
   paths. Torrent-relative limits and filesystem representability are separate
   concerns: relative limits exclude `info.name`, while Linux also checks absolute
   syscall path length and component length. Hostile concurrent local races remain
-  outside scope.
+  outside scope. `Plan.ReadAt` uses a per-plan `ReadAtOpener`; use
+  `WithReadAtOpener` for focused read-spy tests, keeping production plans on the
+  default `os.Open` path rather than adding global hooks.
 - Selected mutations must not modify another pathname's inode. Detach hardlinked
   files before overwrite, verified writes, or resume truncation. Copy with one
   block of memory and an initial-size bound; preserve resume suffixes until

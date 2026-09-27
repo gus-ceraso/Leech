@@ -1684,6 +1684,16 @@ func TestTransferFatalStagingFailureDiagnosticAtStorageBoundary(t *testing.T) {
 	}
 }
 
+type countedOutputReadFile struct {
+	*os.File
+	reads *atomic.Int32
+}
+
+func (f *countedOutputReadFile) ReadAt(data []byte, offset int64) (int, error) {
+	f.reads.Add(1)
+	return f.File.ReadAt(data, offset)
+}
+
 type observedStageFile struct {
 	storage.StagingFile
 	reads           *atomic.Int32
@@ -1772,6 +1782,23 @@ func TestTransferRejectsIncomingPayloadRequestWithoutUploading(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	outputPath := filepath.Join(root, "fixture")
+	if err := os.WriteFile(outputPath, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var outputReads atomic.Int32
+	plan = plan.WithReadAtOpener(func(path string) (storage.ReadAtCloser, error) {
+		file, err := os.Open(path)
+		if err != nil {
+			return nil, err
+		}
+		return &countedOutputReadFile{File: file, reads: &outputReads}, nil
+	})
+	probe := make([]byte, 1)
+	if n, err := plan.ReadAt(0, 0, probe); err != nil || n != 1 || probe[0] != data[0] || outputReads.Load() != 1 {
+		t.Fatalf("read spy probe = %d/%v/%q, calls=%d; want one actual output read", n, err, probe, outputReads.Load())
+	}
+	outputReads.Store(0)
 	infoHash := [20]byte{6, 6, 6}
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -1784,7 +1811,7 @@ func TestTransferRejectsIncomingPayloadRequestWithoutUploading(t *testing.T) {
 	metadataRejects := make(map[uint32]int)
 	var reads, prePayloadReads atomic.Int32
 	var payloadSeen atomic.Bool
-	var readsAfterRequests int32
+	var readsAfterRequests, outputReadsAfterRequests int32
 	serverDone := make(chan error, 1)
 	go func() {
 		conn, err := listener.Accept()
@@ -1895,6 +1922,7 @@ func TestTransferRejectsIncomingPayloadRequestWithoutUploading(t *testing.T) {
 			}
 		}
 		readsAfterRequests = reads.Load()
+		outputReadsAfterRequests = outputReads.Load()
 		payload := make([]byte, 8+len(data))
 		copy(payload[8:], data)
 		if err := writeFixtureFrame(conn, peer.PieceID, payload); err != nil {
@@ -1973,13 +2001,16 @@ func TestTransferRejectsIncomingPayloadRequestWithoutUploading(t *testing.T) {
 	if len(payloadRejects) != len(payloadRequests) || len(metadataRejects) != len(metadataRequests) {
 		t.Fatalf("unexpected rejection set: payload=%v metadata=%v", payloadRejects, metadataRejects)
 	}
-	if readsAfterRequests != 0 || prePayloadReads.Load() != 0 {
-		t.Fatalf("cache reads before payload acceptance: at rejection barrier=%d, total=%d; want zero", readsAfterRequests, prePayloadReads.Load())
+	if readsAfterRequests != 0 || prePayloadReads.Load() != 0 || outputReadsAfterRequests != 0 || outputReads.Load() != 0 {
+		t.Fatalf("storage reads before payload acceptance: cache at rejection barrier=%d, cache total=%d, output at barrier=%d, output total=%d; want zero", readsAfterRequests, prePayloadReads.Load(), outputReadsAfterRequests, outputReads.Load())
 	}
 	if reads.Load() == 0 {
 		t.Fatal("cache read spy did not observe the normal finalizer read")
 	}
-	if output, err := os.ReadFile(filepath.Join(root, "fixture")); err != nil || string(output) != string(data) {
+	if outputReads.Load() != 0 {
+		t.Fatalf("output read spy observed %d reads during transfer; want zero", outputReads.Load())
+	}
+	if output, err := os.ReadFile(outputPath); err != nil || string(output) != string(data) {
 		t.Fatalf("downloaded output = %q, err=%v; want %q", output, err, data)
 	}
 }

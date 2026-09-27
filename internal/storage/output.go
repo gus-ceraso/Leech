@@ -46,6 +46,15 @@ var openOutputFile = func(path string, flag int, mode os.FileMode) (outputFile, 
 	return os.OpenFile(path, flag, mode)
 }
 
+// ReadAtCloser is the read-only output handle used by Plan.ReadAt.
+type ReadAtCloser interface {
+	io.ReaderAt
+	io.Closer
+}
+
+// ReadAtOpener opens a selected output file for bounded reads.
+type ReadAtOpener func(string) (ReadAtCloser, error)
+
 // Entry is one selected regular torrent file and its confined output path.
 // Index is the original index in Metainfo.Files. Path is absolute and rooted
 // below Plan.Root.
@@ -64,10 +73,11 @@ type ExistingState struct {
 // Plan is a validated, immutable selected output plan. Construct one with
 // Validate; construction and all inspection methods are read-only.
 type Plan struct {
-	root    string
-	entries []Entry
-	parts   [][]string
-	byIndex map[int]int
+	root         string
+	entries      []Entry
+	parts        [][]string
+	byIndex      map[int]int
+	readAtOpener ReadAtOpener
 }
 
 // Validate resolves root once and validates every selected output path. It
@@ -151,6 +161,18 @@ func NewPlan(root string, meta torrent.Metainfo, selected []int) (*Plan, error) 
 	return Validate(root, meta, selected)
 }
 
+// WithReadAtOpener returns a plan copy whose ReadAt calls use opener. A nil
+// opener restores the standard os.Open path. This narrow per-plan seam is for
+// read-path instrumentation; preparation and writes are unaffected.
+func (p *Plan) WithReadAtOpener(opener ReadAtOpener) *Plan {
+	if p == nil {
+		return nil
+	}
+	copy := *p
+	copy.readAtOpener = opener
+	return &copy
+}
+
 // Root returns the destination directory after one-time symlink resolution.
 func (p *Plan) Root() string { return p.root }
 
@@ -206,7 +228,15 @@ func (p *Plan) ReadAt(index int, globalOffset int64, dst []byte) (int, error) {
 	if err := p.checkPath(position); err != nil {
 		return 0, err
 	}
-	f, err := os.Open(p.entries[position].Path)
+	var (
+		f   ReadAtCloser
+		err error
+	)
+	if p.readAtOpener == nil {
+		f, err = os.Open(p.entries[position].Path)
+	} else {
+		f, err = p.readAtOpener(p.entries[position].Path)
+	}
 	if err != nil {
 		return 0, fmt.Errorf("storage: open %q for reading: %w", p.entries[position].Path, err)
 	}
