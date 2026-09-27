@@ -76,6 +76,12 @@ piece/request state, and `transfer.go` coordinates peer I/O and finalization.
   from errors during admission, budget checks, or slot waits. `DialWithResult`
   carries the winner through collision rejection while its closed connection
   remains unowned by session.
+- Fatal errors classified by storage at `Stager.Start`, `AdmitPiece`, and
+  `WriteBlockContext` emit one `DiagnosticTransfer` with a fixed operation label
+  (`cache start`, `piece admission`, or `block write`); never retain the raw error
+  or re-emit when it propagates through shutdown. Keep finalizer hash-mismatch
+  accounting and the F6 simultaneous corruption/storage-failure observations
+  separate so clean corruption still retries and fatal storage errors do not.
 - The coordinator alone mutates rarity, request ownership, provenance, strikes,
   and completion. Give the finalizer immutable coverage snapshots. Worker
   callbacks and command enqueueing must not stall coordination indefinitely.
@@ -105,6 +111,8 @@ not replace them with direct calls to `observe` or `Reporter.Debug`.
 | Compact IPv4/IPv6 response provenance | `TestHTTPAnnounceParsesCompactFamiliesAndDictionaryPeers` |
 | Final tracker attempts, including transmitted unanswered started | `TestMetadataUnansweredStartedTrackerGetsStoppedWithoutLaterRegularAnnounce`; `TestRunReportsMetadataFinalEventFailureAsSecondary` |
 | Clean corruption reports retry; simultaneous corruption/storage failure reports fatal, not retry, and preserves strikes/cleanup | `TestTransferCorruptPieceRetriesWithoutOutput`; `TestFinalizePieceCorruptStageCloseFailurePropagatesFatal`; `TestTransferFatalCorruptStageCloseFailureShutsDownImmediately` |
+| Fatal cache-start, piece-admission, and block-write failures report one bounded diagnostic | `TestTransferFatalStagingStartDiagnostic`; `TestTransferFatalStagingFailureDiagnosticAtStorageBoundary` |
+| Incoming transfer requests reject only where Fast/metadata is usable, never upload payload, and do not read cache during rejection | `TestTransferRejectsIncomingPayloadRequestWithoutUploading`; `TestTransferIgnoresIncomingNonFastPayloadRequest`; `TestMetadataFetcherIgnoresIncomingCorePayloadRequest`; `TestMetadataDiscoveryRejectsIncomingMetadataRequest` |
 | Piece assignment/completion debug from CLI; actual coordinator endgame, choke, zero-reqq, and staging-pressure reasons | `TestV1MagnetAndBareHashRunMetadataThenTransferThroughCLI`; `TestTransferEndgameDuplicateWinnerDoesNotDoubleCommit`; `TestTransferDriveReportsChokeAndZeroReqQBlocks`; `TestReviewPressureKeepsPartialStageWhenEmptyStageSuffices` |
 | Local tracker warning/debug redaction and CLI level filtering | `TestRunWithSessionReportsRedactedProductionTrackerFailure`; `TestRunWithSessionEmitsProductionDebugPhaseDiagnostic`; `TestDiagnosticQueueBoundsRedactsAndDrops` |
 | Repeated tracker failures and duplicate peer messages under full debug queue; transfer completes, drop count is reported, reporter joins | `TestCLITransferContinuesAndJoinsUnderDiagnosticQueuePressure`; `TestDiagnosticQueueBoundsRedactsAndDrops` |

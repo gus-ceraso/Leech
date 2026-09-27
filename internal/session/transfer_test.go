@@ -1549,6 +1549,166 @@ func TestTransferEndgameDuplicateWinnerDoesNotDoubleCommit(t *testing.T) {
 	}
 }
 
+func TestTransferFatalStagingStartDiagnostic(t *testing.T) {
+	data := []byte("good")
+	meta := singleFileMeta(data)
+	selection, err := torrent.Select(meta, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	plan, err := storage.Validate(root, meta, selection.SelectedIndices())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cacheFile := filepath.Join(t.TempDir(), "cache")
+	if err := os.WriteFile(cacheFile, []byte("not a directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	infoHash := [20]byte{40, 41, 42}
+	conn, remoteDone := startFixturePeer(t, infoHash, []fixturePiece{{index: 0, data: data}}, false, false)
+	var observations []Diagnostic
+	transfer, err := NewTransfer(TransferConfig{
+		Selection: selection, Output: plan,
+		Stager:         storage.NewStager(storage.StagerConfig{CacheRoot: cacheFile}),
+		LocalHandshake: peer.Handshake{InfoHash: infoHash, PeerID: [20]byte{4, 5, 6}},
+		Peers:          []ConnectedPeer{{ID: "storage-failure", Endpoint: endpoint(40), Conn: conn, Handshake: peer.Handshake{InfoHash: infoHash, PeerID: [20]byte{3, 2, 1}}}},
+		PieceCount:     1, PieceLength: uint32(len(data)), LastPieceLength: uint32(len(data)),
+		OnDiagnostic: func(event Diagnostic) { observations = append(observations, event) },
+	})
+	if err != nil {
+		conn.Close()
+		t.Fatal(err)
+	}
+	if err := transfer.Run(context.Background()); !errors.Is(err, storage.ErrStagingFatal) {
+		t.Fatalf("Transfer.Run = %v, want fatal cache-start error", err)
+	}
+	if err := <-remoteDone; err != nil {
+		t.Fatalf("fixture peer: %v", err)
+	}
+	if len(observations) != 1 || observations[0].Kind != DiagnosticTransfer || observations[0].Phase != "transfer" || observations[0].Detail != "fatal staging failure: cache start" {
+		t.Fatalf("cache-start diagnostics = %+v, want one bounded fatal-staging event", observations)
+	}
+	if output, err := os.ReadFile(filepath.Join(root, "fixture")); err != nil || len(output) != 0 {
+		t.Fatalf("output after cache-start failure = %q, err=%v; want empty", output, err)
+	}
+}
+
+func TestTransferFatalStagingFailureDiagnosticAtStorageBoundary(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		failOpen   bool
+		wantDetail string
+		wantWrites int32
+	}{
+		{name: "open", failOpen: true, wantDetail: "fatal staging failure: piece admission"},
+		{name: "write", wantDetail: "fatal staging failure: block write", wantWrites: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			data := []byte("good")
+			meta := singleFileMeta(data)
+			selection, err := torrent.Select(meta, nil, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			root := t.TempDir()
+			plan, err := storage.Validate(root, meta, selection.SelectedIndices())
+			if err != nil {
+				t.Fatal(err)
+			}
+			infoHash := [20]byte{41, 42, 43}
+			conn, remoteDone := startFixturePeer(t, infoHash, []fixturePiece{{index: 0, data: data}}, false, false)
+			injectedErr := errors.New("injected stage storage failure")
+			var opens, reads, writes atomic.Int32
+			stager := storage.NewStager(storage.StagerConfig{
+				CacheRoot: filepath.Join(t.TempDir(), "cache"), MaxPieces: 1, MaxBytes: int64(len(data)),
+				OpenFile: func(path string, flag int, mode os.FileMode) (storage.StagingFile, error) {
+					opens.Add(1)
+					if test.failOpen {
+						return nil, injectedErr
+					}
+					file, err := os.OpenFile(path, flag, mode)
+					if err != nil {
+						return nil, err
+					}
+					return &observedStageFile{StagingFile: file, reads: &reads, writes: &writes, writeErr: injectedErr}, nil
+				},
+			})
+			var observations []Diagnostic
+			transfer, err := NewTransfer(TransferConfig{
+				Selection: selection, Output: plan, Stager: stager,
+				LocalHandshake: peer.Handshake{InfoHash: infoHash, PeerID: [20]byte{4, 5, 6}},
+				Peers:          []ConnectedPeer{{ID: "storage-failure", Endpoint: endpoint(41), Conn: conn, Handshake: peer.Handshake{InfoHash: infoHash, PeerID: [20]byte{3, 2, 1}}}},
+				PieceCount:     1, PieceLength: uint32(len(data)), LastPieceLength: uint32(len(data)),
+				OnDiagnostic: func(event Diagnostic) { observations = append(observations, event) },
+			})
+			if err != nil {
+				conn.Close()
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := transfer.Run(ctx); !errors.Is(err, injectedErr) || !errors.Is(err, storage.ErrStagingFatal) {
+				t.Fatalf("Transfer.Run = %v, want injected fatal staging error", err)
+			}
+			if err := <-remoteDone; err != nil {
+				t.Fatalf("fixture peer: %v", err)
+			}
+			if opens.Load() != 1 || writes.Load() != test.wantWrites || reads.Load() != 0 {
+				t.Fatalf("stage I/O = opens %d, writes %d, reads %d; want 1/%d/0", opens.Load(), writes.Load(), reads.Load(), test.wantWrites)
+			}
+			fatalCount := 0
+			for _, event := range observations {
+				if event.Kind == DiagnosticTransfer && event.Phase == "transfer" && event.Detail == test.wantDetail {
+					fatalCount++
+					continue
+				}
+				if strings.Contains(event.Detail, "block ") {
+					t.Fatalf("unexpected per-block diagnostic: %+v", event)
+				}
+			}
+			if fatalCount != 1 {
+				t.Fatalf("fatal staging diagnostics = %d, want one (%q): %+v", fatalCount, test.wantDetail, observations)
+			}
+			output, err := os.ReadFile(filepath.Join(root, "fixture"))
+			if err != nil || len(output) != 0 {
+				t.Fatalf("output after staging failure = %q, err=%v; want empty", output, err)
+			}
+			workspace := stager.Workspace()
+			if workspace != "" {
+				if _, err := os.Stat(workspace); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("staging workspace remains after failure: %s (%v)", workspace, err)
+				}
+			}
+		})
+	}
+}
+
+type observedStageFile struct {
+	storage.StagingFile
+	reads           *atomic.Int32
+	prePayloadReads *atomic.Int32
+	payloadSeen     *atomic.Bool
+	writes          *atomic.Int32
+	writeErr        error
+}
+
+func (f *observedStageFile) ReadAt(data []byte, offset int64) (int, error) {
+	f.reads.Add(1)
+	if f.prePayloadReads != nil && f.payloadSeen != nil && !f.payloadSeen.Load() {
+		f.prePayloadReads.Add(1)
+	}
+	return f.StagingFile.ReadAt(data, offset)
+}
+
+func (f *observedStageFile) WriteAt(data []byte, offset int64) (int, error) {
+	f.writes.Add(1)
+	if f.writeErr != nil {
+		return 0, f.writeErr
+	}
+	return f.StagingFile.WriteAt(data, offset)
+}
+
 func TestTransferStagingAdmissionFailureIsFatalAndCleansWorkspace(t *testing.T) {
 	data := []byte("full")
 	meta := singleFileMeta(data)
@@ -1565,11 +1725,13 @@ func TestTransferStagingAdmissionFailureIsFatalAndCleansWorkspace(t *testing.T) 
 	conn, remoteDone := startFixturePeer(t, infoHash, []fixturePiece{{index: 0, data: data}}, false, false)
 	cache := filepath.Join(t.TempDir(), "cache")
 	stager := storage.NewStager(storage.StagerConfig{CacheRoot: cache, MaxPieces: 1, MaxBytes: int64(len(data) - 1)})
+	var observations []Diagnostic
 	transfer, err := NewTransfer(TransferConfig{
 		Selection: selection, Output: plan, Stager: stager,
 		LocalHandshake: peer.Handshake{InfoHash: infoHash, PeerID: [20]byte{4, 5, 6}},
 		Peers:          []ConnectedPeer{{ID: "storage-failure", Conn: conn, Handshake: peer.Handshake{InfoHash: infoHash, PeerID: [20]byte{3, 2, 1}}}},
 		PieceCount:     1, PieceLength: uint32(len(data)), LastPieceLength: uint32(len(data)),
+		OnDiagnostic: func(event Diagnostic) { observations = append(observations, event) },
 	})
 	if err != nil {
 		conn.Close()
@@ -1589,6 +1751,11 @@ func TestTransferStagingAdmissionFailureIsFatalAndCleansWorkspace(t *testing.T) 
 	if workspace := stager.Workspace(); workspace != "" {
 		if _, err := os.Stat(workspace); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("workspace still exists: %s (%v)", workspace, err)
+		}
+	}
+	for _, event := range observations {
+		if strings.Contains(event.Detail, "fatal staging failure") {
+			t.Fatalf("staging budget exhaustion reported as fatal storage failure: %+v", event)
 		}
 	}
 }
@@ -1611,7 +1778,13 @@ func TestTransferRejectsIncomingPayloadRequestWithoutUploading(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer listener.Close()
-	seenReject := make(chan bool, 1)
+	payloadRequests := []peer.Block{{Index: 0, Begin: 0, Length: 2}, {Index: 0, Begin: 2, Length: 2}}
+	metadataRequests := []uint32{0, 1}
+	payloadRejects := make(map[peer.Block]int)
+	metadataRejects := make(map[uint32]int)
+	var reads, prePayloadReads atomic.Int32
+	var payloadSeen atomic.Bool
+	var readsAfterRequests int32
 	serverDone := make(chan error, 1)
 	go func() {
 		conn, err := listener.Accept()
@@ -1624,14 +1797,23 @@ func TestTransferRejectsIncomingPayloadRequestWithoutUploading(t *testing.T) {
 			serverDone <- err
 			return
 		}
-		reserved := [8]byte{7: peer.FastExtensionBit}
+		reserved := [8]byte{5: 0x10, 7: peer.FastExtensionBit}
 		if err := peer.WriteHandshake(conn, infoHash, [20]byte{2, 3, 4}, reserved); err != nil {
 			serverDone <- err
 			return
 		}
-		requestPayload := make([]byte, 12)
-		binary.BigEndian.PutUint32(requestPayload[8:], uint32(len(data)))
-		if err := writeFixtureFrame(conn, peer.RequestID, requestPayload); err != nil {
+		options := peer.ReadOptions{Fast: true, MetadataExtensionID: 7}
+		message, err := peer.ReadMessageWithOptions(conn, options)
+		if err != nil || message.ID != peer.HaveNoneID {
+			serverDone <- fmt.Errorf("initial availability = %+v, %v; want Have None first", message, err)
+			return
+		}
+		message, err = peer.ReadMessageWithOptions(conn, options)
+		if err != nil || message.ID != peer.ExtendedID || len(message.Payload) == 0 || message.Payload[0] != peer.ExtensionHandshakeID {
+			serverDone <- fmt.Errorf("local extension handshake = %+v, %v", message, err)
+			return
+		}
+		if err := writeTestFrame(conn, extensionHandshakeFrame(7, (16<<10)+1)); err != nil {
 			serverDone <- err
 			return
 		}
@@ -1643,43 +1825,102 @@ func TestTransferRejectsIncomingPayloadRequestWithoutUploading(t *testing.T) {
 			serverDone <- err
 			return
 		}
-		gotReject := false
+		requested := false
+		for !requested {
+			message, err = peer.ReadMessageWithOptions(conn, options)
+			if err != nil {
+				serverDone <- err
+				return
+			}
+			if message.KeepAlive || message.ID == peer.InterestedID || message.ID == peer.NotInterestedID {
+				continue
+			}
+			if message.ID != peer.RequestID || len(message.Payload) != 12 || binary.BigEndian.Uint32(message.Payload[:4]) != 0 || binary.BigEndian.Uint32(message.Payload[4:8]) != 0 || binary.BigEndian.Uint32(message.Payload[8:12]) != uint32(len(data)) {
+				serverDone <- fmt.Errorf("unexpected download request: %x", message.Payload)
+				return
+			}
+			requested = true
+		}
+		for _, block := range payloadRequests {
+			request := make([]byte, 12)
+			binary.BigEndian.PutUint32(request[:4], block.Index)
+			binary.BigEndian.PutUint32(request[4:8], block.Begin)
+			binary.BigEndian.PutUint32(request[8:12], block.Length)
+			if err := writeFixtureFrame(conn, peer.RequestID, request); err != nil {
+				serverDone <- err
+				return
+			}
+		}
+		for _, piece := range metadataRequests {
+			if err := writeTestFrame(conn, metadataControlFrame(1, peer.MetadataRequest, piece)); err != nil {
+				serverDone <- err
+				return
+			}
+		}
+		// A valid Cancel has no upload response; it also must not access storage.
+		cancelRequest := make([]byte, 12)
+		binary.BigEndian.PutUint32(cancelRequest[8:], 1)
+		if err := writeFixtureFrame(conn, peer.CancelID, cancelRequest); err != nil {
+			serverDone <- err
+			return
+		}
+		for received := 0; received < len(payloadRequests)+len(metadataRequests); received++ {
+			message, err := peer.ReadMessageWithOptions(conn, options)
+			if err != nil {
+				serverDone <- err
+				return
+			}
+			switch message.ID {
+			case peer.RejectRequestID:
+				block := peer.Block{
+					Index:  binary.BigEndian.Uint32(message.Payload[:4]),
+					Begin:  binary.BigEndian.Uint32(message.Payload[4:8]),
+					Length: binary.BigEndian.Uint32(message.Payload[8:12]),
+				}
+				payloadRejects[block]++
+			case peer.ExtendedID:
+				if len(message.Payload) < 2 || message.Payload[0] != 7 {
+					serverDone <- fmt.Errorf("unexpected extension response: %x", message.Payload)
+					return
+				}
+				control, err := peer.ParseMetadataControl(message.Payload[1:])
+				if err != nil || control.Type != peer.MetadataReject {
+					serverDone <- fmt.Errorf("metadata response = %+v, %v; want reject", control, err)
+					return
+				}
+				metadataRejects[control.Piece]++
+			default:
+				serverDone <- fmt.Errorf("unexpected response to incoming request: id %d", message.ID)
+				return
+			}
+		}
+		readsAfterRequests = reads.Load()
+		payload := make([]byte, 8+len(data))
+		copy(payload[8:], data)
+		if err := writeFixtureFrame(conn, peer.PieceID, payload); err != nil {
+			serverDone <- err
+			return
+		}
 		for {
-			message, err := peer.ReadMessage(conn)
+			message, err := peer.ReadMessageWithOptions(conn, options)
 			if err != nil {
 				if peer.IsDisconnect(err) {
-					seenReject <- gotReject
 					serverDone <- nil
 				} else {
 					serverDone <- err
 				}
 				return
 			}
-			if message.KeepAlive || message.ID == peer.InterestedID {
-				continue
-			}
-			switch message.ID {
-			case peer.RejectRequestID:
-				gotReject = true
-			case peer.RequestID:
-				payload := make([]byte, 8+len(data))
-				copy(payload[8:], data)
-				binary.BigEndian.PutUint32(payload[8-4:8], 0)
-				if err := writeFixtureFrame(conn, peer.PieceID, payload); err != nil {
-					serverDone <- err
-					return
-				}
-			case peer.PieceID, peer.BitfieldID, peer.HaveID, peer.HaveAllID, peer.UnchokeID:
-				serverDone <- fmt.Errorf("forbidden upload message id %d", message.ID)
-				return
-			}
+			serverDone <- fmt.Errorf("unexpected message after download piece: id %d", message.ID)
+			return
 		}
 	}()
 	conn, err := net.Dial("tcp", listener.Addr().String())
 	if err != nil {
 		t.Fatal(err)
 	}
-	local := peer.Handshake{InfoHash: infoHash, PeerID: [20]byte{4, 5, 6}, Reserved: [8]byte{7: peer.FastExtensionBit}}
+	reserved := [8]byte{5: 0x10, 7: peer.FastExtensionBit}
+	local := peer.Handshake{InfoHash: infoHash, PeerID: [20]byte{4, 5, 6}, Reserved: reserved}
 	if err := peer.WriteHandshake(conn, local.InfoHash, local.PeerID, local.Reserved); err != nil {
 		t.Fatal(err)
 	}
@@ -1687,12 +1928,25 @@ func TestTransferRejectsIncomingPayloadRequestWithoutUploading(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	stager := storage.NewStager(storage.StagerConfig{
+		CacheRoot: filepath.Join(t.TempDir(), "cache"), MaxPieces: 1, MaxBytes: int64(len(data)),
+		OpenFile: func(path string, flag int, mode os.FileMode) (storage.StagingFile, error) {
+			file, err := os.OpenFile(path, flag, mode)
+			if err != nil {
+				return nil, err
+			}
+			return &observedStageFile{StagingFile: file, reads: &reads, prePayloadReads: &prePayloadReads, payloadSeen: &payloadSeen, writes: new(atomic.Int32)}, nil
+		},
+	})
 	transfer, err := NewTransfer(TransferConfig{
-		Selection: selection, Output: plan,
-		Stager:         storage.NewStager(storage.StagerConfig{CacheRoot: filepath.Join(t.TempDir(), "cache"), MaxPieces: 1, MaxBytes: int64(len(data))}),
+		Selection: selection, Output: plan, Stager: stager,
 		LocalHandshake: local,
 		Peers:          []ConnectedPeer{{ID: "requesting-peer", Conn: conn, Handshake: remote}},
 		PieceCount:     1, PieceLength: uint32(len(data)), LastPieceLength: uint32(len(data)),
+		OnPayloadReceived: func(int64) error {
+			payloadSeen.Store(true)
+			return nil
+		},
 	})
 	if err != nil {
 		conn.Close()
@@ -1706,8 +1960,163 @@ func TestTransferRejectsIncomingPayloadRequestWithoutUploading(t *testing.T) {
 	if err := <-serverDone; err != nil {
 		t.Fatal(err)
 	}
-	if !<-seenReject {
-		t.Fatal("incoming Fast request did not receive Reject Request")
+	for _, block := range payloadRequests {
+		if payloadRejects[block] != 1 {
+			t.Errorf("Fast payload request %v received %d rejects, want exactly one", block, payloadRejects[block])
+		}
+	}
+	for _, piece := range metadataRequests {
+		if metadataRejects[piece] != 1 {
+			t.Errorf("metadata request %d received %d rejects, want exactly one", piece, metadataRejects[piece])
+		}
+	}
+	if len(payloadRejects) != len(payloadRequests) || len(metadataRejects) != len(metadataRequests) {
+		t.Fatalf("unexpected rejection set: payload=%v metadata=%v", payloadRejects, metadataRejects)
+	}
+	if readsAfterRequests != 0 || prePayloadReads.Load() != 0 {
+		t.Fatalf("cache reads before payload acceptance: at rejection barrier=%d, total=%d; want zero", readsAfterRequests, prePayloadReads.Load())
+	}
+	if reads.Load() == 0 {
+		t.Fatal("cache read spy did not observe the normal finalizer read")
+	}
+	if output, err := os.ReadFile(filepath.Join(root, "fixture")); err != nil || string(output) != string(data) {
+		t.Fatalf("downloaded output = %q, err=%v; want %q", output, err, data)
+	}
+}
+
+func TestTransferIgnoresIncomingNonFastPayloadRequest(t *testing.T) {
+	data := []byte("plain")
+	meta := singleFileMeta(data)
+	selection, err := torrent.Select(meta, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	plan, err := storage.Validate(root, meta, selection.SelectedIndices())
+	if err != nil {
+		t.Fatal(err)
+	}
+	infoHash := [20]byte{14, 15, 16}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	var reads, prePayloadReads atomic.Int32
+	var payloadSeen atomic.Bool
+	serverDone := make(chan error, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		defer conn.Close()
+		if _, err := peer.ReadHandshake(conn, &infoHash, nil); err != nil {
+			serverDone <- err
+			return
+		}
+		if err := peer.WriteHandshake(conn, infoHash, [20]byte{17, 18, 19}, [8]byte{}); err != nil {
+			serverDone <- err
+			return
+		}
+		if err := writeFixtureFrame(conn, peer.BitfieldID, []byte{0x80}); err != nil {
+			serverDone <- err
+			return
+		}
+		if err := writeFixtureFrame(conn, peer.UnchokeID, nil); err != nil {
+			serverDone <- err
+			return
+		}
+		requested := false
+		for {
+			message, err := peer.ReadMessage(conn)
+			if err != nil {
+				if peer.IsDisconnect(err) && requested {
+					serverDone <- nil
+				} else {
+					serverDone <- err
+				}
+				return
+			}
+			if message.KeepAlive || message.ID == peer.InterestedID || message.ID == peer.NotInterestedID {
+				continue
+			}
+			if message.ID != peer.RequestID || requested {
+				serverDone <- fmt.Errorf("unexpected response to non-Fast request: id %d", message.ID)
+				return
+			}
+			if len(message.Payload) != 12 || binary.BigEndian.Uint32(message.Payload[8:12]) != uint32(len(data)) {
+				serverDone <- fmt.Errorf("unexpected download request: %x", message.Payload)
+				return
+			}
+			request := make([]byte, 12)
+			binary.BigEndian.PutUint32(request[8:], uint32(len(data)))
+			if err := writeFixtureFrame(conn, peer.RequestID, request); err != nil {
+				serverDone <- err
+				return
+			}
+			requested = true
+			payload := make([]byte, 8+len(data))
+			copy(payload[8:], data)
+			if err := writeFixtureFrame(conn, peer.PieceID, payload); err != nil {
+				serverDone <- err
+				return
+			}
+		}
+	}()
+	conn, err := net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	local := peer.Handshake{InfoHash: infoHash, PeerID: [20]byte{4, 5, 6}}
+	if err := peer.WriteHandshake(conn, local.InfoHash, local.PeerID, local.Reserved); err != nil {
+		t.Fatal(err)
+	}
+	remote, err := peer.ReadHandshake(conn, &infoHash, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stager := storage.NewStager(storage.StagerConfig{
+		CacheRoot: filepath.Join(t.TempDir(), "cache"), MaxPieces: 1, MaxBytes: int64(len(data)),
+		OpenFile: func(path string, flag int, mode os.FileMode) (storage.StagingFile, error) {
+			file, err := os.OpenFile(path, flag, mode)
+			if err != nil {
+				return nil, err
+			}
+			return &observedStageFile{StagingFile: file, reads: &reads, prePayloadReads: &prePayloadReads, payloadSeen: &payloadSeen, writes: new(atomic.Int32)}, nil
+		},
+	})
+	transfer, err := NewTransfer(TransferConfig{
+		Selection: selection, Output: plan, Stager: stager,
+		LocalHandshake: local,
+		Peers:          []ConnectedPeer{{ID: "non-fast-requester", Conn: conn, Handshake: remote}},
+		PieceCount:     1, PieceLength: uint32(len(data)), LastPieceLength: uint32(len(data)),
+		OnPayloadReceived: func(int64) error {
+			payloadSeen.Store(true)
+			return nil
+		},
+	})
+	if err != nil {
+		conn.Close()
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := transfer.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-serverDone; err != nil {
+		t.Fatal(err)
+	}
+	if prePayloadReads.Load() != 0 {
+		t.Fatalf("cache reads before payload acceptance = %d, want zero for ignored request", prePayloadReads.Load())
+	}
+	if reads.Load() == 0 {
+		t.Fatal("cache read spy did not observe the normal finalizer read")
+	}
+	if output, err := os.ReadFile(filepath.Join(root, "fixture")); err != nil || string(output) != string(data) {
+		t.Fatalf("downloaded output = %q, err=%v; want %q", output, err, data)
 	}
 }
 

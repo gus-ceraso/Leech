@@ -314,6 +314,7 @@ func (t *Transfer) Run(ctx context.Context) error {
 		return err
 	}
 	if err := t.stager.Start(ctx); err != nil {
+		t.observeStagingFailure("cache start", err)
 		t.releaseInitialPeers()
 		return t.stager.Cleanup(err)
 	}
@@ -650,6 +651,7 @@ func (t *Transfer) drive(ctx context.Context, peers *[]*transferPeer) error {
 			}
 			stage, err := t.stager.AdmitPiece(mapping.Piece)
 			if err != nil {
+				t.observeStagingFailure("piece admission", err)
 				_ = t.scheduler.RejectPiece(offer)
 				return err
 			}
@@ -973,6 +975,15 @@ func (t *Transfer) observeSession(detail string, count uint64) {
 	t.observeCount(nil, detail, count, "")
 }
 
+// observeStagingFailure reports only errors the stager classified as fatal.
+// Operation labels are fixed at the call sites; raw storage errors and payload
+// details never enter the bounded diagnostic.
+func (t *Transfer) observeStagingFailure(operation string, err error) {
+	if errors.Is(err, storage.ErrStagingFatal) {
+		t.observeSession("fatal staging failure: "+operation, 0)
+	}
+}
+
 func (t *Transfer) reportPeerActivity(peers []*transferPeer) {
 	for _, p := range peers {
 		if p == nil || p.done {
@@ -1186,6 +1197,7 @@ func (t *Transfer) handleEventWithPeers(ctx context.Context, peers []*transferPe
 				return fmt.Errorf("%w: piece %d has no stage", ErrTransferConfig, block.Index)
 			}
 			if err := stage.WriteBlockContext(ctx, int64(block.Begin), data); err != nil {
+				t.observeStagingFailure("block write", err)
 				return err
 			}
 			p.lastUseful = t.clock()
