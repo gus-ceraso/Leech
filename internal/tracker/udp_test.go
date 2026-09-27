@@ -905,6 +905,27 @@ func TestUDPRotatingEndpointsRetainBoundedSessions(t *testing.T) {
 		t.Fatalf("observed peak sessions=%d open sockets=%d, capacity=%d", maxSessions.Load(), maxOpen.Load(), udpSessionCapacity)
 	}
 
+	// Pressure has verified the busy IPv6 entry was not evicted. Finish and
+	// join it before selecting idle retained endpoints from either family.
+	releaseBusy()
+	select {
+	case outcome := <-busyDone:
+		busyJoined = true
+		if outcome.err != nil {
+			t.Fatalf("held IPv6 announce: %v", outcome.err)
+		}
+		validateResult(outcome.result, busyEndpoint)
+	case <-time.After(time.Second):
+		t.Fatal("held IPv6 announce did not finish after release")
+	}
+	checkBounds()
+	client.mu.Lock()
+	busyUsers = busySession.users
+	client.mu.Unlock()
+	if busyUsers != 0 {
+		t.Fatalf("joined IPv6 announce leaked %d session users", busyUsers)
+	}
+
 	client.mu.Lock()
 	retained4, retained6 := 0, 0
 	for _, session := range client.sessions {
@@ -1032,19 +1053,19 @@ func TestUDPRotatingEndpointsRetainBoundedSessions(t *testing.T) {
 	if maxOpen.Load() > udpSessionCapacity || maxSessions.Load() > udpSessionCapacity {
 		t.Fatalf("replacement exceeded capacity: peak sessions=%d open sockets=%d", maxSessions.Load(), maxOpen.Load())
 	}
-
-	releaseBusy()
-	select {
-	case outcome := <-busyDone:
-		busyJoined = true
-		if outcome.err != nil {
-			t.Fatalf("held IPv6 announce: %v", outcome.err)
+	client.mu.Lock()
+	for _, session := range client.sessions {
+		if session.users != 0 {
+			client.mu.Unlock()
+			t.Fatalf("endpoint %s leaked %d session users", session.endpoint, session.users)
 		}
-		validateResult(outcome.result, busyEndpoint)
-	case <-time.After(time.Second):
-		t.Fatal("held IPv6 announce did not finish after release")
 	}
-	checkBounds()
+	client.mu.Unlock()
+	for _, socket := range snapshotSockets() {
+		if reads := socket.conn.activeReads.Load(); reads != 0 {
+			t.Fatalf("fixture socket for %s has %d active readers", socket.endpoint, reads)
+		}
+	}
 }
 
 func TestUDPTransactionLockWaiterKeepsSessionFromEviction(t *testing.T) {
