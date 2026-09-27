@@ -647,83 +647,389 @@ func TestUDPConnectionIDReuseAndExpiry(t *testing.T) {
 
 func TestUDPRotatingEndpointsRetainBoundedSessions(t *testing.T) {
 	const endpointCount = 2*udpSessionCapacity + 1
-	var selected net.IPAddr
+	busyEndpoint := netip.MustParseAddrPort("[2001:db8::ffff]:1")
+	busyIP := net.IPAddr{IP: net.ParseIP("2001:db8::ffff")}
+	var selectionMu sync.RWMutex
+	selected := busyIP
 	resolver := fixtureResolverFunc(func(context.Context, string) ([]net.IPAddr, error) {
-		return []net.IPAddr{selected}, nil
+		selectionMu.RLock()
+		ip := net.IPAddr{IP: append(net.IP(nil), selected.IP...), Zone: selected.Zone}
+		selectionMu.RUnlock()
+		return []net.IPAddr{ip}, nil
 	})
-	var created []*fixtureConn
-	var open atomic.Int32
-	dialer := fixtureDialFunc(func(_ context.Context, _ string, address string) (net.Conn, error) {
-		seq := len(created) + 1
+	setSelected := func(ip net.IPAddr) {
+		selectionMu.Lock()
+		selected = net.IPAddr{IP: append(net.IP(nil), ip.IP...), Zone: ip.Zone}
+		selectionMu.Unlock()
+	}
+	type socketRecord struct {
+		endpoint netip.AddrPort
+		id       uint64
+		conn     *fixtureConn
+	}
+	var socketsMu sync.Mutex
+	var sockets []socketRecord
+	var open, maxOpen, maxSessions atomic.Int32
+	recordMaximum := func(counter *atomic.Int32, value int32) {
+		for old := counter.Load(); value > old; old = counter.Load() {
+			if counter.CompareAndSwap(old, value) {
+				return
+			}
+		}
+	}
+	busyAnnounceEntered := make(chan struct{})
+	var busyAnnounceOnce sync.Once
+	busyRelease := make(chan struct{})
+	var busyReleaseOnce sync.Once
+	releaseBusy := func() { busyReleaseOnce.Do(func() { close(busyRelease) }) }
+	clock := newFixtureClock()
+	var client *UDPClient
+	dialer := fixtureDialFunc(func(_ context.Context, network, address string) (net.Conn, error) {
+		endpoint, err := netip.ParseAddrPort(address)
+		if err != nil {
+			return nil, err
+		}
+		if endpoint.Addr().Is4() && network != "udp4" || endpoint.Addr().Is6() && network != "udp6" {
+			return nil, errors.New("UDP socket family does not match endpoint")
+		}
+		socketsMu.Lock()
+		id := uint64(len(sockets) + 1)
 		var conn *fixtureConn
 		conn = newFixtureConn(func(packet []byte) {
+			tx := packet[12:16]
 			switch binary.BigEndian.Uint32(packet[8:12]) {
 			case 0:
-				conn.push(connectResponse(packet, uint64(seq)))
+				// BEP 15 connect response: action, transaction ID, connection ID.
+				conn.push([]byte{
+					0, 0, 0, 0, tx[0], tx[1], tx[2], tx[3],
+					byte(id >> 56), byte(id >> 48), byte(id >> 40), byte(id >> 32),
+					byte(id >> 24), byte(id >> 16), byte(id >> 8), byte(id),
+				})
 			case 1:
-				conn.push(announceResponse(packet))
+				if endpoint == busyEndpoint {
+					busyAnnounceOnce.Do(func() { close(busyAnnounceEntered) })
+					<-busyRelease
+				}
+				if endpoint.Addr().Is4() {
+					// Independent BEP 15 IPv4 announce response and one compact peer.
+					conn.push([]byte{
+						0, 0, 0, 1, tx[0], tx[1], tx[2], tx[3],
+						0, 0, 0, 60, 0, 0, 0, 4, 0, 0, 0, 5,
+						203, 0, 113, 9, 0x1a, 0xe1,
+					})
+				} else {
+					// Independent BEP 15 IPv6 announce response and one 18-byte peer.
+					conn.push([]byte{
+						0, 0, 0, 1, tx[0], tx[1], tx[2], tx[3],
+						0, 0, 0, 60, 0, 0, 0, 4, 0, 0, 0, 5,
+						0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0,
+						0, 0, 0, 0, 0, 0, 0, 0x99, 0x1a, 0xe2,
+					})
+				}
 			}
 		})
 		conn.onClose = func() { open.Add(-1) }
-		created = append(created, conn)
-		open.Add(1)
+		sockets = append(sockets, socketRecord{endpoint: endpoint, id: id, conn: conn})
+		socketsMu.Unlock()
+		currentOpen := open.Add(1)
+		recordMaximum(&maxOpen, currentOpen)
+		client.mu.Lock()
+		currentSessions := len(client.sessions)
+		client.mu.Unlock()
+		recordMaximum(&maxSessions, int32(currentSessions))
 		return conn, nil
 	})
-	client := NewUDPClient(Config{Resolver: resolver, Dialer: dialer, Clock: newFixtureClock()})
-	defer client.Close()
+	client = NewUDPClient(Config{Resolver: resolver, Dialer: dialer, Clock: clock})
+	var busyJoined bool
+	busyDone := make(chan struct {
+		result AnnounceResult
+		err    error
+	}, 1)
+	t.Cleanup(func() {
+		releaseBusy()
+		if !busyJoined {
+			select {
+			case <-busyDone:
+			case <-time.After(time.Second):
+				t.Error("timed out joining the held IPv6 announce")
+			}
+		}
+		if err := client.Close(); err != nil {
+			t.Errorf("client close: %v", err)
+		}
+	})
 
 	addresses := make([]net.IPAddr, endpointCount)
+	endpoints := make([]netip.AddrPort, endpointCount)
 	for i := range addresses {
-		addresses[i] = net.IPAddr{IP: net.IPv4(10, byte(i>>8), byte(i), 1)}
-		selected = addresses[i]
-		result, err := client.Announce(context.Background(), "udp://tracker.test:1", testRequest())
-		if err != nil || !result.Transmitted {
-			t.Fatalf("announce endpoint %d: result=%+v err=%v", i, result, err)
+		var ip net.IP
+		var addr netip.Addr
+		if i%2 == 0 {
+			raw := [4]byte{10, byte(i >> 16), byte(i >> 8), byte(i)}
+			ip, addr = net.IP(raw[:]), netip.AddrFrom4(raw)
+		} else {
+			raw := [16]byte{0x20, 0x01, 0x0d, 0xb8}
+			binary.BigEndian.PutUint64(raw[8:], uint64(i+1))
+			ip, addr = net.IP(raw[:]), netip.AddrFrom16(raw)
 		}
-		if got := len(client.sessions); got > udpSessionCapacity {
-			t.Fatalf("retained %d sessions, capacity %d", got, udpSessionCapacity)
+		addresses[i] = net.IPAddr{IP: ip}
+		endpoints[i] = netip.AddrPortFrom(addr, 1)
+	}
+
+	validateResult := func(result AnnounceResult, endpoint netip.AddrPort) {
+		t.Helper()
+		if !result.Transmitted || result.Interval != time.Minute || len(result.Families) != 1 || result.Families[0].Endpoint != endpoint || result.Families[0].Err != nil {
+			t.Fatalf("announce %s result = %+v", endpoint, result)
+		}
+		wantPeer := netip.MustParseAddrPort("[2001:db8::99]:6882")
+		if endpoint.Addr().Is4() {
+			wantPeer = netip.MustParseAddrPort("203.0.113.9:6881")
+		}
+		if len(result.Peers) != 1 || result.Peers[0] != wantPeer {
+			t.Fatalf("announce %s peers = %v, want %s", endpoint, result.Peers, wantPeer)
+		}
+	}
+	announce := func(ip net.IPAddr, endpoint netip.AddrPort) AnnounceResult {
+		t.Helper()
+		setSelected(ip)
+		result, err := client.Announce(context.Background(), "udp://tracker.test:1", testRequest())
+		if err != nil {
+			t.Fatalf("announce endpoint %s: %v", endpoint, err)
+		}
+		validateResult(result, endpoint)
+		return result
+	}
+	snapshotSockets := func() []socketRecord {
+		socketsMu.Lock()
+		defer socketsMu.Unlock()
+		return append([]socketRecord(nil), sockets...)
+	}
+	checkBounds := func() {
+		t.Helper()
+		client.mu.Lock()
+		retained := len(client.sessions)
+		client.mu.Unlock()
+		recordMaximum(&maxSessions, int32(retained))
+		if retained > udpSessionCapacity {
+			t.Fatalf("retained %d sessions, capacity %d", retained, udpSessionCapacity)
 		}
 		if got := open.Load(); got > udpSessionCapacity {
 			t.Fatalf("owned %d open sockets, capacity %d", got, udpSessionCapacity)
 		}
 	}
-	if len(created) != endpointCount || open.Load() != udpSessionCapacity {
-		t.Fatalf("created=%d open=%d, want %d and %d", len(created), open.Load(), endpointCount, udpSessionCapacity)
-	}
-	evicted := -1
-	for i, conn := range created {
+	closed := func(conn *fixtureConn) bool {
 		select {
 		case <-conn.closed:
-			if evicted < 0 {
-				evicted = i
-			}
+			return true
 		default:
+			return false
 		}
 	}
-	if evicted < 0 {
-		t.Fatal("no endpoint socket was retired")
+	findSocket := func(endpoint netip.AddrPort) socketRecord {
+		t.Helper()
+		for _, socket := range snapshotSockets() {
+			if socket.endpoint == endpoint {
+				return socket
+			}
+		}
+		t.Fatalf("no fixture socket for %s", endpoint)
+		return socketRecord{}
+	}
+	findLatestSocket := func(endpoint netip.AddrPort) socketRecord {
+		t.Helper()
+		all := snapshotSockets()
+		for i := len(all) - 1; i >= 0; i-- {
+			if all[i].endpoint == endpoint {
+				return all[i]
+			}
+		}
+		t.Fatalf("no fixture socket for %s", endpoint)
+		return socketRecord{}
+	}
+	verifyNewSocket := func(socket socketRecord) {
+		t.Helper()
+		if socket.conn.writeCount() != 2 {
+			t.Fatalf("fresh socket for %s writes = %d, want connect then announce", socket.endpoint, socket.conn.writeCount())
+		}
+		connect, announce := socket.conn.writeAt(0), socket.conn.writeAt(1)
+		if binary.BigEndian.Uint32(connect[8:12]) != 0 || binary.BigEndian.Uint32(announce[8:12]) != 1 || binary.BigEndian.Uint64(announce[:8]) != socket.id {
+			t.Fatalf("fresh socket for %s did not connect before announcing with ID %d", socket.endpoint, socket.id)
+		}
 	}
 
-	// The most recently retained endpoint keeps its connection ID and socket.
-	selected = addresses[endpointCount-1]
-	if _, err := client.Announce(context.Background(), "udp://tracker.test:1", testRequest()); err != nil {
-		t.Fatal(err)
+	// Hold one IPv6 transaction active while more than twice the cache capacity
+	// in mixed-family endpoints rotate through the actual production bound.
+	setSelected(busyIP)
+	go func() {
+		result, err := client.Announce(context.Background(), "udp://tracker.test:1", testRequest())
+		busyDone <- struct {
+			result AnnounceResult
+			err    error
+		}{result, err}
+	}()
+	select {
+	case <-busyAnnounceEntered:
+	case <-time.After(time.Second):
+		t.Fatal("IPv6 transaction did not become busy")
 	}
-	if len(created) != endpointCount || binary.BigEndian.Uint64(created[endpointCount-1].writeAt(1)[:8]) != uint64(endpointCount) {
-		t.Fatal("retained endpoint did not reuse its connection ID")
+	busyKey := sessionKey(&udpSession{endpoint: busyEndpoint})
+	client.mu.Lock()
+	busySession := client.sessions[busyKey]
+	busyUsers := 0
+	if busySession != nil {
+		busyUsers = busySession.users
+	}
+	client.mu.Unlock()
+	if busySession == nil || busyUsers != 1 {
+		t.Fatalf("busy IPv6 session = %p with %d users, want one active user", busySession, busyUsers)
+	}
+	busySocket := findSocket(busyEndpoint)
+
+	for i, endpoint := range endpoints {
+		announce(addresses[i], endpoint)
+		checkBounds()
+		client.mu.Lock()
+		stillBusy := client.sessions[busyKey] == busySession && busySession.users == 1
+		client.mu.Unlock()
+		if !stillBusy || closed(busySocket.conn) {
+			t.Fatal("capacity pressure retired the active IPv6 session")
+		}
+	}
+	if got := len(snapshotSockets()); got != endpointCount+1 || open.Load() != udpSessionCapacity {
+		t.Fatalf("rotated endpoints: created=%d open=%d, want %d and %d", got, open.Load(), endpointCount+1, udpSessionCapacity)
+	}
+	if maxOpen.Load() > udpSessionCapacity || maxSessions.Load() > udpSessionCapacity {
+		t.Fatalf("observed peak sessions=%d open sockets=%d, capacity=%d", maxSessions.Load(), maxOpen.Load(), udpSessionCapacity)
 	}
 
-	// An evicted endpoint reconnects and receives a fresh ID.
-	selected = addresses[evicted]
-	if _, err := client.Announce(context.Background(), "udp://tracker.test:1", testRequest()); err != nil {
-		t.Fatal(err)
+	client.mu.Lock()
+	retained4, retained6 := 0, 0
+	for _, session := range client.sessions {
+		session.connMu.RLock()
+		conn := session.conn
+		session.connMu.RUnlock()
+		fixture, ok := conn.(*fixtureConn)
+		if !ok || closed(fixture) {
+			client.mu.Unlock()
+			t.Fatalf("retained endpoint %s has no open fixture socket", session.endpoint)
+		}
+		if session.endpoint.Addr().Is4() {
+			retained4++
+		} else {
+			retained6++
+		}
 	}
-	if len(created) != endpointCount+1 || binary.BigEndian.Uint64(created[endpointCount].writeAt(1)[:8]) != endpointCount+1 {
-		t.Fatal("evicted endpoint did not reconnect with a fresh connection ID")
+	client.mu.Unlock()
+	if retained4 == 0 || retained6 == 0 || retained4+retained6 != udpSessionCapacity || int32(retained4+retained6) != open.Load() {
+		t.Fatalf("retained family sessions: IPv4=%d IPv6=%d open=%d, want both within total capacity %d", retained4, retained6, open.Load(), udpSessionCapacity)
 	}
-	if got := open.Load(); got != udpSessionCapacity {
-		t.Fatalf("open sockets after replacement = %d, want %d", got, udpSessionCapacity)
+	retired4, retired6 := 0, 0
+	evicted := make(map[bool]netip.AddrPort, 2)
+	for _, socket := range snapshotSockets() {
+		if !closed(socket.conn) {
+			continue
+		}
+		family := socket.endpoint.Addr().Is4()
+		if family {
+			retired4++
+		} else {
+			retired6++
+		}
+		if socket.endpoint != busyEndpoint {
+			if _, found := evicted[family]; !found {
+				evicted[family] = socket.endpoint
+			}
+		}
+		client.mu.Lock()
+		stillOwned := false
+		if session := client.sessions[sessionKey(&udpSession{endpoint: socket.endpoint})]; session != nil {
+			session.connMu.RLock()
+			stillOwned = session.conn == socket.conn
+			session.connMu.RUnlock()
+		}
+		client.mu.Unlock()
+		if stillOwned {
+			t.Fatalf("retired socket for %s remains owned", socket.endpoint)
+		}
 	}
+	if retired4 == 0 || retired6 == 0 || retired4+retired6 < endpointCount+1-udpSessionCapacity {
+		t.Fatalf("retired family sockets: IPv4=%d IPv6=%d", retired4, retired6)
+	}
+
+	// Both families' recent endpoints retain their IDs and sockets.
+	retainedV6, retainedV4 := endpoints[endpointCount-2], endpoints[endpointCount-1]
+	for _, index := range []int{endpointCount - 2, endpointCount - 1} {
+		endpoint, oldSocket := endpoints[index], findSocket(endpoints[index])
+		if closed(oldSocket.conn) {
+			t.Fatalf("recent endpoint %s was retired", endpoint)
+		}
+		writes := oldSocket.conn.writeCount()
+		announce(addresses[index], endpoint)
+		if oldSocket.conn.writeCount() != writes+1 || binary.BigEndian.Uint64(oldSocket.conn.writeAt(writes)[:8]) != oldSocket.id {
+			t.Fatalf("retained endpoint %s did not reuse connection ID %d", endpoint, oldSocket.id)
+		}
+	}
+	if got := len(snapshotSockets()); got != endpointCount+1 {
+		t.Fatalf("retained revisits opened %d sockets, want none", got-endpointCount-1)
+	}
+
+	// Expired IPv4 and IPv6 IDs must reconnect before the next announce.
+	clock.advance(connectionLife + time.Second)
+	for _, endpoint := range []netip.AddrPort{retainedV6, retainedV4} {
+		oldSocket := findSocket(endpoint)
+		setIndex := endpointCount - 1
+		if endpoint.Addr().Is6() {
+			setIndex = endpointCount - 2
+		}
+		before := len(snapshotSockets())
+		announce(addresses[setIndex], endpoint)
+		freshSocket := findLatestSocket(endpoint)
+		if len(snapshotSockets()) != before+1 || freshSocket.conn == oldSocket.conn || !closed(oldSocket.conn) {
+			t.Fatalf("expired endpoint %s did not replace its old socket", endpoint)
+		}
+		verifyNewSocket(freshSocket)
+		checkBounds()
+	}
+
+	// At least one retired endpoint from each family reconnects with a new ID.
+	for _, is4 := range []bool{true, false} {
+		endpoint, ok := evicted[is4]
+		if !ok {
+			t.Fatalf("no retired %s endpoint to revisit", map[bool]string{true: "IPv4", false: "IPv6"}[is4])
+		}
+		oldSocket := findSocket(endpoint)
+		client.mu.Lock()
+		stillRetained := client.sessions[sessionKey(&udpSession{endpoint: endpoint})] != nil
+		client.mu.Unlock()
+		if stillRetained {
+			t.Fatalf("evicted endpoint %s remains in the cache", endpoint)
+		}
+		before := len(snapshotSockets())
+		ip := net.IPAddr{IP: net.IP(endpoint.Addr().AsSlice())}
+		announce(ip, endpoint)
+		freshSocket := findLatestSocket(endpoint)
+		if len(snapshotSockets()) != before+1 || freshSocket.conn == oldSocket.conn || freshSocket.id == oldSocket.id {
+			t.Fatalf("evicted endpoint %s did not reconnect with a fresh ID", endpoint)
+		}
+		verifyNewSocket(freshSocket)
+		checkBounds()
+	}
+	if maxOpen.Load() > udpSessionCapacity || maxSessions.Load() > udpSessionCapacity {
+		t.Fatalf("replacement exceeded capacity: peak sessions=%d open sockets=%d", maxSessions.Load(), maxOpen.Load())
+	}
+
+	releaseBusy()
+	select {
+	case outcome := <-busyDone:
+		busyJoined = true
+		if outcome.err != nil {
+			t.Fatalf("held IPv6 announce: %v", outcome.err)
+		}
+		validateResult(outcome.result, busyEndpoint)
+	case <-time.After(time.Second):
+		t.Fatal("held IPv6 announce did not finish after release")
+	}
+	checkBounds()
 }
 
 func TestUDPTransactionLockWaiterKeepsSessionFromEviction(t *testing.T) {
