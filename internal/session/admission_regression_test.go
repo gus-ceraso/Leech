@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -87,6 +88,36 @@ func TestAdmissionAdvancesExaminedCandidates(t *testing.T) {
 			var mu sync.Mutex
 			var attempts []string
 			var workers sync.WaitGroup
+			var incumbentClosed chan struct{}
+			var closeIncumbent sync.Once
+			var collisionAtAdmission chan struct {
+				event          Diagnostic
+				incumbentAlive bool
+			}
+			if mode == "live-ID-collision" {
+				incumbentClosed = make(chan struct{})
+				collisionAtAdmission = make(chan struct {
+					event          Diagnostic
+					incumbentAlive bool
+				}, 1)
+				c.config.OnDiagnostic = func(event Diagnostic) {
+					if event.Kind == DiagnosticTransportRace && strings.HasPrefix(event.Detail, "peer ID collision;") {
+						retained := true
+						select {
+						case <-incumbentClosed:
+							retained = false
+						default:
+						}
+						select {
+						case collisionAtAdmission <- struct {
+							event          Diagnostic
+							incumbentAlive bool
+						}{event: event, incumbentAlive: retained}:
+						default:
+						}
+					}
+				}
+			}
 			c.config.TCPDial = func(_ context.Context, _, address string) (net.Conn, error) {
 				mu.Lock()
 				attempts = append(attempts, address)
@@ -99,6 +130,9 @@ func TestAdmissionAdvancesExaminedCandidates(t *testing.T) {
 				go func() {
 					defer workers.Done()
 					defer server.Close()
+					if mode == "live-ID-collision" && address == first.String() {
+						defer closeIncumbent.Do(func() { close(incumbentClosed) })
+					}
 					if _, err := peer.ReadHandshake(server, (*[20]byte)(&meta.InfoHash), nil); err != nil {
 						return
 					}
@@ -140,6 +174,22 @@ func TestAdmissionAdvancesExaminedCandidates(t *testing.T) {
 			mu.Unlock()
 			if mode == "backoff" {
 				order = order[1:]
+			}
+			if mode == "live-ID-collision" {
+				select {
+				case collision := <-collisionAtAdmission:
+					if !collision.incumbentAlive {
+						t.Fatal("peer-ID collision closed the older live connection before transfer completion")
+					}
+					if collision.event.Peer != order[1] || collision.event.Detail != "peer ID collision; older connection retained; winner=tcp" {
+						t.Fatalf("local collision diagnostic = %+v", collision.event)
+					}
+				case <-time.After(time.Second):
+					t.Fatal("local session did not report its live peer-ID collision")
+				}
+				if len(c.strikes) != 0 || !c.backoff.Ready(first, time.Now().Add(time.Hour)) || !c.backoff.Ready(order[1], time.Now().Add(time.Hour)) {
+					t.Fatalf("peer-ID collision changed endpoint penalties: strikes=%v firstReady=%v collisionReady=%v", c.strikes, c.backoff.Ready(first, time.Now().Add(time.Hour)), c.backoff.Ready(order[1], time.Now().Add(time.Hour)))
+				}
 			}
 			want := make([]string, len(order))
 			for i, e := range order {

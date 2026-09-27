@@ -1317,11 +1317,12 @@ func (t *Transfer) finalizePiece(ctx context.Context, index, activePeers int) er
 			for _, endpoint := range verification.Blacklisted {
 				t.notifyBlacklisted(endpoint)
 			}
-			t.observeSession(fmt.Sprintf("piece %d hash mismatch; retry scheduled", index), uint64(len(verification.Strikes)))
 			if fatal := t.stager.Fatal(); fatal != nil {
+				t.observeSession(fmt.Sprintf("piece %d hash mismatch; fatal staging failure", index), uint64(len(verification.Strikes)))
 				t.observeSession("fatal staging failure during hash retry", 0)
 				return errors.Join(verifyErr, fatal)
 			}
+			t.observeSession(fmt.Sprintf("piece %d hash mismatch; retry scheduled", index), uint64(len(verification.Strikes)))
 			return verifyErr
 		}
 		if errors.Is(err, storage.ErrStagingFatal) {

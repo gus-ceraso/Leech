@@ -1176,6 +1176,11 @@ type v1PeerFixture struct {
 	stall           bool
 	withhold        bool
 	partial         bool
+	duplicateHave   bool
+	diagnosticChurn int
+	requestSeen     chan struct{}
+	releasePiece    chan struct{}
+	requestOnce     sync.Once
 	failAfterFirst  bool
 	calls           atomic.Int32
 	done            chan error
@@ -1286,6 +1291,23 @@ func (f *v1PeerFixture) serveTransfer(conn net.Conn) error {
 	if err := v1WriteFrame(conn, v1RawMessage(peer.BitfieldID, bitfield)); err != nil {
 		return err
 	}
+	for range f.diagnosticChurn {
+		if err := v1WriteFrame(conn, v1RawMessage(peer.ChokeID, nil)); err != nil {
+			return err
+		}
+		if err := v1WriteFrame(conn, v1RawMessage(peer.UnchokeID, nil)); err != nil {
+			return err
+		}
+	}
+	if f.duplicateHave {
+		have := make([]byte, 4)
+		if err := v1WriteFrame(conn, v1RawMessage(peer.HaveID, have)); err != nil {
+			return err
+		}
+		if err := v1WriteFrame(conn, v1RawMessage(peer.HaveID, have)); err != nil {
+			return err
+		}
+	}
 	if f.stall {
 		_, err := io.Copy(io.Discard, conn)
 		return err
@@ -1349,6 +1371,12 @@ func (f *v1PeerFixture) serveTransfer(conn net.Conn) error {
 					return err
 				}
 				requested = true
+				if f.requestSeen != nil {
+					f.requestOnce.Do(func() { close(f.requestSeen) })
+				}
+				if f.releasePiece != nil {
+					<-f.releasePiece
+				}
 			}
 			piece := make([]byte, 8+int(length))
 			binary.BigEndian.PutUint32(piece[:4], index)

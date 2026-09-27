@@ -992,7 +992,7 @@ func TestFinalizePieceCorruptStageCloseFailurePropagatesFatal(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(root, "fixture")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("corrupt output exists or stat failed: %v", err)
 	}
-	if len(observations) != 2 || observations[0].Detail != "piece 0 hash mismatch; retry scheduled" || observations[1].Detail != "fatal staging failure during hash retry" {
+	if len(observations) != 2 || observations[0].Detail != "piece 0 hash mismatch; fatal staging failure" || observations[1].Detail != "fatal staging failure during hash retry" {
 		t.Fatalf("hash/fatal diagnostics = %+v", observations)
 	}
 	_ = stager.Cleanup(nil)
@@ -1036,11 +1036,13 @@ func TestTransferFatalCorruptStageCloseFailureShutsDownImmediately(t *testing.T)
 	})
 	infoHash := [20]byte{1, 3, 5}
 	conn, remoteDone := startFixturePeer(t, infoHash, []fixturePiece{{index: 0, data: data}}, true, false)
+	var observations []Diagnostic
 	transfer, err := NewTransfer(TransferConfig{
 		Selection: selection, Output: plan, Stager: stager,
 		LocalHandshake: peer.Handshake{InfoHash: infoHash, PeerID: [20]byte{4, 5, 6}},
 		Peers:          []ConnectedPeer{{ID: "fatal-peer", Endpoint: endpoint(1), Conn: conn, Handshake: peer.Handshake{InfoHash: infoHash, PeerID: [20]byte{3, 2, 1}}}},
 		PieceCount:     1, PieceLength: uint32(len(data)), LastPieceLength: uint32(len(data)),
+		OnDiagnostic: func(event Diagnostic) { observations = append(observations, event) },
 	})
 	if err != nil {
 		conn.Close()
@@ -1070,6 +1072,20 @@ func TestTransferFatalCorruptStageCloseFailureShutsDownImmediately(t *testing.T)
 	if got := transfer.scheduler.StrikeCount(endpoint(1)); got != 1 {
 		t.Fatalf("contributor strikes = %d, want exactly one", got)
 	}
+	fatalMismatch, fatalStorage, retryScheduled := 0, 0, 0
+	for _, event := range observations {
+		switch event.Detail {
+		case "piece 0 hash mismatch; fatal staging failure":
+			fatalMismatch++
+		case "fatal staging failure during hash retry":
+			fatalStorage++
+		case "piece 0 hash mismatch; retry scheduled":
+			retryScheduled++
+		}
+	}
+	if fatalMismatch != 1 || fatalStorage != 1 || retryScheduled != 0 {
+		t.Fatalf("fatal hash diagnostics = %+v", observations)
+	}
 	if output, err := os.ReadFile(filepath.Join(root, "fixture")); err != nil || len(output) != 0 {
 		t.Fatalf("corrupt output = %q, err=%v; want empty prepared output", output, err)
 	}
@@ -1089,6 +1105,7 @@ func TestTransferCorruptPieceRetriesWithoutOutput(t *testing.T) {
 	}
 	conn, remoteDone := startFixturePeer(t, [20]byte{1, 3, 5}, []fixturePiece{{index: 0, data: data}}, true, false)
 	var payloadBytes []int64
+	var observations []Diagnostic
 	transfer, err := NewTransfer(TransferConfig{
 		Selection:      selection,
 		Output:         plan,
@@ -1100,6 +1117,7 @@ func TestTransferCorruptPieceRetriesWithoutOutput(t *testing.T) {
 			payloadBytes = append(payloadBytes, n)
 			return nil
 		},
+		OnDiagnostic: func(event Diagnostic) { observations = append(observations, event) },
 	})
 	if err != nil {
 		conn.Close()
@@ -1125,6 +1143,18 @@ func TestTransferCorruptPieceRetriesWithoutOutput(t *testing.T) {
 	}
 	if want := []int64{int64(len(data)), int64(len(data))}; !reflect.DeepEqual(payloadBytes, want) {
 		t.Fatalf("payload accounting = %v, want %v", payloadBytes, want)
+	}
+	mismatches := 0
+	for _, event := range observations {
+		if event.Detail == "piece 0 hash mismatch; retry scheduled" {
+			mismatches++
+		}
+		if strings.Contains(event.Detail, "fatal staging failure") {
+			t.Fatalf("clean corruption reported fatal staging: %+v", observations)
+		}
+	}
+	if mismatches != 1 {
+		t.Fatalf("retryable corruption diagnostics = %+v", observations)
 	}
 }
 
@@ -1471,6 +1501,7 @@ func TestTransferEndgameDuplicateWinnerDoesNotDoubleCommit(t *testing.T) {
 	infoHash := [20]byte{12, 12, 12}
 	firstConn, firstDone := startFixturePeer(t, infoHash, []fixturePiece{{index: 0, data: data}}, false, false)
 	secondConn, secondDone := startFixturePeer(t, infoHash, []fixturePiece{{index: 0, data: data}}, false, false)
+	var observations []Diagnostic
 	transfer, err := NewTransfer(TransferConfig{
 		Selection: selection, Output: plan,
 		Stager:         storage.NewStager(storage.StagerConfig{CacheRoot: filepath.Join(t.TempDir(), "cache"), MaxPieces: 1, MaxBytes: int64(len(data))}),
@@ -1480,6 +1511,7 @@ func TestTransferEndgameDuplicateWinnerDoesNotDoubleCommit(t *testing.T) {
 			{ID: "second", Endpoint: endpoint(2), Conn: secondConn, Handshake: peer.Handshake{InfoHash: infoHash, PeerID: [20]byte{2, 2, 2}}},
 		},
 		PieceCount: 1, PieceLength: uint32(len(data)), LastPieceLength: uint32(len(data)),
+		OnDiagnostic: func(event Diagnostic) { observations = append(observations, event) },
 	})
 	if err != nil {
 		firstConn.Close()
@@ -1498,6 +1530,15 @@ func TestTransferEndgameDuplicateWinnerDoesNotDoubleCommit(t *testing.T) {
 	}
 	if progress := transfer.Progress(); progress.Verified != int64(len(data)) {
 		t.Fatalf("progress = %#v", progress)
+	}
+	endgameEvents := 0
+	for _, event := range observations {
+		if event.Detail == "endgame entered" {
+			endgameEvents++
+		}
+	}
+	if endgameEvents != 1 {
+		t.Fatalf("endgame transition diagnostics = %+v", observations)
 	}
 	// The winner can commit while the other fixture peer is writing its
 	// redundant response. Closing that connection may interrupt the write.

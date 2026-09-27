@@ -99,20 +99,23 @@ not replace them with direct calls to `observe` or `Reporter.Debug`.
 | Empty availability, transitions, and duplicate suppression | `TestTransferDiagnosticsObserveAvailabilityAndFirstUsefulBlock` |
 | First useful block; late and callback-rejected payload are not useful | `TestTransferDiagnosticsObserveAvailabilityAndFirstUsefulBlock`; `TestTransferPayloadCallbackCountsLatePiece`; `TestTransferPayloadCallbackErrorStopsBeforeAcceptance` |
 | Exact late Piece and Reject tombstones consumed once without strike/progress | `TestTransferTimeoutPreservesFastLateTerminalWithoutStrike`; `TestTransferTimeoutPreservesFastLateRejectWithoutStrike` |
-| Peer-ID collision keeps older live peer and race winner detail | `TestDialWithResultRetainsWinnerOnPeerIDCollision`; `TestTransportRaceDiagnosticsRetainCollisionWinner` |
+| Peer-ID collision keeps older live peer, preserves endpoint penalties, and reports the real winner in a local session | `TestAdmissionAdvancesExaminedCandidates/live-ID-collision` |
 | Actual winning and failed transport race, metadata phase included | `TestV1MagnetAndBareHashRunMetadataThenTransferThroughCLI`; `TestMetadataDiscoveryReportsFailedTransportRace` |
 | Metadata refusal | `TestMetadataDiscoveryObservesMetadataReject` |
 | Compact IPv4/IPv6 response provenance | `TestHTTPAnnounceParsesCompactFamiliesAndDictionaryPeers` |
 | Final tracker attempts, including transmitted unanswered started | `TestMetadataUnansweredStartedTrackerGetsStoppedWithoutLaterRegularAnnounce`; `TestRunReportsMetadataFinalEventFailureAsSecondary` |
-| Retryable corruption and simultaneous fatal staging failure | `TestTransferCorruptPieceRetriesWithoutOutput`; `TestFinalizePieceCorruptStageCloseFailurePropagatesFatal`; `TestTransferFatalCorruptStageCloseFailureShutsDownImmediately` |
-| Piece assignment/completion and useful scheduling debug from CLI; endgame, outstanding work, choke/reqq/staging pressure | `TestV1MagnetAndBareHashRunMetadataThenTransferThroughCLI`; `TestTransferDiagnosticsObserveAvailabilityAndFirstUsefulBlock`; `TestSchedulerEndgameWinnerCancelsDuplicateAssignments`; `TestSchedulerReassignsAndEnforcesRequestCaps`; `TestReviewPressureKeepsPartialStageWhenEmptyStageSuffices`; `TestReviewZeroReqQStagesWithoutRequests`; `TestTransferReqQPresencePreservesExplicitZero`; `TestTransferActivityDiagnosticsSummarizeRepeatedRequests` (counter summary unit) |
+| Clean corruption reports retry; simultaneous corruption/storage failure reports fatal, not retry, and preserves strikes/cleanup | `TestTransferCorruptPieceRetriesWithoutOutput`; `TestFinalizePieceCorruptStageCloseFailurePropagatesFatal`; `TestTransferFatalCorruptStageCloseFailureShutsDownImmediately` |
+| Piece assignment/completion debug from CLI; actual coordinator endgame, choke, zero-reqq, and staging-pressure reasons | `TestV1MagnetAndBareHashRunMetadataThenTransferThroughCLI`; `TestTransferEndgameDuplicateWinnerDoesNotDoubleCommit`; `TestTransferDriveReportsChokeAndZeroReqQBlocks`; `TestReviewPressureKeepsPartialStageWhenEmptyStageSuffices` |
 | Local tracker warning/debug redaction and CLI level filtering | `TestRunWithSessionReportsRedactedProductionTrackerFailure`; `TestRunWithSessionEmitsProductionDebugPhaseDiagnostic`; `TestDiagnosticQueueBoundsRedactsAndDrops` |
+| Repeated tracker failures and duplicate peer messages under full debug queue; transfer completes, drop count is reported, reporter joins | `TestCLITransferContinuesAndJoinsUnderDiagnosticQueuePressure`; `TestDiagnosticQueueBoundsRedactsAndDrops` |
 
 The CLI acceptance checks additionally cover all four log levels, noninteractive
 status suppression, stdout separation, diagnostic drain before final output, real
-peer/scheduling/lifecycle debug output, and retained-queue pressure in
-`internal/cli/run_test.go`, `internal/cli/v1_test.go`, and
-`internal/cli/diagnostic_test.go`.
+peer/scheduling/lifecycle debug output, and a local completed transfer under
+repeated tracker failures and peer-message pressure in
+`internal/cli/diagnostic_pressure_test.go`. The pressure test observes queue drops
+and reporter join; `TestDiagnosticQueueBoundsRedactsAndDrops` asserts the fixed
+retention capacity.
 
 ## Scheduling and results
 

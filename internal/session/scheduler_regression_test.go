@@ -364,9 +364,18 @@ func TestReviewPressureKeepsPartialStageWhenEmptyStageSuffices(t *testing.T) {
 		t.Fatal(err)
 	}
 	reviewAdvertise(t, transfer, replacement, 2)
+	var observations []Diagnostic
+	transfer.onDiagnostic = func(event Diagnostic) { observations = append(observations, event) }
 	live := []*transferPeer{replacement}
 	if err := transfer.drive(context.Background(), &live); err != nil {
 		t.Fatal(err)
+	}
+	sawPressure := false
+	for _, event := range observations {
+		sawPressure = sawPressure || event.Detail == "assignment blocked: staging pressure or no assignable piece"
+	}
+	if !sawPressure {
+		t.Fatalf("missing coordinator staging-pressure diagnostic: %+v", observations)
 	}
 	if got := reviewReadRequest(t, remote); got.Index != 2 {
 		t.Fatalf("replacement request = %#v", got)
