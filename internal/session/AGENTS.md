@@ -88,6 +88,32 @@ piece/request state, and `transfer.go` coordinates peer I/O and finalization.
   and no event index or iteration is in use. Clear removed slice references;
   keep endpoint penalties separately.
 
+## F1 diagnostic acceptance matrix
+
+These named tests exercise diagnostics through their owning production paths; do
+not replace them with direct calls to `observe` or `Reporter.Debug`.
+
+| Observation | Production-path acceptance test |
+| --- | --- |
+| Ordinary choke duration; Allowed Fast grant versus useful request/data; a grant without ordinary availability cannot trigger a request | `TestTransferFastAllowedPieceCanProgressWhileChoked`; `TestPeerStateAvailabilityAndAllowedFastAreIndependent` |
+| Empty availability, transitions, and duplicate suppression | `TestTransferDiagnosticsObserveAvailabilityAndFirstUsefulBlock` |
+| First useful block; late and callback-rejected payload are not useful | `TestTransferDiagnosticsObserveAvailabilityAndFirstUsefulBlock`; `TestTransferPayloadCallbackCountsLatePiece`; `TestTransferPayloadCallbackErrorStopsBeforeAcceptance` |
+| Exact late Piece and Reject tombstones consumed once without strike/progress | `TestTransferTimeoutPreservesFastLateTerminalWithoutStrike`; `TestTransferTimeoutPreservesFastLateRejectWithoutStrike` |
+| Peer-ID collision keeps older live peer and race winner detail | `TestDialWithResultRetainsWinnerOnPeerIDCollision`; `TestTransportRaceDiagnosticsRetainCollisionWinner` |
+| Actual winning and failed transport race, metadata phase included | `TestV1MagnetAndBareHashRunMetadataThenTransferThroughCLI`; `TestMetadataDiscoveryReportsFailedTransportRace` |
+| Metadata refusal | `TestMetadataDiscoveryObservesMetadataReject` |
+| Compact IPv4/IPv6 response provenance | `TestHTTPAnnounceParsesCompactFamiliesAndDictionaryPeers` |
+| Final tracker attempts, including transmitted unanswered started | `TestMetadataUnansweredStartedTrackerGetsStoppedWithoutLaterRegularAnnounce`; `TestRunReportsMetadataFinalEventFailureAsSecondary` |
+| Retryable corruption and simultaneous fatal staging failure | `TestTransferCorruptPieceRetriesWithoutOutput`; `TestFinalizePieceCorruptStageCloseFailurePropagatesFatal`; `TestTransferFatalCorruptStageCloseFailureShutsDownImmediately` |
+| Piece assignment/completion and useful scheduling debug from CLI; endgame, outstanding work, choke/reqq/staging pressure | `TestV1MagnetAndBareHashRunMetadataThenTransferThroughCLI`; `TestTransferDiagnosticsObserveAvailabilityAndFirstUsefulBlock`; `TestSchedulerEndgameWinnerCancelsDuplicateAssignments`; `TestSchedulerReassignsAndEnforcesRequestCaps`; `TestReviewPressureKeepsPartialStageWhenEmptyStageSuffices`; `TestReviewZeroReqQStagesWithoutRequests`; `TestTransferReqQPresencePreservesExplicitZero`; `TestTransferActivityDiagnosticsSummarizeRepeatedRequests` (counter summary unit) |
+| Local tracker warning/debug redaction and CLI level filtering | `TestRunWithSessionReportsRedactedProductionTrackerFailure`; `TestRunWithSessionEmitsProductionDebugPhaseDiagnostic`; `TestDiagnosticQueueBoundsRedactsAndDrops` |
+
+The CLI acceptance checks additionally cover all four log levels, noninteractive
+status suppression, stdout separation, diagnostic drain before final output, real
+peer/scheduling/lifecycle debug output, and retained-queue pressure in
+`internal/cli/run_test.go`, `internal/cli/v1_test.go`, and
+`internal/cli/diagnostic_test.go`.
+
 ## Scheduling and results
 
 - Apply request, queue, staged-count, and staged-byte budgets together. Bound

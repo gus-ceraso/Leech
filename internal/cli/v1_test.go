@@ -895,7 +895,7 @@ func TestV1MagnetAndBareHashRunMetadataThenTransferThroughCLI(t *testing.T) {
 			output := t.TempDir()
 			trackerFixture := &v1Tracker{}
 			peers := newV1Peers(t, infoHash, infoBytes, data, true)
-			opts := parseV1Options(t, "--output", output, test.source)
+			opts := parseV1Options(t, "--loglevel", "debug", "--output", output, test.source)
 			config := v1SessionConfig(t, trackerFixture, peers)
 			var phases []string
 			var races []session.Diagnostic
@@ -907,7 +907,8 @@ func TestV1MagnetAndBareHashRunMetadataThenTransferThroughCLI(t *testing.T) {
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 			defer cancel()
-			err := RunWithSession(ctx, opts, &bytes.Buffer{}, &bytes.Buffer{}, config)
+			var stdout, stderr bytes.Buffer
+			err := RunWithSession(ctx, opts, &stdout, &stderr, config)
 			if err != nil {
 				t.Fatalf("CLI run: %v", err)
 			}
@@ -924,6 +925,14 @@ func TestV1MagnetAndBareHashRunMetadataThenTransferThroughCLI(t *testing.T) {
 			}
 			if !metadataWinner || !transferWinner {
 				t.Fatalf("transport race winners metadata=%t transfer=%t: %+v", metadataWinner, transferWinner, races)
+			}
+			for _, diagnostic := range []string{"debug: peer selection phase=metadata", "debug: transfer", "piece 0 assigned", "piece 0 completed", "first useful block accepted and staged", "debug: session lifecycle"} {
+				if !strings.Contains(stderr.String(), diagnostic) {
+					t.Fatalf("production %s diagnostic missing: %q", diagnostic, stderr.String())
+				}
+			}
+			if stdout.Len() != 0 {
+				t.Fatalf("runtime diagnostics wrote to stdout: %q", stdout.String())
 			}
 			if err := peers.wait(t); err != nil {
 				t.Fatal(err)

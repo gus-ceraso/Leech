@@ -737,6 +737,7 @@ func TestTransferPayloadCallbackCountsLatePiece(t *testing.T) {
 	local, remote := net.Pipe()
 	defer remote.Close()
 	var got int64
+	var observations []Diagnostic
 	transfer, err := NewTransfer(TransferConfig{
 		Selection: selection, Output: &storage.Plan{},
 		Peers:      []ConnectedPeer{{ID: "late-piece", Endpoint: endpoint(62), Conn: local}},
@@ -745,6 +746,7 @@ func TestTransferPayloadCallbackCountsLatePiece(t *testing.T) {
 			got += n
 			return nil
 		},
+		OnDiagnostic: func(event Diagnostic) { observations = append(observations, event) },
 	})
 	if err != nil {
 		local.Close()
@@ -772,6 +774,11 @@ func TestTransferPayloadCallbackCountsLatePiece(t *testing.T) {
 	if got != int64(len(data)) {
 		t.Fatalf("late payload bytes = %d, want %d", got, len(data))
 	}
+	for _, event := range observations {
+		if event.Detail == "first useful block accepted and staged" {
+			t.Fatalf("late piece counted as useful: %+v", observations)
+		}
+	}
 	_ = p.worker.Close()
 }
 
@@ -784,6 +791,7 @@ func TestTransferPayloadCallbackErrorStopsBeforeAcceptance(t *testing.T) {
 	local, remote := net.Pipe()
 	defer remote.Close()
 	wantErr := errors.New("payload accounting failed")
+	var observations []Diagnostic
 	var transfer *Transfer
 	transfer, err = NewTransfer(TransferConfig{
 		Selection: selection, Output: &storage.Plan{},
@@ -798,6 +806,7 @@ func TestTransferPayloadCallbackErrorStopsBeforeAcceptance(t *testing.T) {
 			}
 			return wantErr
 		},
+		OnDiagnostic: func(event Diagnostic) { observations = append(observations, event) },
 	})
 	if err != nil {
 		local.Close()
@@ -843,6 +852,11 @@ func TestTransferPayloadCallbackErrorStopsBeforeAcceptance(t *testing.T) {
 	}
 	if got := transfer.scheduler.ActiveRequests(); got != 1 {
 		t.Fatalf("active requests after callback error = %d, want 1", got)
+	}
+	for _, event := range observations {
+		if event.Detail == "first useful block accepted and staged" {
+			t.Fatalf("rejected payload counted as useful: %+v", observations)
+		}
 	}
 	_ = p.worker.Close()
 }
@@ -2244,6 +2258,8 @@ func TestTransferTimeoutPreservesFastLateTerminalWithoutStrike(t *testing.T) {
 
 func TestTransferTimeoutPreservesFastLateRejectWithoutStrike(t *testing.T) {
 	transfer, p, remote, messages, block, setNow, base := newTransferWithOutstandingTestRequest(t, true)
+	var observations []Diagnostic
+	transfer.onDiagnostic = func(event Diagnostic) { observations = append(observations, event) }
 	defer func() {
 		_ = p.worker.Close()
 		_ = transfer.scheduler.RemovePeer(p.input.ID)
@@ -2276,6 +2292,15 @@ func TestTransferTimeoutPreservesFastLateRejectWithoutStrike(t *testing.T) {
 	}
 	if transfer.scheduler.StrikeCount(p.input.Endpoint) != 0 {
 		t.Fatalf("timeout or late Reject caused a strike: %d", transfer.scheduler.StrikeCount(p.input.Endpoint))
+	}
+	lateCount := 0
+	for _, event := range observations {
+		if event.Detail == "exact tombstone consumed" {
+			lateCount++
+		}
+	}
+	if lateCount != 1 || transfer.Progress().Verified != 0 {
+		t.Fatalf("late Reject observation count=%d verified=%d observations=%+v", lateCount, transfer.Progress().Verified, observations)
 	}
 }
 
