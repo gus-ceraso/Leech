@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"errors"
 	"net/netip"
 	"strings"
 	"testing"
@@ -68,6 +69,43 @@ func TestDiagnosticQueueBoundsRedactsAndDrops(t *testing.T) {
 	for _, line := range strings.Split(strings.TrimSpace(got), "\n") {
 		if len(strings.TrimPrefix(line, "debug: ")) > DefaultDiagnosticBytes {
 			t.Fatalf("rendered diagnostic exceeded %d bytes: %d", DefaultDiagnosticBytes, len(line))
+		}
+	}
+}
+
+func TestReportQueueAndSecondaryRetentionAreBounded(t *testing.T) {
+	queue := newReportQueue()
+	queue.enqueuePrepared(reportWarning, SanitizeDiagnostic("warning https://user:password@example.test/private?token=secret"+strings.Repeat("x", DefaultDiagnosticBytes*2)))
+	for i := 0; i < reportQueueCapacity+2; i++ {
+		queue.enqueuePrepared(reportPhase, strings.Repeat("p", DefaultDiagnosticBytes))
+	}
+	if got := len(queue.records); got != reportQueueCapacity {
+		t.Fatalf("queued report records = %d, want %d", got, reportQueueCapacity)
+	}
+	if got := queue.dropped.Load(); got != 3 {
+		t.Fatalf("dropped report records = %d, want 3", got)
+	}
+	for len(queue.records) != 0 {
+		event := <-queue.records
+		if len(event.text) > DefaultDiagnosticBytes {
+			t.Fatalf("retained report text = %d bytes, limit %d", len(event.text), DefaultDiagnosticBytes)
+		}
+		if strings.Contains(event.text, "password") || strings.Contains(event.text, "/private") || strings.Contains(event.text, "token=secret") {
+			t.Fatalf("report queue retained sensitive data: %q", event.text)
+		}
+	}
+
+	secondaries := &secondaryFailures{}
+	for i := 0; i < secondaryFailureLimit; i++ {
+		secondaries.add(errors.New("shutdown https://user:password@example.test/path?token=secret" + strings.Repeat("x", DefaultDiagnosticBytes*2)))
+	}
+	retained := secondaries.snapshot()
+	if len(retained) != secondaryFailureLimit {
+		t.Fatalf("retained secondary failures = %d, want %d", len(retained), secondaryFailureLimit)
+	}
+	for _, message := range retained {
+		if len(message) > DefaultDiagnosticBytes || strings.Contains(message, "password") || strings.Contains(message, "/path") || strings.Contains(message, "token=secret") {
+			t.Fatalf("secondary failure retention was not bounded/redacted: %q", message)
 		}
 	}
 }

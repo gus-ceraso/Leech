@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -14,15 +15,111 @@ import (
 	"github.com/gus-ceraso/Leech/internal/session"
 )
 
-const diagnosticQueueCapacity = 128
+const (
+	diagnosticQueueCapacity = 128
+	reportQueueCapacity     = 256
+	secondaryFailureLimit   = 4
+)
 
 type diagnosticQueue struct {
 	records chan session.Diagnostic
 	dropped atomic.Uint64
 }
 
+type reportEventKind uint8
+
+const (
+	reportPhase reportEventKind = iota + 1
+	reportWarning
+	reportStatus
+	reportPhaseStatus
+)
+
+type reportEvent struct {
+	kind       reportEventKind
+	text       string
+	status     Status
+	at         time.Time
+	generation uint64
+	version    uint64
+}
+
+type reportQueue struct {
+	records chan reportEvent
+	dropped atomic.Uint64
+}
+
+type secondaryFailures struct {
+	mu      sync.Mutex
+	count   int
+	records [secondaryFailureLimit]string
+}
+
 func newDiagnosticQueue() *diagnosticQueue {
 	return &diagnosticQueue{records: make(chan session.Diagnostic, diagnosticQueueCapacity)}
+}
+
+func newReportQueue() *reportQueue {
+	return &reportQueue{records: make(chan reportEvent, reportQueueCapacity)}
+}
+
+// enqueuePrepared retains already-sanitized phase or warning lines without
+// waiting for the reporting worker. Queue pressure is summarized when it joins.
+func (q *reportQueue) enqueuePrepared(kind reportEventKind, text string) {
+	select {
+	case q.records <- reportEvent{kind: kind, text: text}:
+	default:
+		incrementSaturating(&q.dropped)
+	}
+}
+
+func (q *reportQueue) enqueueStatus(generation uint64, snapshot Status, at time.Time, version uint64) bool {
+	select {
+	case q.records <- reportEvent{kind: reportStatus, status: snapshot, at: at, generation: generation, version: version}:
+		return true
+	default:
+		return false
+	}
+}
+
+func (q *reportQueue) enqueuePhaseStatus(snapshot Status, at time.Time, version uint64) bool {
+	select {
+	case q.records <- reportEvent{kind: reportPhaseStatus, status: snapshot, at: at, version: version}:
+		return true
+	default:
+		return false
+	}
+}
+
+// add retains every session secondary error in a fixed array. Session has at
+// most four OnSecondary boundaries: metadata finalization, session cleanup,
+// transfer-stage cleanup, and final tracker events.
+func (q *secondaryFailures) add(err error) {
+	if err == nil {
+		return
+	}
+	text := SanitizeDiagnostic(err.Error())
+	q.mu.Lock()
+	if q.count < len(q.records) {
+		q.records[q.count] = text
+		q.count++
+	}
+	q.mu.Unlock()
+}
+
+func (q *secondaryFailures) snapshot() []string {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return append([]string(nil), q.records[:q.count]...)
+}
+
+func incrementSaturating(counter *atomic.Uint64) {
+	for {
+		old := counter.Load()
+		if old == math.MaxUint64 || counter.CompareAndSwap(old, old+1) {
+			return
+		}
+	}
 }
 
 // enqueue sanitizes and bounds all retained text before the nonblocking send.
@@ -55,12 +152,7 @@ func (q *diagnosticQueue) enqueue(record session.Diagnostic) {
 	select {
 	case q.records <- record:
 	default:
-		for {
-			old := q.dropped.Load()
-			if old == math.MaxUint64 || q.dropped.CompareAndSwap(old, old+1) {
-				break
-			}
-		}
+		incrementSaturating(&q.dropped)
 	}
 }
 

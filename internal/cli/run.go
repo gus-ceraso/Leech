@@ -56,59 +56,151 @@ func runWithReporter(ctx context.Context, opts Options, stdout io.Writer, depend
 	dependencies.Resume = opts.Resume
 	dependencies.Streaming = opts.Stream
 	dependencies.Timeout = opts.Timeout
+	statusEnabled := reporter.statusEnabled()
+	diagnostics := newDiagnosticQueue()
+	reports := newReportQueue()
+	secondaries := &secondaryFailures{}
 	var statusMu sync.Mutex
 	var activeStatus Status
-	active, pending := false, false
-	renderStatus := func() {
-		shown, err := reporter.renderStatus(activeStatus)
-		pending = !shown && err == nil
-	}
-	reportDiagnostic := func(diagnostic session.Diagnostic) {
-		renderDiagnostic(reporter, diagnostic)
+	active, pending, statusQueued := false, false, false
+	statusAt := time.Time{}
+	statusGeneration, statusVersion := uint64(0), uint64(0)
+	setStatus := func(snapshot Status, phaseEntry bool) {
+		if !statusEnabled {
+			return
+		}
+		snapshot.Phase = SanitizeDiagnostic(snapshot.Phase, 64)
 		statusMu.Lock()
-		pending = active
+		activeStatus = snapshot
+		active = true
+		pending = true
+		statusAt = reporter.currentTime()
+		statusVersion++
+		if phaseEntry {
+			reports.enqueuePhaseStatus(snapshot, statusAt, statusVersion)
+		} else if !statusQueued {
+			statusQueued = reports.enqueueStatus(statusGeneration, activeStatus, statusAt, statusVersion)
+		}
 		statusMu.Unlock()
 	}
-	diagnostics := newDiagnosticQueue()
-	diagnosticDone := make(chan struct{})
-	go func() {
-		defer close(diagnosticDone)
-		for diagnostic := range diagnostics.records {
-			reportDiagnostic(diagnostic)
+	markStatusPending := func() {
+		if !statusEnabled {
+			return
 		}
-		if dropped := diagnostics.dropped.Load(); dropped != 0 {
-			_ = reporter.Debug("diagnostics: dropped %d debug records because the queue was full", dropped)
-			statusMu.Lock()
-			pending = active
-			statusMu.Unlock()
+		statusMu.Lock()
+		if active {
+			pending = true
+			statusVersion++
 		}
-	}()
-	stopDiagnostics := func() {
-		close(diagnostics.records)
-		<-diagnosticDone
+		statusMu.Unlock()
 	}
-	stopStatus := func() {}
-	if reporter.statusEnabled() {
-		stop := make(chan struct{})
-		done := make(chan struct{})
-		go func() {
-			defer close(done)
-			ticker := time.NewTicker(statusInterval)
-			defer ticker.Stop()
+	renderStatusSnapshot := func(snapshot Status, version uint64, at time.Time) {
+		shown, err := reporter.renderStatusAt(snapshot, at)
+		statusMu.Lock()
+		if version == statusVersion {
+			pending = !shown && err == nil
+		}
+		statusMu.Unlock()
+	}
+	renderPendingStatus := func() {
+		statusMu.Lock()
+		if !active || !pending {
+			statusMu.Unlock()
+			return
+		}
+		snapshot, version := activeStatus, statusVersion
+		statusMu.Unlock()
+		renderStatusSnapshot(snapshot, version, reporter.currentTime())
+	}
+	reporterDone := make(chan struct{})
+	var statusTicker *time.Ticker
+	var statusTicks <-chan time.Time
+	if statusEnabled {
+		statusTicker = time.NewTicker(statusInterval)
+		statusTicks = statusTicker.C
+	}
+	go func() {
+		defer close(reporterDone)
+		handleReport := func(event reportEvent) {
+			switch event.kind {
+			case reportPhase:
+				_ = reporter.Phase(event.text)
+			case reportWarning:
+				_ = reporter.Warning("%s", event.text)
+				markStatusPending()
+				renderPendingStatus()
+			case reportStatus:
+				statusMu.Lock()
+				if event.generation != statusGeneration {
+					statusMu.Unlock()
+					return
+				}
+				statusQueued = false
+				statusMu.Unlock()
+				renderStatusSnapshot(event.status, event.version, event.at)
+				statusMu.Lock()
+				if event.version != statusVersion && active && pending && !statusQueued {
+					statusQueued = reports.enqueueStatus(statusGeneration, activeStatus, statusAt, statusVersion)
+				}
+				statusMu.Unlock()
+			case reportPhaseStatus:
+				renderStatusSnapshot(event.status, event.version, event.at)
+			}
+		}
+		drainReports := func() {
 			for {
 				select {
-				case <-ticker.C:
-					statusMu.Lock()
-					if active && pending {
-						renderStatus()
+				case event, ok := <-reports.records:
+					if !ok {
+						return
 					}
-					statusMu.Unlock()
-				case <-stop:
+					handleReport(event)
+				default:
 					return
 				}
 			}
-		}()
-		stopStatus = func() { close(stop); <-done }
+		}
+		diagnosticRecords := (<-chan session.Diagnostic)(diagnostics.records)
+		reportRecords := (<-chan reportEvent)(reports.records)
+		for diagnosticRecords != nil || reportRecords != nil {
+			select {
+			case diagnostic, ok := <-diagnosticRecords:
+				if !ok {
+					diagnosticRecords = nil
+					continue
+				}
+				renderDiagnostic(reporter, diagnostic)
+				if reporter.Level() == LogDebug {
+					markStatusPending()
+				}
+			case event, ok := <-reportRecords:
+				if !ok {
+					reportRecords = nil
+					continue
+				}
+				handleReport(event)
+			case <-statusTicks:
+				drainReports()
+				renderPendingStatus()
+			}
+		}
+		if dropped := reports.dropped.Load(); dropped != 0 {
+			_ = reporter.Warning("CLI reporting queue dropped %d phase/warning records", dropped)
+			markStatusPending()
+		}
+		if dropped := diagnostics.dropped.Load(); dropped != 0 {
+			_ = reporter.Debug("diagnostics: dropped %d debug records because the queue was full", dropped)
+			markStatusPending()
+		}
+		renderPendingStatus()
+	}()
+	stopReporter := func() {
+		close(diagnostics.records)
+		close(reports.records)
+		if statusTicker != nil {
+			statusTicker.Stop()
+		}
+		<-reporterDone
 	}
 	oldPhase, oldProgress := dependencies.OnPhase, dependencies.OnProgress
 	oldPhaseStatus := dependencies.OnPhaseStatus
@@ -119,43 +211,37 @@ func runWithReporter(ctx context.Context, opts Options, stdout io.Writer, depend
 		if oldPhase != nil {
 			oldPhase(phase)
 		}
+		phase = SanitizeDiagnostic(phase)
 		statusMu.Lock()
 		active = false
 		pending = false
-		_ = reporter.Phase(phase)
+		statusQueued = false
+		statusGeneration++
+		statusVersion++
+		reports.enqueuePrepared(reportPhase, phase)
 		statusMu.Unlock()
 	}
 	dependencies.OnPhaseStatus = func(phase string, progress session.RunProgress) {
 		if oldPhaseStatus != nil {
 			oldPhaseStatus(phase, progress)
 		}
-		statusMu.Lock()
-		activeStatus = Status{Phase: phase, VerifiedSelectedBytes: uint64(maxInt64(0, progress.VerifiedSelectedBytes)), SelectedBytes: uint64(maxInt64(0, progress.SelectedBytes))}
-		active = true
-		renderStatus()
-		statusMu.Unlock()
+		setStatus(Status{Phase: phase, VerifiedSelectedBytes: uint64(maxInt64(0, progress.VerifiedSelectedBytes)), SelectedBytes: uint64(maxInt64(0, progress.SelectedBytes))}, true)
 	}
 	dependencies.OnProgress = func(progress session.RunProgress) {
 		if oldProgress != nil {
 			oldProgress(progress)
 		}
-		statusMu.Lock()
-		activeStatus = transferStatus(progress)
-		active = true
-		renderStatus()
-		statusMu.Unlock()
+		setStatus(transferStatus(progress), false)
 	}
-	if reporter.statusEnabled() {
+	if statusEnabled {
 		dependencies.OnStatus = func(progress session.RunProgress) {
 			if oldStatus != nil {
 				oldStatus(progress)
 			}
-			statusMu.Lock()
-			activeStatus = transferStatus(progress)
-			active = true
-			renderStatus()
-			statusMu.Unlock()
+			setStatus(transferStatus(progress), false)
 		}
+	} else if oldStatus != nil {
+		dependencies.OnStatus = oldStatus
 	}
 	dependencies.OnDiagnostic = func(diagnostic session.Diagnostic) {
 		if oldDiagnostic != nil {
@@ -167,23 +253,22 @@ func runWithReporter(ctx context.Context, opts Options, stdout io.Writer, depend
 		if oldWarning != nil {
 			oldWarning(message)
 		}
+		message = SanitizeDiagnostic(message)
 		statusMu.Lock()
-		_ = reporter.Warning("%s", message)
-		pending = active
+		reports.enqueuePrepared(reportWarning, message)
 		statusMu.Unlock()
 	}
 	dependencies.OnSecondary = func(shutdownErr error) {
 		if oldSecondary != nil {
 			oldSecondary(shutdownErr)
 		}
-		statusMu.Lock()
-		_ = reporter.SecondaryFailure(shutdownErr)
-		pending = active
-		statusMu.Unlock()
+		secondaries.add(shutdownErr)
 	}
 	result, err := session.Run(ctx, dependencies)
-	stopStatus()
-	stopDiagnostics()
+	stopReporter()
+	for _, secondary := range secondaries.snapshot() {
+		_ = reporter.secondaryFailureText(secondary)
+	}
 	if err != nil {
 		_ = reporter.PrimaryFailure(err, result.HasVerifiedOutput)
 		return err

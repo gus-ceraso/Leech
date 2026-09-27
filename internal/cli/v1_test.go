@@ -744,6 +744,87 @@ func (f v1CloseFailureStageFile) Close() error {
 	return f.err
 }
 
+type v1FinalFailureTracker struct {
+	delegate tracker.TrackerHTTP
+	err      error
+}
+
+func (f v1FinalFailureTracker) Announce(ctx context.Context, rawURL string, request tracker.AnnounceRequest) (tracker.HTTPAnnounceResult, error) {
+	if request.Event == tracker.EventStopped {
+		return tracker.HTTPAnnounceResult{Transmitted: true}, f.err
+	}
+	return f.delegate.Announce(ctx, rawURL, request)
+}
+
+func TestV1CLIPrimaryAndSecondaryErrorsRedactBeforeTruncation(t *testing.T) {
+	data := []byte("redaction boundary")
+	info, infoHash := v1Info(t, data)
+	torrentPath := writeV1Torrent(t, v1Metainfo(t, info, ""))
+	peers := newV1Peers(t, infoHash, info, data, false)
+	defer peers.close()
+	delegate := &v1Tracker{}
+	secondaryText := "tracker https://secondary-user:secondary-password@[2001:db8::22]:9443/private'path?token=secondary-query-secret " +
+		"magnet:?xt=urn:btih:0123456789012345678901234567890123456789&dn=secondary-magnet-secret\x1b[31m"
+	config := v1SessionConfig(t, delegate, peers)
+	config.HTTP = v1FinalFailureTracker{delegate: delegate, err: errors.New(secondaryText)}
+	userinfo := strings.Repeat("primary-userinfo-secret-", 3000)
+	primaryText := "staged read failed: https://" + userinfo + "@[2001:db8::11]:8443/primary-private'path?token=primary-query-secret\x1b[31m"
+	primaryErr := errors.New(primaryText)
+	config.StageFileOpener = func(path string, flag int, mode os.FileMode) (storage.StagingFile, error) {
+		file, err := os.OpenFile(path, flag, mode)
+		if err != nil {
+			return nil, err
+		}
+		return v1ReadFailureStageFile{File: file, err: primaryErr}, nil
+	}
+	var stdout, stderr bytes.Buffer
+	opts := parseV1Options(t, "--output", t.TempDir(), "--loglevel", "error", torrentPath)
+	runErr := RunWithSession(context.Background(), opts, &stdout, &stderr, config)
+	if !errors.Is(runErr, primaryErr) {
+		t.Fatalf("session error = %v, want staged read failure", runErr)
+	}
+	if err := peers.wait(t); err != nil {
+		t.Fatal(err)
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("errors wrote stdout: %q", stdout.String())
+	}
+	lines := strings.Split(strings.TrimSpace(stderr.String()), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("diagnostics = %q, want primary and secondary lines", stderr.String())
+	}
+	for _, secret := range []string{
+		"primary-userinfo-secret", "primary-private", "primary-query-secret",
+		"secondary-user", "secondary-password", "/private", "secondary-query-secret",
+		"magnet:?", "0123456789012345678901234567890123456789", "secondary-magnet-secret", "\x1b",
+	} {
+		if strings.Contains(stderr.String(), secret) {
+			t.Errorf("CLI diagnostics leaked %q: %q", secret, stderr.String())
+		}
+	}
+	for _, host := range []string{"[2001:db8::11]:8443", "[2001:db8::22]:9443"} {
+		if !strings.Contains(stderr.String(), host) {
+			t.Errorf("CLI diagnostics lost IPv6 host %q: %q", host, stderr.String())
+		}
+	}
+	for _, line := range lines {
+		if len(line) > DefaultDiagnosticBytes+len("error: ")+1 {
+			t.Errorf("rendered error line is unbounded (%d bytes): %q", len(line), line)
+		}
+	}
+	primaryLine, secondaryLine := false, false
+	for _, line := range lines {
+		primaryLine = primaryLine || strings.HasPrefix(line, "error: failure: ")
+		secondaryLine = secondaryLine || strings.HasPrefix(line, "error: shutdown: ")
+	}
+	if !primaryLine || !secondaryLine {
+		t.Fatalf("primary and secondary classifications changed: %q", lines)
+	}
+	if !strings.Contains(stderr.String(), `\x1b[31m`) {
+		t.Fatalf("control characters were not escaped: %q", stderr.String())
+	}
+}
+
 func TestV1CLIStagedReadFailureStopsAndCleansSession(t *testing.T) {
 	data := []byte("fail staged read")
 	infoBytes, infoHash := v1Info(t, data)

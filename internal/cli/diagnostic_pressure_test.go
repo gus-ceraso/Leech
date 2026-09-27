@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -84,6 +85,174 @@ func (w *blockedDebugWriter) String() string {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.output.String()
+}
+
+type blockedWarningWriter struct {
+	mu          sync.Mutex
+	output      bytes.Buffer
+	entered     chan struct{}
+	release     chan struct{}
+	once        sync.Once
+	releaseOnce sync.Once
+	active      atomic.Int32
+}
+
+func newBlockedWarningWriter() *blockedWarningWriter {
+	return &blockedWarningWriter{entered: make(chan struct{}), release: make(chan struct{})}
+}
+
+func (w *blockedWarningWriter) Write(p []byte) (int, error) {
+	w.active.Add(1)
+	defer w.active.Add(-1)
+	if bytes.HasPrefix(p, []byte("warning: tracker")) {
+		w.once.Do(func() {
+			close(w.entered)
+			<-w.release
+		})
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.output.Write(p)
+}
+
+func (w *blockedWarningWriter) unblock() {
+	w.releaseOnce.Do(func() { close(w.release) })
+}
+
+func (w *blockedWarningWriter) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.output.String()
+}
+
+type warningAndPeerTracker struct {
+	warningURL string
+	peerPort   uint16
+	warnings   chan struct{}
+	stopped    chan struct{}
+}
+
+func (f *warningAndPeerTracker) Announce(_ context.Context, rawURL string, request tracker.AnnounceRequest) (tracker.HTTPAnnounceResult, error) {
+	if request.Event == tracker.EventStopped {
+		select {
+		case f.stopped <- struct{}{}:
+		default:
+		}
+		return tracker.HTTPAnnounceResult{Transmitted: true}, nil
+	}
+	if rawURL == f.warningURL {
+		select {
+		case f.warnings <- struct{}{}:
+		default:
+		}
+		return tracker.HTTPAnnounceResult{Transmitted: true}, errors.New("controlled local tracker failure")
+	}
+	return tracker.HTTPAnnounceResult{Interval: time.Minute, Transmitted: true,
+		Peers: []tracker.HTTPPeer{{Host: "127.0.0.1", Port: f.peerPort}}}, nil
+}
+
+func TestCLIBlockedWarningDoesNotStallTransferStatusOrShutdown(t *testing.T) {
+	data := []byte("blocked reporter still joins")
+	info, infoHash := v1Info(t, data)
+	const warningURL = "http://warning.fixture/announce"
+	torrentPath := writeV1Torrent(t, v1Metainfo(t, info, warningURL))
+	peers := newV1Peers(t, infoHash, info, data, false)
+	peers.stall = true
+	peers.failAfterFirst = true
+	defer peers.close()
+	fixture := &warningAndPeerTracker{
+		warningURL: warningURL, peerPort: v1FixturePeerPort,
+		warnings: make(chan struct{}, 16), stopped: make(chan struct{}, 16),
+	}
+	config := v1SessionConfig(t, nil, peers)
+	config.HTTP = fixture
+	statuses := make(chan session.RunProgress, 8)
+	config.OnStatus = func(progress session.RunProgress) {
+		select {
+		case statuses <- progress:
+		default:
+		}
+	}
+	warnings := make(chan struct{}, 1)
+	config.OnWarning = func(string) {
+		select {
+		case warnings <- struct{}{}:
+		default:
+		}
+	}
+	writer := newBlockedWarningWriter()
+	reporter := NewReporterWithOptions(ReporterOptions{
+		Level: LogInfo, Stderr: writer, IsTerminal: func(io.Writer) bool { return true },
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	opts := parseV1Options(t, "--output", t.TempDir(), "--loglevel", "info", torrentPath)
+	done := make(chan error, 1)
+	go func() { done <- runWithReporter(ctx, opts, &bytes.Buffer{}, config, reporter) }()
+	returned := false
+	defer func() {
+		writer.unblock()
+		cancel()
+		if !returned {
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				t.Errorf("CLI did not join after releasing reporter")
+			}
+		}
+	}()
+	select {
+	case <-writer.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("reporter did not block while writing the local tracker warning")
+	}
+	select {
+	case <-warnings:
+	case <-time.After(5 * time.Second):
+		t.Fatal("session did not deliver the recoverable tracker warning")
+	}
+	statusSeen := false
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
+	for !statusSeen {
+		select {
+		case progress := <-statuses:
+			statusSeen = progress.ActivePeers == 1
+		case <-deadline.C:
+			t.Fatal("transfer status callback stalled behind the blocked warning writer")
+		}
+	}
+	cancel()
+	select {
+	case <-fixture.stopped:
+	case <-time.After(5 * time.Second):
+		t.Fatal("session shutdown stalled before the final tracker event")
+	}
+	select {
+	case err := <-done:
+		returned = true
+		t.Fatalf("CLI returned before the blocked reporter was released: %v", err)
+	default:
+	}
+	writer.unblock()
+	select {
+	case err := <-done:
+		returned = true
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("CLI error = %v, want cancellation", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("reporting worker did not join after writer release (active=%d output=%q)", writer.active.Load(), writer.String())
+	}
+	if writer.active.Load() != 0 {
+		t.Fatalf("writer still active after CLI returned: %d", writer.active.Load())
+	}
+	output := writer.String()
+	if !strings.Contains(output, "warning: tracker http://warning.fixture failure; retrying") {
+		t.Fatalf("recoverable warning was lost: %q", output)
+	}
+	if strings.LastIndex(output, "status:") < strings.LastIndex(output, "warning: tracker") {
+		t.Fatalf("status was not restored after warning: %q", output)
+	}
 }
 
 func TestCLITransferContinuesAndJoinsUnderDiagnosticQueuePressure(t *testing.T) {

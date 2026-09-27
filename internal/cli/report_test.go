@@ -185,6 +185,16 @@ func TestSanitizeDiagnosticRedactsCompleteTrackerURLs(t *testing.T) {
 			raw:  "announce https://tracker.example/announce?token=disposable-comma,passkey failed",
 			want: "announce https://tracker.example failed",
 		},
+		{
+			name: "apostrophe in path",
+			raw:  "announce https://tracker.example/private'path?token=apostrophe-secret failed",
+			want: "announce https://tracker.example failed",
+		},
+		{
+			name: "IPv6 host without port",
+			raw:  "announce https://[2001:db8::1]/private failed",
+			want: "announce https://[2001:db8::1] failed",
+		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			if got := SanitizeDiagnostic(test.raw); got != test.want {
@@ -213,6 +223,30 @@ func TestReporterRedactsNestedURLErrorAndKeepsOrdinaryDetails(t *testing.T) {
 	}
 	if got, want := SanitizeDiagnostic("ordinary validation error: missing file; retry later"), "ordinary validation error: missing file; retry later"; got != want {
 		t.Fatalf("ordinary diagnostic = %q, want %q", got, want)
+	}
+}
+
+func TestSanitizeDiagnosticParsesSupportedURLBeforeTruncation(t *testing.T) {
+	const supportedTrackerURLBytes = 64 << 20
+	prefix := "https://long-user:long-password@tracker.example/"
+	raw := prefix + strings.Repeat("x", supportedTrackerURLBytes-len(prefix)) + " finished"
+	if got, want := SanitizeDiagnostic(raw), "https://tracker.example finished"; got != want {
+		t.Fatalf("sanitized 64 MiB URL = %q, want %q", got, want)
+	}
+}
+
+func TestSanitizeDiagnosticRedactsLongAuthorityBeforeTruncation(t *testing.T) {
+	userinfo := strings.Repeat("disposable-long-userinfo-", 4000)
+	raw := "announce https://" + userinfo + "@[2001:db8::1]:8443/private'path?token=long-secret failed"
+	got := SanitizeDiagnostic(raw)
+	if strings.Contains(got, "disposable-long-userinfo") || strings.Contains(got, "long-secret") || strings.Contains(got, "/private") {
+		t.Fatalf("sanitized diagnostic leaked URL data: %q", got)
+	}
+	if !strings.HasPrefix(got, "announce https://[2001:db8::1]:8443") {
+		t.Fatalf("sanitized diagnostic lost IPv6 authority: %q", got)
+	}
+	if len(got) > DefaultDiagnosticBytes {
+		t.Fatalf("sanitized length = %d, want <= %d", len(got), DefaultDiagnosticBytes)
 	}
 }
 

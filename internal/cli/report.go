@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -20,7 +19,14 @@ import (
 // their inputs are not trusted to be small.
 const DefaultDiagnosticBytes = 4096
 
-const statusInterval = time.Second
+// maxRedactableURLBytes matches the supported 64 MiB tracker-URL input bound.
+const maxRedactableURLBytes = 64 << 20
+
+const (
+	maxRedactionScanBytes = maxRedactableURLBytes + DefaultDiagnosticBytes
+	maxTrackerHostBytes   = 1024
+	statusInterval        = time.Second
+)
 
 // ReporterOptions contains the seams needed by the CLI and its deterministic
 // presentation tests. A nil IsTerminal uses the small os.File check below;
@@ -38,6 +44,7 @@ type ReporterOptions struct {
 // Reporter is safe for concurrent session workers to use.
 type Reporter struct {
 	mu          sync.Mutex
+	nowMu       sync.Mutex
 	level       LogLevel
 	stderr      io.Writer
 	isTerminal  func(io.Writer) bool
@@ -173,13 +180,34 @@ func (r *Reporter) Status(snapshot Status) error {
 	return err
 }
 
+func (r *Reporter) currentTime() time.Time {
+	r.nowMu.Lock()
+	defer r.nowMu.Unlock()
+	return r.now()
+}
+
 func (r *Reporter) renderStatus(snapshot Status) (bool, error) {
-	if r == nil || !r.statusEnabled() {
+	if r == nil {
 		return false, nil
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	now := r.now()
+	return r.renderStatusLocked(snapshot, r.currentTime())
+}
+
+func (r *Reporter) renderStatusAt(snapshot Status, now time.Time) (bool, error) {
+	if r == nil {
+		return false, nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.renderStatusLocked(snapshot, now)
+}
+
+func (r *Reporter) renderStatusLocked(snapshot Status, now time.Time) (bool, error) {
+	if !r.statusEnabled() {
+		return false, nil
+	}
 	if r.status.updated && now.Sub(r.status.lastTime) < statusInterval {
 		return false, nil
 	}
@@ -239,17 +267,32 @@ func (r *Reporter) ReportResult(result Result) error {
 // the same permanent line records that verified partial output is available
 // for a later --resume run.
 func (r *Reporter) PrimaryFailure(err error, resumable bool) error {
+	if r == nil || !r.enabled(LogError) {
+		return nil
+	}
 	message := "failure: " + sanitizeError(err, r.maxBytes)
 	if resumable {
 		message += "; verified partial output remains resumable"
 	}
-	return r.Error("%s", message)
+	return r.writePermanent(LogError, truncateString(message, r.maxBytes))
 }
 
 // SecondaryFailure records a shutdown or final-event diagnostic without
 // replacing the primary result.
 func (r *Reporter) SecondaryFailure(err error) error {
-	return r.Error("shutdown: %s", sanitizeError(err, r.maxBytes))
+	if r == nil || !r.enabled(LogError) {
+		return nil
+	}
+	return r.secondaryFailureText(sanitizeError(err, r.maxBytes))
+}
+
+// secondaryFailureText writes a message already redacted and bounded before
+// retention by the CLI reporting owner.
+func (r *Reporter) secondaryFailureText(message string) error {
+	if r == nil || !r.enabled(LogError) {
+		return nil
+	}
+	return r.writePermanent(LogError, truncateString("shutdown: "+message, r.maxBytes))
 }
 
 // PrivateIgnored emits the required warning for the deliberate BEP 27
@@ -349,13 +392,32 @@ func SanitizeDiagnostic(value string, bounds ...int) string {
 // RedactTrackerURL returns only a URL's scheme and host (including an explicit
 // port). Malformed or hostless input is represented by a fixed placeholder.
 func RedactTrackerURL(raw string) string {
-	u, err := url.Parse(raw)
+	separator := strings.Index(raw, "://")
+	if separator <= 0 || separator > 32 {
+		return "<redacted-tracker>"
+	}
+	scheme := raw[:separator]
+	authorityStart := separator + 3
+	authorityEnd := len(raw)
+	if offset := strings.IndexAny(raw[authorityStart:], "/?#"); offset >= 0 {
+		authorityEnd = authorityStart + offset
+	}
+	authority := raw[authorityStart:authorityEnd]
+	if at := strings.LastIndexByte(authority, '@'); at >= 0 {
+		authority = authority[at+1:]
+	}
+	if authority == "" || len(authority) > maxTrackerHostBytes || strings.IndexFunc(authority, unicode.IsControl) >= 0 {
+		return "<redacted-tracker>"
+	}
+	u, err := url.Parse(scheme + "://" + authority)
 	if err != nil || u.Scheme == "" || u.Hostname() == "" {
 		return "<redacted-tracker>"
 	}
 	host := u.Hostname()
 	if port := u.Port(); port != "" {
 		host = net.JoinHostPort(host, port)
+	} else if strings.Contains(host, ":") {
+		host = "[" + host + "]"
 	}
 	return strings.ToLower(u.Scheme) + "://" + host
 }
@@ -364,43 +426,85 @@ func sanitizeError(err error, maxBytes int) string {
 	if err == nil {
 		return "<nil>"
 	}
-	message := err.Error()
-	var urlErr *url.Error
-	if errors.As(err, &urlErr) {
-		redacted := urlErr.Op + " " + strconv.Quote(RedactTrackerURL(urlErr.URL)) + ": " + urlErr.Err.Error()
-		message = strings.ReplaceAll(message, urlErr.Error(), redacted)
-	}
-	return SanitizeDiagnostic(message, maxBytes)
+	return SanitizeDiagnostic(err.Error(), maxBytes)
 }
 
 func redactSensitive(value string) string {
+	const outputLimit = DefaultDiagnosticBytes - 3
 	var out strings.Builder
-	// Replacements are always shorter than the input in the usual case, but
-	// this cap prevents a hostile string from making the builder grow without
-	// bound due to scanner mistakes.
-	if len(value) > DefaultDiagnosticBytes*16 {
-		value = value[:DefaultDiagnosticBytes*16]
-	}
-	for i := 0; i < len(value); {
+	out.Grow(DefaultDiagnosticBytes)
+	for i, scanned := 0, 0; i < len(value); {
+		if out.Len() >= outputLimit || scanned >= maxRedactionScanBytes {
+			return out.String() + "..."
+		}
 		if scheme, ok := sensitiveSchemeAt(value, i); ok {
-			end := tokenEnd(value, i)
-			token := value[i:end]
-			if scheme == "magnet" {
-				out.WriteString("magnet:<redacted>")
-			} else {
-				out.WriteString(RedactTrackerURL(token))
+			tokenLimit := maxRedactableURLBytes
+			if remaining := maxRedactionScanBytes - scanned; remaining < tokenLimit {
+				tokenLimit = remaining
 			}
+			end, complete := sensitiveTokenEnd(value, i, tokenLimit)
+			token := value[i:end]
+			replacement := "magnet:<redacted>"
+			if scheme != "magnet" {
+				replacement = RedactTrackerURL(token)
+			}
+			// net/url.Error quotes its URL. Keep a closing quote and the
+			// following formatting punctuation without exposing URL text.
+			replacement += redactedTokenSuffix(token)
+			if len(replacement) > outputLimit-out.Len() {
+				return out.String() + "..."
+			}
+			out.WriteString(replacement)
+			scanned += end - i
 			i = end
+			if !complete {
+				return out.String() + "..."
+			}
 			continue
 		}
 		_, size := utf8.DecodeRuneInString(value[i:])
 		if size == 0 {
 			size = 1
 		}
+		if scanned+size > maxRedactionScanBytes || out.Len()+size > outputLimit {
+			return out.String() + "..."
+		}
 		out.WriteString(value[i : i+size])
 		i += size
+		scanned += size
 	}
 	return out.String()
+}
+
+func redactedTokenSuffix(token string) string {
+	for i := len(token) - 1; i >= 0; i-- {
+		switch token[i] {
+		case '"':
+			return token[i:]
+		case ':', ',', ')', ']', '}':
+			continue
+		default:
+			return ""
+		}
+	}
+	return ""
+}
+
+func sensitiveTokenEnd(value string, start, limit int) (int, bool) {
+	for i := start; i < len(value); {
+		r, size := utf8.DecodeRuneInString(value[i:])
+		if size == 0 {
+			size = 1
+		}
+		if unicode.IsSpace(r) || unicode.IsControl(r) {
+			return i, true
+		}
+		if i-start >= limit {
+			return i, false
+		}
+		i += size
+	}
+	return len(value), true
 }
 
 func sensitiveSchemeAt(value string, offset int) (string, bool) {
@@ -420,16 +524,6 @@ func sensitiveSchemeAt(value string, offset int) (string, bool) {
 		return strings.TrimSuffix(strings.ToLower(scheme), "://"), true
 	}
 	return "", false
-}
-
-func tokenEnd(value string, start int) int {
-	for i := start; i < len(value); i++ {
-		switch value[i] {
-		case ' ', '\t', '\r', '\n', '\'', '"', '<', '>':
-			return i
-		}
-	}
-	return len(value)
 }
 
 func escapeControls(value string) string {

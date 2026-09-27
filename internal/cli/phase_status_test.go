@@ -222,6 +222,7 @@ func TestCLIStatusReturnsAfterRapidResumeToStalledTransfer(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("transfer tracker did not start")
 	}
+	waitStatusOutput(t, stderr, `info: phase: "transfer"`)
 	initial := stderr.String()
 	if !strings.Contains(initial, `status: phase="resume" verified=0/32768 bytes`) ||
 		!strings.Contains(initial, `info: phase: "transfer"`) ||
@@ -264,6 +265,72 @@ type statusFailingTracker struct{}
 
 func (statusFailingTracker) Announce(context.Context, string, tracker.AnnounceRequest) (tracker.HTTPAnnounceResult, error) {
 	return tracker.HTTPAnnounceResult{Transmitted: true}, &tracker.HTTPError{Class: tracker.HTTPFailureTransient, Code: tracker.HTTPErrorTimeout, Err: errors.New("fixture timeout")}
+}
+
+func TestCallerStatusCallbackSurvivesCLIStatusFiltering(t *testing.T) {
+	info, infoHash := v1Info(t, []byte("x"))
+	torrentPath := writeV1Torrent(t, v1Metainfo(t, info, ""))
+	for _, level := range []LogLevel{LogInfo, LogWarning, LogError} {
+		t.Run(string(level), func(t *testing.T) {
+			peers := newV1Peers(t, infoHash, info, []byte("x"), false)
+			peers.stall = true
+			defer peers.close()
+			config := v1SessionConfig(t, &v1Tracker{}, peers)
+			statuses := make(chan session.RunProgress, 1)
+			config.OnStatus = func(progress session.RunProgress) {
+				select {
+				case statuses <- progress:
+				default:
+				}
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			var stdout, stderr bytes.Buffer
+			opts := Options{Source: torrentPath, Output: t.TempDir(), LogLevel: level}
+			done := make(chan error, 1)
+			go func() { done <- RunWithSession(ctx, opts, &stdout, &stderr, config) }()
+			returned := false
+			defer func() {
+				cancel()
+				peers.close()
+				if !returned {
+					select {
+					case <-done:
+					case <-time.After(4 * time.Second):
+						t.Errorf("CLI did not join during callback-test cleanup")
+					}
+				}
+			}()
+			select {
+			case <-statuses:
+				cancel()
+			case err := <-done:
+				returned = true
+				t.Fatalf("CLI run ended before invoking the caller's status callback: %v", err)
+			case <-time.After(4 * time.Second):
+				cancel()
+				t.Fatal("caller status callback was filtered with CLI status")
+			}
+			select {
+			case err := <-done:
+				returned = true
+				if !errors.Is(err, context.Canceled) {
+					t.Fatalf("CLI error = %v, want cancellation", err)
+				}
+			case <-time.After(4 * time.Second):
+				t.Fatal("CLI did not join after caller status callback canceled the session")
+			}
+			if strings.Contains(stderr.String(), "status:") {
+				t.Fatalf("filtered status was rendered at %s level: %q", level, stderr.String())
+			}
+			if stdout.Len() != 0 {
+				t.Fatalf("status callback wrote stdout: %q", stdout.String())
+			}
+			if err := peers.wait(t); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
 }
 
 func TestInfoWarningRestoresInteractiveMetadataStatus(t *testing.T) {
