@@ -49,12 +49,13 @@ func (f *pressureFailTracker) snapshot() map[string]int {
 }
 
 type blockedDebugWriter struct {
-	mu      sync.Mutex
-	output  bytes.Buffer
-	entered chan struct{}
-	release chan struct{}
-	once    sync.Once
-	active  atomic.Int32
+	mu          sync.Mutex
+	output      bytes.Buffer
+	entered     chan struct{}
+	release     chan struct{}
+	once        sync.Once
+	releaseOnce sync.Once
+	active      atomic.Int32
 }
 
 func newBlockedDebugWriter() *blockedDebugWriter {
@@ -73,6 +74,10 @@ func (w *blockedDebugWriter) Write(p []byte) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.output.Write(p)
+}
+
+func (w *blockedDebugWriter) unblock() {
+	w.releaseOnce.Do(func() { close(w.release) })
 }
 
 func (w *blockedDebugWriter) String() string {
@@ -108,8 +113,29 @@ func TestCLITransferContinuesAndJoinsUnderDiagnosticQueuePressure(t *testing.T) 
 		}
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
 	done := make(chan error, 1)
+	sessionReturned := false
+	var releasePeer sync.Once
+	unblockPeer := func() { releasePeer.Do(func() { close(peers.releasePiece) }) }
+	defer func() {
+		writer.unblock()
+		unblockPeer()
+		if !sessionReturned {
+			cancel()
+		}
+		peers.close()
+		if !sessionReturned {
+			select {
+			case <-done:
+			case <-time.After(3 * time.Second):
+				t.Errorf("CLI session did not join during failure cleanup")
+			}
+		}
+		cancel()
+		if err := peers.waitCalls(t, 2); err != nil {
+			t.Errorf("peer fixtures did not join during cleanup: %v", err)
+		}
+	}()
 	go func() { done <- RunWithSession(ctx, opts, &bytes.Buffer{}, writer, config) }()
 	select {
 	case <-writer.entered:
@@ -119,7 +145,6 @@ func TestCLITransferContinuesAndJoinsUnderDiagnosticQueuePressure(t *testing.T) 
 	select {
 	case <-peers.requestSeen:
 	case <-ctx.Done():
-		close(writer.release)
 		t.Fatal("local peer did not receive the transfer request")
 	}
 	attemptCount := 0
@@ -128,25 +153,22 @@ func TestCLITransferContinuesAndJoinsUnderDiagnosticQueuePressure(t *testing.T) 
 		case <-trackerFixture.attempts:
 			attemptCount++
 		case <-ctx.Done():
-			close(peers.releasePiece)
-			close(writer.release)
 			t.Fatalf("tracker retries did not fill the diagnostic queue: observed %d attempts", attemptCount)
 		}
 	}
-	close(peers.releasePiece)
+	unblockPeer()
 	select {
 	case <-progress:
 	case <-ctx.Done():
-		close(writer.release)
 		t.Fatal("transfer stalled while diagnostic rendering was blocked")
 	}
 	if got, err := os.ReadFile(filepath.Join(output, "payload.bin")); err != nil || !bytes.Equal(got, data) {
-		close(writer.release)
 		t.Fatalf("piece was not verified before reporter release: %q, %v", got, err)
 	}
-	close(writer.release)
+	writer.unblock()
 	select {
 	case err := <-done:
+		sessionReturned = true
 		if err != nil {
 			t.Fatalf("CLI transfer: %v", err)
 		}
@@ -155,9 +177,6 @@ func TestCLITransferContinuesAndJoinsUnderDiagnosticQueuePressure(t *testing.T) 
 	}
 	if writer.active.Load() != 0 {
 		t.Fatalf("writer still active after RunWithSession returned: %d", writer.active.Load())
-	}
-	if err := peers.wait(t); err != nil {
-		t.Fatal(err)
 	}
 	outputText := writer.String()
 	if strings.Count(outputText, "debug: diagnostics: dropped ") != 1 {

@@ -67,6 +67,12 @@ func assertAdmissionCacheRemoved(t *testing.T, root string) {
 	}
 }
 
+type admissionCollisionObservation struct {
+	event          Diagnostic
+	incumbentAlive bool
+	observedAt     time.Time
+}
+
 func TestAdmissionAdvancesExaminedCandidates(t *testing.T) {
 	for _, mode := range []string{"idle", "dial-failure", "live-ID-collision", "backoff"} {
 		t.Run(mode, func(t *testing.T) {
@@ -90,16 +96,10 @@ func TestAdmissionAdvancesExaminedCandidates(t *testing.T) {
 			var workers sync.WaitGroup
 			var incumbentClosed chan struct{}
 			var closeIncumbent sync.Once
-			var collisionAtAdmission chan struct {
-				event          Diagnostic
-				incumbentAlive bool
-			}
+			var collisionAtAdmission chan admissionCollisionObservation
 			if mode == "live-ID-collision" {
 				incumbentClosed = make(chan struct{})
-				collisionAtAdmission = make(chan struct {
-					event          Diagnostic
-					incumbentAlive bool
-				}, 1)
+				collisionAtAdmission = make(chan admissionCollisionObservation, 1)
 				c.config.OnDiagnostic = func(event Diagnostic) {
 					if event.Kind == DiagnosticTransportRace && strings.HasPrefix(event.Detail, "peer ID collision;") {
 						retained := true
@@ -109,10 +109,7 @@ func TestAdmissionAdvancesExaminedCandidates(t *testing.T) {
 						default:
 						}
 						select {
-						case collisionAtAdmission <- struct {
-							event          Diagnostic
-							incumbentAlive bool
-						}{event: event, incumbentAlive: retained}:
+						case collisionAtAdmission <- admissionCollisionObservation{event: event, incumbentAlive: retained, observedAt: time.Now()}:
 						default:
 						}
 					}
@@ -162,6 +159,13 @@ func TestAdmissionAdvancesExaminedCandidates(t *testing.T) {
 				}()
 				return client, nil
 			}
+			var penaltyReadyBefore map[peer.Endpoint]bool
+			if mode == "live-ID-collision" {
+				baselineAt := time.Now()
+				penaltyReadyBefore = map[peer.Endpoint]bool{
+					first: c.backoff.Ready(first, baselineAt), order[1]: c.backoff.Ready(order[1], baselineAt),
+				}
+			}
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 			defer cancel()
 			err := c.startTransferPhase(ctx, torrent.Source{}, meta, selection, plan, storage.ResumeResult{})
@@ -176,8 +180,9 @@ func TestAdmissionAdvancesExaminedCandidates(t *testing.T) {
 				order = order[1:]
 			}
 			if mode == "live-ID-collision" {
+				var collision admissionCollisionObservation
 				select {
-				case collision := <-collisionAtAdmission:
+				case collision = <-collisionAtAdmission:
 					if !collision.incumbentAlive {
 						t.Fatal("peer-ID collision closed the older live connection before transfer completion")
 					}
@@ -187,8 +192,15 @@ func TestAdmissionAdvancesExaminedCandidates(t *testing.T) {
 				case <-time.After(time.Second):
 					t.Fatal("local session did not report its live peer-ID collision")
 				}
-				if len(c.strikes) != 0 || !c.backoff.Ready(first, time.Now().Add(time.Hour)) || !c.backoff.Ready(order[1], time.Now().Add(time.Hour)) {
-					t.Fatalf("peer-ID collision changed endpoint penalties: strikes=%v firstReady=%v collisionReady=%v", c.strikes, c.backoff.Ready(first, time.Now().Add(time.Hour)), c.backoff.Ready(order[1], time.Now().Add(time.Hour)))
+				for _, endpoint := range []peer.Endpoint{first, order[1]} {
+					before := penaltyReadyBefore[endpoint]
+					after := c.backoff.Ready(endpoint, collision.observedAt)
+					if after != before {
+						t.Fatalf("peer-ID collision changed %s backoff readiness at %s: before=%t after=%t", endpoint, collision.observedAt.Format(time.RFC3339Nano), before, after)
+					}
+				}
+				if len(c.strikes) != 0 {
+					t.Fatalf("peer-ID collision changed corruption strikes: %v", c.strikes)
 				}
 			}
 			want := make([]string, len(order))
