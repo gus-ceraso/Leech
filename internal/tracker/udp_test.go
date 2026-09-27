@@ -789,6 +789,9 @@ func TestUDPRotatingEndpointsRetainBoundedSessions(t *testing.T) {
 			t.Fatalf("announce %s peers = %v, want %s", endpoint, result.Peers, wantPeer)
 		}
 	}
+	ipForEndpoint := func(endpoint netip.AddrPort) net.IPAddr {
+		return net.IPAddr{IP: net.IP(endpoint.Addr().AsSlice())}
+	}
 	announce := func(ip net.IPAddr, endpoint netip.AddrPort) AnnounceResult {
 		t.Helper()
 		setSelected(ip)
@@ -956,15 +959,32 @@ func TestUDPRotatingEndpointsRetainBoundedSessions(t *testing.T) {
 		t.Fatalf("retired family sockets: IPv4=%d IPv6=%d", retired4, retired6)
 	}
 
-	// Both families' recent endpoints retain their IDs and sockets.
-	retainedV6, retainedV4 := endpoints[endpointCount-2], endpoints[endpointCount-1]
-	for _, index := range []int{endpointCount - 2, endpointCount - 1} {
-		endpoint, oldSocket := endpoints[index], findSocket(endpoints[index])
+	// Select actual idle sessions under the client lock; eviction order is
+	// intentionally arbitrary, so no particular rotating endpoint is promised.
+	retained := make(map[bool]netip.AddrPort, 2)
+	client.mu.Lock()
+	for _, session := range client.sessions {
+		if session.users != 0 {
+			continue
+		}
+		family := session.endpoint.Addr().Is4()
+		if _, found := retained[family]; !found {
+			retained[family] = session.endpoint
+		}
+	}
+	client.mu.Unlock()
+	retainedV4, hasV4 := retained[true]
+	retainedV6, hasV6 := retained[false]
+	if !hasV4 || !hasV6 {
+		t.Fatalf("no idle retained endpoint for both families: IPv4=%v IPv6=%v", hasV4, hasV6)
+	}
+	for _, endpoint := range []netip.AddrPort{retainedV6, retainedV4} {
+		oldSocket := findSocket(endpoint)
 		if closed(oldSocket.conn) {
-			t.Fatalf("recent endpoint %s was retired", endpoint)
+			t.Fatalf("retained endpoint %s was retired", endpoint)
 		}
 		writes := oldSocket.conn.writeCount()
-		announce(addresses[index], endpoint)
+		announce(ipForEndpoint(endpoint), endpoint)
 		if oldSocket.conn.writeCount() != writes+1 || binary.BigEndian.Uint64(oldSocket.conn.writeAt(writes)[:8]) != oldSocket.id {
 			t.Fatalf("retained endpoint %s did not reuse connection ID %d", endpoint, oldSocket.id)
 		}
@@ -977,12 +997,8 @@ func TestUDPRotatingEndpointsRetainBoundedSessions(t *testing.T) {
 	clock.advance(connectionLife + time.Second)
 	for _, endpoint := range []netip.AddrPort{retainedV6, retainedV4} {
 		oldSocket := findSocket(endpoint)
-		setIndex := endpointCount - 1
-		if endpoint.Addr().Is6() {
-			setIndex = endpointCount - 2
-		}
 		before := len(snapshotSockets())
-		announce(addresses[setIndex], endpoint)
+		announce(ipForEndpoint(endpoint), endpoint)
 		freshSocket := findLatestSocket(endpoint)
 		if len(snapshotSockets()) != before+1 || freshSocket.conn == oldSocket.conn || !closed(oldSocket.conn) {
 			t.Fatalf("expired endpoint %s did not replace its old socket", endpoint)
@@ -1005,8 +1021,7 @@ func TestUDPRotatingEndpointsRetainBoundedSessions(t *testing.T) {
 			t.Fatalf("evicted endpoint %s remains in the cache", endpoint)
 		}
 		before := len(snapshotSockets())
-		ip := net.IPAddr{IP: net.IP(endpoint.Addr().AsSlice())}
-		announce(ip, endpoint)
+		announce(ipForEndpoint(endpoint), endpoint)
 		freshSocket := findLatestSocket(endpoint)
 		if len(snapshotSockets()) != before+1 || freshSocket.conn == oldSocket.conn || freshSocket.id == oldSocket.id {
 			t.Fatalf("evicted endpoint %s did not reconnect with a fresh ID", endpoint)
