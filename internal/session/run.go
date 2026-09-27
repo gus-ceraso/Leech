@@ -677,7 +677,10 @@ func trackerFailureDetail(err error) string {
 	return "transaction failed"
 }
 
-func transportRaceDiagnostic(phase string, endpoint peer.Endpoint, result peer.HandshakeResult, err error) Diagnostic {
+func dialOutcomeDiagnostic(phase string, endpoint peer.Endpoint, result peer.HandshakeResult, raceStarted bool, err error) Diagnostic {
+	if !raceStarted {
+		return Diagnostic{Kind: DiagnosticPeerSelection, Phase: phase, Peer: endpoint, Detail: "candidate failed before transport race"}
+	}
 	detail := "failed"
 	if errors.Is(err, peer.ErrPeerIDCollision) {
 		detail = "peer ID collision; older connection retained; winner=" + result.Transport.String()
@@ -878,10 +881,10 @@ func (c *coordinator) startTransferPhase(ctx context.Context, source torrent.Sou
 				}
 				c.diagnostic(Diagnostic{Kind: DiagnosticPeerSelection, Phase: "transfer", Peer: candidate.Endpoint, Detail: "candidate selected for dial"})
 				dialCtx, dialCancel := context.WithTimeout(acquireCtx, trackerEndpointRaceTimeout)
-				admitted, raceResult, dialErr := manager.DialWithResult(dialCtx, candidate)
+				admitted, raceResult, raceStarted, dialErr := manager.DialWithResult(dialCtx, candidate)
 				dialCancel()
 				if dialErr != nil {
-					c.diagnostic(transportRaceDiagnostic("transfer", candidate.Endpoint, raceResult, dialErr))
+					c.diagnostic(dialOutcomeDiagnostic("transfer", candidate.Endpoint, raceResult, raceStarted, dialErr))
 					c.diagnostic(Diagnostic{Kind: DiagnosticPeerSelection, Phase: "transfer", Peer: candidate.Endpoint, Detail: "candidate dial failed"})
 					var budgetErr *peer.EndpointBudgetError
 					if errors.As(dialErr, &budgetErr) {
@@ -889,7 +892,7 @@ func (c *coordinator) startTransferPhase(ctx context.Context, source torrent.Sou
 					}
 					continue
 				}
-				c.diagnostic(transportRaceDiagnostic("transfer", admitted.Endpoint, raceResult, nil))
+				c.diagnostic(dialOutcomeDiagnostic("transfer", admitted.Endpoint, raceResult, raceStarted, nil))
 				c.diagnostic(Diagnostic{Kind: DiagnosticPeerSelection, Phase: "transfer", Peer: admitted.Endpoint, Detail: "candidate connected"})
 				liveMu.Lock()
 				live[admitted.Conn] = admitted

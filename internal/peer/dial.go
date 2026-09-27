@@ -168,30 +168,38 @@ func NewDialManager(config DialManagerConfig) (*DialManager, error) {
 // handshake. No live-peer slot is held because ownership remains with the
 // caller until it admits the result.
 func (m *DialManager) Race(ctx context.Context, candidate ResolvedCandidate) (HandshakeResult, error) {
+	result, _, err := m.RaceWithResult(ctx, candidate)
+	return result, err
+}
+
+// RaceWithResult reports whether RaceEndpoint was invoked. A false value means
+// the call failed before a transport race began, for example at the endpoint
+// budget or while waiting for a race slot.
+func (m *DialManager) RaceWithResult(ctx context.Context, candidate ResolvedCandidate) (HandshakeResult, bool, error) {
 	if m == nil {
-		return HandshakeResult{}, ErrDialConfig
+		return HandshakeResult{}, false, ErrDialConfig
 	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	endpoint, err := NormalizeEndpoint(candidate.Endpoint)
 	if err != nil {
-		return HandshakeResult{}, err
+		return HandshakeResult{}, false, err
 	}
 	if !m.backoff.Ready(endpoint, m.now()) {
 		if m.backoff.IsBlacklisted(endpoint) {
-			return HandshakeResult{}, fmt.Errorf("%w: endpoint is blacklisted", ErrCandidate)
+			return HandshakeResult{}, false, fmt.Errorf("%w: endpoint is blacklisted", ErrCandidate)
 		}
-		return HandshakeResult{}, fmt.Errorf("%w: endpoint backoff is active", ErrCandidate)
+		return HandshakeResult{}, false, fmt.Errorf("%w: endpoint backoff is active", ErrCandidate)
 	}
 	select {
 	case m.races <- struct{}{}:
 	case <-ctx.Done():
-		return HandshakeResult{}, ctx.Err()
+		return HandshakeResult{}, false, ctx.Err()
 	}
 	defer func() { <-m.races }()
 	if err := ctx.Err(); err != nil {
-		return HandshakeResult{}, err
+		return HandshakeResult{}, false, err
 	}
 	config := m.raceConfig
 	if candidate.HasExpectedID {
@@ -199,7 +207,7 @@ func (m *DialManager) Race(ctx context.Context, candidate ResolvedCandidate) (Ha
 		config.ExpectedPeerID = &expected
 	}
 	if err := m.backoff.beginAttempt(endpoint, m.now()); err != nil {
-		return HandshakeResult{}, err
+		return HandshakeResult{}, false, err
 	}
 	result, err := RaceEndpoint(ctx, endpoint, config)
 	if err != nil {
@@ -210,27 +218,28 @@ func (m *DialManager) Race(ctx context.Context, candidate ResolvedCandidate) (Ha
 				m.backoff.RecordFailure(endpoint, m.now())
 			}
 		}
-		return HandshakeResult{}, err
+		return HandshakeResult{}, true, err
 	}
 	m.backoff.RecordSuccess(endpoint)
-	return result, nil
+	return result, true, nil
 }
 
 // Dial performs a full bounded race and admits the winner into the live-peer
 // registry. On success, the returned LivePeer owns its connection. On every
 // failure, any connection from the race is closed by the relevant owner.
 func (m *DialManager) Dial(ctx context.Context, candidate ResolvedCandidate) (*LivePeer, error) {
-	admitted, _, err := m.DialWithResult(ctx, candidate)
+	admitted, _, _, err := m.DialWithResult(ctx, candidate)
 	return admitted, err
 }
 
 // DialWithResult also returns a successful handshake race result when peer-ID
 // registry admission fails, so the caller can observe the winning transport.
 // The result is observational: on success the LivePeer owns its connection; on
-// admission error DialManager closes it.
-func (m *DialManager) DialWithResult(ctx context.Context, candidate ResolvedCandidate) (*LivePeer, HandshakeResult, error) {
+// admission error DialManager closes it. The bool reports whether the
+// transport race began.
+func (m *DialManager) DialWithResult(ctx context.Context, candidate ResolvedCandidate) (*LivePeer, HandshakeResult, bool, error) {
 	if m == nil {
-		return nil, HandshakeResult{}, ErrDialConfig
+		return nil, HandshakeResult{}, false, ErrDialConfig
 	}
 	if ctx == nil {
 		ctx = context.Background()
@@ -238,19 +247,19 @@ func (m *DialManager) DialWithResult(ctx context.Context, candidate ResolvedCand
 	select {
 	case m.liveSlots <- struct{}{}:
 	case <-ctx.Done():
-		return nil, HandshakeResult{}, ctx.Err()
+		return nil, HandshakeResult{}, false, ctx.Err()
 	}
-	peerResult, err := m.Race(ctx, candidate)
+	peerResult, raceStarted, err := m.RaceWithResult(ctx, candidate)
 	if err != nil {
 		<-m.liveSlots
-		return nil, HandshakeResult{}, err
+		return nil, peerResult, raceStarted, err
 	}
 	peer, err := m.registry.Admit(peerResult)
 	if err != nil {
 		<-m.liveSlots
-		return nil, peerResult, err
+		return nil, peerResult, raceStarted, err
 	}
-	return peer, peerResult, nil
+	return peer, peerResult, raceStarted, nil
 }
 
 // Release closes and releases a peer admitted by Dial. A stale release is a

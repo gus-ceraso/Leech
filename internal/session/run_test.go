@@ -32,13 +32,17 @@ func TestTransportRaceDiagnosticsRetainCollisionWinner(t *testing.T) {
 	defer server.Close()
 	endpoint := peer.Endpoint{Addr: netip.MustParseAddr("192.0.2.44"), Port: 51444}
 	result := peer.HandshakeResult{Endpoint: endpoint, Transport: peer.TransportUTP, Conn: client}
-	diagnostic := transportRaceDiagnostic("transfer", endpoint, result, peer.ErrPeerIDCollision)
+	diagnostic := dialOutcomeDiagnostic("transfer", endpoint, result, true, peer.ErrPeerIDCollision)
 	if diagnostic.Kind != DiagnosticTransportRace || diagnostic.Peer != endpoint || diagnostic.Detail != "peer ID collision; older connection retained; winner=utp" {
 		t.Fatalf("collision transport diagnostic = %+v", diagnostic)
 	}
-	failed := transportRaceDiagnostic("metadata", endpoint, peer.HandshakeResult{}, errors.New("untrusted dial error"))
-	if failed.Detail != "failed" || failed.Phase != "metadata" {
+	failed := dialOutcomeDiagnostic("metadata", endpoint, peer.HandshakeResult{}, true, errors.New("untrusted dial error"))
+	if failed.Kind != DiagnosticTransportRace || failed.Detail != "failed" || failed.Phase != "metadata" {
 		t.Fatalf("failed transport diagnostic = %+v", failed)
+	}
+	preRace := dialOutcomeDiagnostic("transfer", endpoint, peer.HandshakeResult{}, false, peer.ErrEndpointBudget)
+	if preRace.Kind != DiagnosticPeerSelection || preRace.Detail != "candidate failed before transport race" {
+		t.Fatalf("pre-race failure diagnostic = %+v", preRace)
 	}
 }
 

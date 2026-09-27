@@ -498,8 +498,8 @@ func TestDialManagerBudgetAllowsRetriesAndCountsNormalizedEndpointsOnce(t *testi
 	}
 	v4Mapped := Endpoint{Addr: netip.MustParseAddr("::ffff:127.0.0.1"), Port: 51413}
 	ipv4 := Endpoint{Addr: netip.MustParseAddr("127.0.0.1"), Port: 51413}
-	if _, err := manager.Race(context.Background(), ResolvedCandidate{Endpoint: v4Mapped}); err == nil {
-		t.Fatal("first fixture race unexpectedly succeeded")
+	if _, started, err := manager.RaceWithResult(context.Background(), ResolvedCandidate{Endpoint: v4Mapped}); err == nil || !started {
+		t.Fatalf("first fixture race = started %t, err %v; want attempted failure", started, err)
 	}
 	if len(backoff.attempted) != 1 {
 		t.Fatalf("attempted endpoint count after first race = %d, want 1", len(backoff.attempted))
@@ -516,10 +516,10 @@ func TestDialManagerBudgetAllowsRetriesAndCountsNormalizedEndpointsOnce(t *testi
 	}
 
 	budgetEndpoint := Endpoint{Addr: netip.MustParseAddr("127.0.0.2"), Port: 51413}
-	_, err = manager.Race(context.Background(), ResolvedCandidate{Endpoint: budgetEndpoint})
+	_, _, started, err := manager.DialWithResult(context.Background(), ResolvedCandidate{Endpoint: budgetEndpoint})
 	var budgetErr *EndpointBudgetError
-	if !errors.As(err, &budgetErr) || !errors.Is(err, ErrEndpointBudget) || budgetErr.Limit != 1 {
-		t.Fatalf("next distinct endpoint error = %v, want typed one-endpoint budget error", err)
+	if started || !errors.As(err, &budgetErr) || !errors.Is(err, ErrEndpointBudget) || budgetErr.Limit != 1 {
+		t.Fatalf("next distinct dial = race started %t, error %v, want pre-race typed one-endpoint budget error", started, err)
 	}
 	if calls.Load() != 2 || len(backoff.attempted) != 1 {
 		t.Fatalf("budget rejection started work: calls=%d attempted=%d", calls.Load(), len(backoff.attempted))
@@ -631,13 +631,13 @@ func TestDialWithResultRetainsWinnerOnPeerIDCollision(t *testing.T) {
 		t.Fatal(err)
 	}
 	firstCandidate := ResolvedCandidate{Endpoint: Endpoint{Addr: netip.MustParseAddr("192.0.2.41"), Port: 5141}}
-	first, firstResult, err := manager.DialWithResult(context.Background(), firstCandidate)
-	if err != nil || firstResult.Transport != TransportTCP {
+	first, firstResult, firstStarted, err := manager.DialWithResult(context.Background(), firstCandidate)
+	if err != nil || !firstStarted || firstResult.Transport != TransportTCP {
 		t.Fatalf("first DialWithResult = %v, %v, want TCP winner", firstResult.Transport, err)
 	}
 	secondCandidate := ResolvedCandidate{Endpoint: Endpoint{Addr: netip.MustParseAddr("192.0.2.42"), Port: 5142}}
-	second, collisionResult, err := manager.DialWithResult(context.Background(), secondCandidate)
-	if second != nil || !errors.Is(err, ErrPeerIDCollision) || collisionResult.Transport != TransportTCP || collisionResult.Handshake.PeerID != remote.PeerID {
+	second, collisionResult, collisionStarted, err := manager.DialWithResult(context.Background(), secondCandidate)
+	if second != nil || !collisionStarted || !errors.Is(err, ErrPeerIDCollision) || collisionResult.Transport != TransportTCP || collisionResult.Handshake.PeerID != remote.PeerID {
 		t.Fatalf("collision result peer=%v transport=%v id=%x err=%v", second, collisionResult.Transport, collisionResult.Handshake.PeerID, err)
 	}
 	retained, ok := manager.Registry().Lookup(remote.PeerID)

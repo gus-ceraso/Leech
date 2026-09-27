@@ -54,9 +54,11 @@ BEPs [3](../../beps/bep_0003.rst), [6](../../beps/bep_0006.rst),
 - Race both transports to the same literal endpoint. Preserve the uTP head start
   even after early failure; a valid BEP 3 handshake wins. Cancel, close, and join
   the loser before evaluating capabilities. Never revive it to obtain an
-  extension. `DialWithResult` preserves the validated winner fields if peer-ID
-  registry admission rejects a collision; the result connection is already
-  closed in that case. See the [uTP dial-context lifetime rule](../utp/AGENTS.md).
+  extension. `RaceWithResult` marks only calls that reached `RaceEndpoint` as
+  started; endpoint-budget, backoff, and slot-wait failures remain pre-race.
+  `DialWithResult` preserves the validated winner fields if peer-ID registry
+  admission rejects a collision; the result connection is already closed in that
+  case. See the [uTP dial-context lifetime rule](../utp/AGENTS.md).
 - Distinguish severe peer-origin violations from ordinary disconnects, stalls,
   and compatibility failures; keep bounded well-framed unknown messages ignorable.
 

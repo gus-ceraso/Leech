@@ -72,8 +72,10 @@ piece/request state, and `transfer.go` coordinates peer I/O and finalization.
   retirement or shutdown); duplicate grants do not increment them. Keep event
   details summarized, with no per-block logging. `DiagnosticTransportRace`
   records the actual handshake winner or a failed race, including metadata phase,
-  without retaining raw errors. `DialWithResult` carries the winner through
-  collision rejection while its closed connection remains unowned by session.
+  without retaining raw errors. `RaceWithResult` distinguishes a started race
+  from errors during admission, budget checks, or slot waits. `DialWithResult`
+  carries the winner through collision rejection while its closed connection
+  remains unowned by session.
 - The coordinator alone mutates rarity, request ownership, provenance, strikes,
   and completion. Give the finalizer immutable coverage snapshots. Worker
   callbacks and command enqueueing must not stall coordination indefinitely.

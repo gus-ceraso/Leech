@@ -1128,11 +1128,17 @@ func (d *MetadataDiscovery) Run(ctx context.Context) (result MetadataResult, pri
 
 func (d *MetadataDiscovery) tryCandidate(ctx context.Context, manager *peer.DialManager, candidate peer.ResolvedCandidate, strikes map[peer.Endpoint]uint8, backoff *peer.EndpointBackoff) (metadataCandidate, error) {
 	raceCtx, cancel := context.WithTimeout(ctx, trackerEndpointRaceTimeout)
-	connected, err := manager.Race(raceCtx, candidate)
+	connected, raceStarted, err := manager.RaceWithResult(raceCtx, candidate)
 	cancel()
 	if err != nil {
 		if d.config.OnDiagnostic != nil {
-			d.config.OnDiagnostic(Diagnostic{Kind: DiagnosticTransportRace, Phase: "metadata", Peer: candidate.Endpoint, Detail: "failed"})
+			kind := DiagnosticTransportRace
+			detail := "failed"
+			if !raceStarted {
+				kind = DiagnosticPeerSelection
+				detail = "candidate failed before transport race"
+			}
+			d.config.OnDiagnostic(Diagnostic{Kind: kind, Phase: "metadata", Peer: candidate.Endpoint, Detail: detail})
 		}
 		if errors.Is(err, peer.ErrProtocolViolation) {
 			backoff.Blacklist(candidate.Endpoint)
